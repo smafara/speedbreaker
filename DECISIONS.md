@@ -366,3 +366,21 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   replay_check.sh` (frames + presented picture) before every commit. Next: draft the RHI
   headers (`gpu/rhi/`) from what `renderer.cpp` and `presenter.cpp` actually use, for review
   before implementing.
+- 2026-10-26: RHI headers drafted for review: `runtime/gpu/rhi/{types,device,command_list}.h`
+  (510 lines, headers only, compile standalone, included by nothing yet). Built from the
+  renderer's real use: ~25 formats, buffers (device / upload / cached), images (one view),
+  samplers, `BindingLayout` + persistent `BindingSet` + pushed tables (D10), graphics and
+  compute pipelines (created from SPIR-V, thread-safe), `CommandList` (rendering passes,
+  state, draws, copies, clears, `Transition` with states per D9), `Fence`, `Event`, `QueryPool`,
+  `Device::Submit`. Boundary decisions written in the `device.h` header comment: image block
+  suballocation and the memory plan's driver parts move INSIDE the Vulkan backend; guest memory
+  is `ImportHostMemory` with capability + alignment (Metal: 16 KB, newBufferWithBytesNoCopy);
+  one shared queue with an internal lock replaces `VulkanContext::queueMutex`.
+  Open items found while drafting: (a) `Event`/`SignalEvent` (the renderer's VkEvent write
+  fences) has no cheap Metal equivalent: MTLSharedEvent between encoders costs an encoder
+  break; (b) image views in a format other than the image's (a few resolves) are not in the
+  draft; (c) the renderer reads vertex data from guest memory as a storage buffer (512 MB
+  buffer; Metal's maxBufferLength must allow it, and the "split memory" path exists for
+  devices that can't); (d) occlusion counting, fragment shading rate, multiview and depth/
+  stencil resolve are not in the draft (the last two: check whether they are used at all);
+  (e) pipeline cache blob format is per backend; (f) `Present`/swapchain come with step 2.
