@@ -62,6 +62,10 @@
 #include <fstream>
 #include <utility>
 #include <vulkan/vulkan.h>
+#ifdef SB_METAL
+#include <gpu/rhi/metal/metal_device.h>
+#include <gpu/rhi/metal/metal_native.h>
+#endif
 
 namespace video
 {
@@ -302,10 +306,41 @@ namespace video
         }
         bool s_vsync = true;
 
+        // The graphics API under the presenter. Vulkan is the default and has the
+        // renderer and the UI; Metal (built with SB_METAL, chosen with
+        // NFSMW_BACKEND=metal) is the presenter alone for now: no picture comes
+        // from the renderer, which is still Vulkan.
+        enum class Backend { Vulkan, Metal };
+        Backend s_backend = Backend::Vulkan;
+        SDL_MetalView s_metalView = nullptr;
+
+        Backend ChooseBackend()
+        {
+            const char* v = std::getenv("NFSMW_BACKEND");
+            if (!v || !*v || !strcmp(v, "vulkan"))
+                return Backend::Vulkan;
+            if (!strcmp(v, "metal"))
+            {
+#ifdef SB_METAL
+                return Backend::Metal;
+#else
+                fprintf(stderr, "[video] NFSMW_BACKEND=metal: this build has no Metal backend (-DSB_METAL=ON); using Vulkan\n");
+                return Backend::Vulkan;
+#endif
+            }
+            fprintf(stderr, "[video] NFSMW_BACKEND=%s: not a backend (vulkan, metal); using Vulkan\n", v);
+            return Backend::Vulkan;
+        }
+
         // vkDeviceWaitIdle needs every queue externally synchronised; with one
         // shared queue, wait on it under the queue mutex.
         void WaitIdle()
         {
+            if (!s_queue)  // not Vulkan's
+            {
+                s_rhi->WaitIdle();
+                return;
+            }
             std::lock_guard lock(*s_queueMutexPtr);
             vkQueueWaitIdle(s_queue);
         }
@@ -731,6 +766,7 @@ namespace video
             desc.extent = { s_swapExtent.width, s_swapExtent.height, 1 };
             desc.preferredFormat = gpu::rhi::Format::BGRA8;
             desc.vsync = s_vsync;
+            desc.readable = true;  // screenshots and the checks read the drawn frame back (Vulkan: whatever the surface allows)
             // MoltenVK takes the CAMetalLayer drawable inside vkQueuePresentKHR,
             // which holds the queue mutex: with 2 drawables (its minimum) that
             // waited for the display to free one, and the command processor
@@ -763,7 +799,8 @@ namespace video
             s_swapchain = s_rhi->CreateSwapchain(*s_rhiSurface, desc);
             if (!s_swapchain)
                 return false;
-            s_swapFormat = gpu::rhi::vulkan::NativeFormat(*s_swapchain);
+            if (s_backend == Backend::Vulkan)
+                s_swapFormat = gpu::rhi::vulkan::NativeFormat(*s_swapchain);  // (for the UI)
             s_swapReadable = s_swapchain->Readable();
             {
                 // Once per change: the V-Sync setting's effect, in the log.
@@ -1426,6 +1463,154 @@ namespace video
         }
     }
 
+    namespace
+    {
+        // Whether new frames are shown at a time after their vblank (the schedule
+        // and the display's own timing); `offered`: the backend can show a
+        // present at a time (Vulkan: VK_GOOGLE_display_timing, to be enabled
+        // with the device; Metal: presentDrawable:atTime:).
+        void ConfigureShowAtTime(bool offered)
+        {
+#if defined(__APPLE__) && !TARGET_OS_IOS
+    {
+        // Frames shown at a time need the watchdog, which needs the
+        // present waiter.
+        const char* v = std::getenv("NFSMW_PRESENT_AT");
+        const double ms = v ? std::atof(v) : double(kShowAfterVblankNs) / 1e6;
+        s_showAfterVblankNs = int64_t(std::clamp(ms, 0.0, 100.0) * 1e6);
+        s_schedule = PresentSchedule(!v ? PresentSchedule::Mode::Auto : s_showAfterVblankNs > 0 ? PresentSchedule::Mode::On
+                                                                                               : PresentSchedule::Mode::Off);
+        // Auto, on a display that isn't a 120 Hz one at launch (a 60 Hz
+        // monitor, the macOS 15 VM): the extension isn't even enabled, so
+        // the session's device and presents are v0.1.3's (it isn't asked
+        // for again should the window move to a 120 Hz display later).
+        const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
+        PresentSchedule launch;
+        launch.SetDisplayHz(mode ? mode->refresh_rate : 0.0f);
+        const bool mayShowAtTime = s_schedule.GetMode() == PresentSchedule::Mode::On ||
+            (s_schedule.GetMode() == PresentSchedule::Mode::Auto && launch.FastDisplay());
+        s_displayTiming = offered && s_presentTiming && (mayShowAtTime || std::getenv("NFSMW_VBLANK_LOG"));
+    }
+#else
+            (void)offered;
+#endif
+        }
+
+        // After the device and surface: what the backend can time, the logs for it
+        // (NFSMW_VBLANK_LOG) and the lines that say so. The names are the backend's
+        // own mechanisms, for the log.
+        void ReportPresentTiming(bool timingOff, const char* displayTimingName, const char* presentTimingName)
+        {
+    s_presentTiming = s_presentTiming && s_rhi->GetCapabilities().presentTiming;
+#if defined(__APPLE__) && !TARGET_OS_IOS
+    // No frame is shown at a time without the driver's reports and the
+    // present timing that goes with them (the watchdog).
+    if (!(s_displayTiming && s_presentTiming && s_rhi->GetCapabilities().scheduledPresent))
+        s_displayTiming = false;
+#endif
+    if (s_presentTiming)
+    {
+        if (const char* path = std::getenv("NFSMW_VBLANK_LOG"))
+            if ((s_timingLog = fopen(path, "w")))
+            {
+                fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns,ready,multiple,between,desired\n");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+                if (s_displayTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
+                    fprintf(s_actualLog, "# steady_ns %lld uptime_raw_ns %llu\nid,actual_ns\n", (long long)NowNs(),
+                        (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+#endif
+            }
+    }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+    if (s_displayTiming && s_showAfterVblankNs > 0 && s_schedule.GetMode() != PresentSchedule::Mode::Off)
+        fprintf(stderr, "[vblank] new frames shown %.2f ms after their vblank %s (%s, watched; "
+            "NFSMW_PRESENT_AT=0: never)\n", double(s_showAfterVblankNs) / 1e6, s_schedule.GetMode() == PresentSchedule::Mode::On
+                ? "on any display (NFSMW_PRESENT_AT)" : "on a 120 Hz display the vblank isn't locked to", displayTimingName);
+    else if (s_schedule.GetMode() == PresentSchedule::Mode::Auto)
+        fprintf(stderr, "[vblank] new frames shown when ready: not a 120 Hz display at launch, or no %s (not used)\n", displayTimingName);
+#endif
+    fprintf(stderr, "[vblank] %s\n", s_presentTiming ? ("presents are timed (" + std::string(presentTimingName) + ")").c_str()
+        : timingOff ? "presents aren't timed (NFSMW_PRESENT_TIMING=0): the guest vblank can't lock to the display"
+        : ("no present timing (" + std::string(presentTimingName) + ") on this device: the guest vblank can't lock to the display").c_str());
+        }
+
+        // The frame slots' lists and fences, the GPU timing queries, the swapchain.
+        void CreateFramesAndSwapchain()
+        {
+    for (Frame& f : s_frames)
+    {
+        f.list = s_rhi->CreateCommandList();
+        f.done = s_rhi->CreateFence(true);
+    }
+    if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
+    {
+        if (s_rhi->GetCapabilities().timestampQueries)
+            s_timestamps = s_rhi->CreateQueryPool(gpu::rhi::QueryKind::Timestamp, FRAMES_IN_FLIGHT * 3);
+        s_timestampPeriod = s_rhi->GetCapabilities().timestampPeriodNs;
+    }
+    CreateSwapchain();
+        }
+
+        // The screen against the game's window in the log, the GPU and display
+        // lines of the bug report (report/system_info.cpp), and the hint for a
+        // Game Mode screen smaller than the monitor.
+        void ReportScreen(const std::string& gpuItem)
+        {
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
+            auto [nativeW, nativeH] = NativeMonitorMode();
+            fprintf(stderr, "[video] screen %dx%d%s, monitor %dx%d, %s\n", mode ? mode->w : 0, mode ? mode->h : 0,
+                s_fullscreen.Window() ? " (fullscreen)" : "", nativeW, nativeH, s_gameMode ? "Game Mode (gamescope)" : "desktop");
+            report::SetSystemItem("GPU", gpuItem);
+            UpdateDisplayItem();
+            if (s_gameMode && mode && nativeW > 0 && int64_t(mode->w) * mode->h < int64_t(nativeW) * nativeH)
+                s_resolutionHint = std::format("Steam gives this game {}x{} of your {}x{} display. For full sharpness, set this game's "
+                    "Properties > General > Game Resolution to Native in Steam.", mode->w, mode->h, nativeW, nativeH);
+        }
+
+        // The Metal bring-up: the device, the window's layer, presents with the
+        // display's own times, and the post-processing on them. There is no renderer
+        // (gpu/renderer.cpp, Vulkan) and no UI (Dear ImGui's Vulkan backend) to give
+        // it a picture yet: the game runs without a GPU renderer, as when Vulkan
+        // can't start (headless), and the CPU path's frame is what is shown.
+        bool InitializeMetal()
+        {
+#ifdef SB_METAL
+            s_rhi = gpu::rhi::metal::CreateDevice();
+            if (!s_rhi)
+            {
+                fprintf(stderr, "[video] no Metal device\n");
+                return false;
+            }
+            s_metalView = SDL_Metal_CreateView(s_window);
+            void* layer = s_metalView ? SDL_Metal_GetLayer(s_metalView) : nullptr;
+            if (!layer)
+            {
+                fprintf(stderr, "[video] SDL_Metal_CreateView: %s\n", SDL_GetError());
+                return false;
+            }
+            s_rhiSurface = gpu::rhi::metal::CreateSurface(*s_rhi, layer);
+            const gpu::rhi::Capabilities& caps = s_rhi->GetCapabilities();
+            const char* timing = std::getenv("NFSMW_PRESENT_TIMING");
+            const bool timingOff = timing && timing[0] == '0';
+            s_presentTiming = !timingOff;
+            ConfigureShowAtTime(caps.scheduledPresent);
+            ReportPresentTiming(timingOff, "presentDrawable:atTime:", "the drawable's presented handler");
+            CreateFramesAndSwapchain();
+            s_settingsGeneration = settings::Generation();
+            fprintf(stderr, "[video] %s (Metal), swapchain %ux%u%s\n", caps.deviceName, s_swapExtent.width, s_swapExtent.height,
+                GeometryNote().c_str());
+            fprintf(stderr, "[video] Metal: no renderer or UI yet (they are Vulkan); the game runs without a GPU renderer\n");
+            ReportScreen(std::format("{}, Metal", caps.deviceName));
+            if (!s_resolutionHint.empty())
+                fprintf(stderr, "[video] %s\n", s_resolutionHint.c_str());
+            return true;
+#else
+            return false;
+#endif
+        }
+
+    }
+
     bool Initialize()
     {
         if (const char* h = std::getenv("NFSMW_HEADLESS"); h && h[0] == '1')
@@ -1465,6 +1650,7 @@ namespace video
         // The size it had last time (NFSMW_WINDOW=<width>x<height> overrides).
         int windowW = settings::GetInt(settings::Id::WindowWidth), windowH = settings::GetInt(settings::Id::WindowHeight);
         s_gameMode = DetectGameMode();
+        s_backend = ChooseBackend();
         const bool startFullscreen = s_fullscreen.Launch(settings::GetBool(settings::Id::Fullscreen), FullscreenLocked());
         s_vsync = settings::GetBool(settings::Id::VSync);
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -1479,7 +1665,7 @@ namespace video
         platform::ios::PrepareOrientation();
 #endif
         s_window = SDL_CreateWindow("SpeedBreaker", windowW, windowH,
-            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (startFullscreen ? SDL_WINDOW_FULLSCREEN : 0));
+            (s_backend == Backend::Metal ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (startFullscreen ? SDL_WINDOW_FULLSCREEN : 0));
         if (!s_window)
         {
             fprintf(stderr, "[video] SDL_CreateWindow: %s\n", SDL_GetError());
@@ -1493,6 +1679,8 @@ namespace video
 #if defined(__APPLE__) && TARGET_OS_IOS
         platform::ios::WatchKeyboards(s_window);
 #endif
+        if (s_backend == Backend::Metal)
+            return InitializeMetal();
 
         Uint32 extCount = 0;
         const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&extCount);
@@ -1619,27 +1807,7 @@ namespace video
             devExts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
             devExts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
         }
-#if defined(__APPLE__) && !TARGET_OS_IOS
-        {
-            // Frames shown at a time need the watchdog, which needs the
-            // present waiter (VK_KHR_present_wait).
-            const char* v = std::getenv("NFSMW_PRESENT_AT");
-            const double ms = v ? std::atof(v) : double(kShowAfterVblankNs) / 1e6;
-            s_showAfterVblankNs = int64_t(std::clamp(ms, 0.0, 100.0) * 1e6);
-            s_schedule = PresentSchedule(!v ? PresentSchedule::Mode::Auto : s_showAfterVblankNs > 0 ? PresentSchedule::Mode::On
-                                                                                                   : PresentSchedule::Mode::Off);
-            // Auto, on a display that isn't a 120 Hz one at launch (a 60 Hz
-            // monitor, the macOS 15 VM): the extension isn't even enabled, so
-            // the session's device and presents are v0.1.3's (it isn't asked
-            // for again should the window move to a 120 Hz display later).
-            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
-            PresentSchedule launch;
-            launch.SetDisplayHz(mode ? mode->refresh_rate : 0.0f);
-            const bool mayShowAtTime = s_schedule.GetMode() == PresentSchedule::Mode::On ||
-                (s_schedule.GetMode() == PresentSchedule::Mode::Auto && launch.FastDisplay());
-            s_displayTiming = displayTiming && s_presentTiming && (mayShowAtTime || std::getenv("NFSMW_VBLANK_LOG"));
-        }
-#endif
+        ConfigureShowAtTime(displayTiming);
         if (s_displayTiming)
             devExts.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 
@@ -1730,37 +1898,7 @@ namespace video
             SDL_GetWindowSizeInPixels(s_window, &w, &h);
             return gpu::rhi::Extent3D{ uint32_t(std::max(w, 0)), uint32_t(std::max(h, 0)), 1 };
         });
-        s_presentTiming = s_presentTiming && s_rhi->GetCapabilities().presentTiming;
-#if defined(__APPLE__) && !TARGET_OS_IOS
-        // No frame is shown at a time without the driver's reports and the
-        // present timing that goes with them (the watchdog).
-        if (!(s_displayTiming && s_presentTiming && s_rhi->GetCapabilities().scheduledPresent))
-            s_displayTiming = false;
-#endif
-        if (s_presentTiming)
-        {
-            if (const char* path = std::getenv("NFSMW_VBLANK_LOG"))
-                if ((s_timingLog = fopen(path, "w")))
-                {
-                    fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns,ready,multiple,between,desired\n");
-#if defined(__APPLE__) && !TARGET_OS_IOS
-                    if (s_displayTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
-                        fprintf(s_actualLog, "# steady_ns %lld uptime_raw_ns %llu\nid,actual_ns\n", (long long)NowNs(),
-                            (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
-#endif
-                }
-        }
-#if defined(__APPLE__) && !TARGET_OS_IOS
-        if (s_displayTiming && s_showAfterVblankNs > 0 && s_schedule.GetMode() != PresentSchedule::Mode::Off)
-            fprintf(stderr, "[vblank] new frames shown %.2f ms after their vblank %s (VK_GOOGLE_display_timing, watched; "
-                "NFSMW_PRESENT_AT=0: never)\n", double(s_showAfterVblankNs) / 1e6, s_schedule.GetMode() == PresentSchedule::Mode::On
-                    ? "on any display (NFSMW_PRESENT_AT)" : "on a 120 Hz display the vblank isn't locked to");
-        else if (s_schedule.GetMode() == PresentSchedule::Mode::Auto)
-            fprintf(stderr, "[vblank] new frames shown when ready: not a 120 Hz display at launch, or no VK_GOOGLE_display_timing (not used)\n");
-#endif
-        fprintf(stderr, "[vblank] %s\n", s_presentTiming ? "presents are timed (VK_KHR_present_wait)"
-            : timingOff ? "presents aren't timed (NFSMW_PRESENT_TIMING=0): the guest vblank can't lock to the display"
-            : "no present timing (VK_KHR_present_wait) on this device: the guest vblank can't lock to the display");
+        ReportPresentTiming(timingOff, "VK_GOOGLE_display_timing", "VK_KHR_present_wait");
 #ifdef _WIN32
         // Which of the two the device has (NVIDIA's Windows driver is
         // expected to have both, Intel's 101.2135 has neither).
@@ -1770,18 +1908,7 @@ namespace video
         fprintf(stderr, "[vblank] %s on %s\n", s_timingText.c_str(), props.deviceName);
 #endif
 
-        for (Frame& f : s_frames)
-        {
-            f.list = s_rhi->CreateCommandList();
-            f.done = s_rhi->CreateFence(true);
-        }
-        if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
-        {
-            if (s_rhi->GetCapabilities().timestampQueries)
-                s_timestamps = s_rhi->CreateQueryPool(gpu::rhi::QueryKind::Timestamp, FRAMES_IN_FLIGHT * 3);
-            s_timestampPeriod = s_rhi->GetCapabilities().timestampPeriodNs;
-        }
-        CreateSwapchain();
+        CreateFramesAndSwapchain();
         s_context = { s_instance, s_physical, s_device, s_queueFamily, s_queue, s_queueMutexPtr,
             hostImport ? (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(s_device, "vkGetMemoryHostPointerPropertiesEXT") : nullptr,
             (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdBeginRenderingKHR"),
@@ -1803,12 +1930,6 @@ namespace video
         }
 #endif
         {
-            // What the game was given, against the monitor (Game Mode: the
-            // screen is the size Steam's per-game Game Resolution sets).
-            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
-            auto [nativeW, nativeH] = NativeMonitorMode();
-            fprintf(stderr, "[video] screen %dx%d%s, monitor %dx%d, %s\n", mode ? mode->w : 0, mode ? mode->h : 0,
-                s_fullscreen.Window() ? " (fullscreen)" : "", nativeW, nativeH, s_gameMode ? "Game Mode (gamescope)" : "desktop");
             // For the logs' system summary and bug reports (report/system_info.cpp).
             {
                 const char* type = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
@@ -1843,18 +1964,15 @@ namespace video
 #endif
                 uint32_t loader = VK_API_VERSION_1_0;
                 vkEnumerateInstanceVersion(&loader);
-                report::SetSystemItem("GPU", std::format("{} ({}, {:04x}:{:04x}), {}, Vulkan {}.{}.{} (loader {}.{}.{}){}",
+                const std::string gpuItem = std::format("{} ({}, {:04x}:{:04x}), {}, Vulkan {}.{}.{} (loader {}.{}.{}){}",
                     props.deviceName, type, props.vendorID, props.deviceID, driver, VK_API_VERSION_MAJOR(props.apiVersion),
                     VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), VK_API_VERSION_MAJOR(loader),
-                    VK_API_VERSION_MINOR(loader), VK_API_VERSION_PATCH(loader), link.empty() ? std::string() : ", " + link));
-                UpdateDisplayItem();
+                    VK_API_VERSION_MINOR(loader), VK_API_VERSION_PATCH(loader), link.empty() ? std::string() : ", " + link);
+                ReportScreen(gpuItem);
 #ifdef _WIN32
                 report::SetSystemItem("Present", s_presentText + "; " + s_timingText);
 #endif
             }
-            if (s_gameMode && mode && nativeW > 0 && int64_t(mode->w) * mode->h < int64_t(nativeW) * nativeH)
-                s_resolutionHint = std::format("Steam gives this game {}x{} of your {}x{} display. For full sharpness, set this game's "
-                    "Properties > General > Game Resolution to Native in Steam.", mode->w, mode->h, nativeW, nativeH);
         }
         s_uiReady = ui::Initialize(s_window, { s_instance, s_physical, s_device, s_queueFamily, s_queue, s_queueMutexPtr,
             VK_API_VERSION_1_2, s_swapFormat });
@@ -2218,10 +2336,13 @@ namespace video
         // guest callbacks at the frozen time.
         {
             std::lock_guard lock(*s_queueMutexPtr);
-            if (!s_background.load(std::memory_order_relaxed) && s_queue)
+            if (!s_background.load(std::memory_order_relaxed) && s_rhi)
             {
                 s_background.store(true, std::memory_order_release);
-                vkQueueWaitIdle(s_queue);
+                if (s_queue)
+                    vkQueueWaitIdle(s_queue);
+                else
+                    s_rhi->WaitIdle();
                 if (SuspendGpuOnly())
                 {
                     s_visible.store(false, std::memory_order_relaxed);  // as 7303475 did: the watchdog pauses
@@ -3218,7 +3339,7 @@ namespace video
 
     void WaitGpuIdle()
     {
-        if (s_device)
+        if (s_rhi)
             WaitIdle();
     }
 
@@ -3413,7 +3534,7 @@ namespace video
 
     void Shutdown()
     {
-        if (s_device)
+        if (s_rhi)
             WaitIdle();
         if (s_uiReady)
         {
@@ -3422,6 +3543,14 @@ namespace video
         }
         hid::Shutdown();  // a rumble under way would otherwise carry on
         DestroySwapchain();  // nothing presents to the window from here on, and its present thread is joined
+#ifdef SB_METAL
+        if (s_metalView)
+        {
+            s_rhiSurface.reset();
+            SDL_Metal_DestroyView(s_metalView);
+            s_metalView = nullptr;
+        }
+#endif
         // Then the title bar's styling lets go of the window (Retire first:
         // nothing presents to it while it is taken apart), then SDL frees it.
 #if defined(__APPLE__) && !TARGET_OS_IOS

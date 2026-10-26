@@ -598,3 +598,21 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   early, none dropped, spacing 19.8 ms. Frames presented before the window is up may go unseen
   (dropped), so the test ignores the first five. Not done: colour space (layer default; Vulkan
   path sets sRGB through MoltenVK, to compare), EDR, display-link refresh rate.
+- 2026-10-26: Presenter wired for a second backend. `NFSMW_BACKEND=metal` (default vulkan; needs
+  -DSB_METAL=ON, else it says so and uses Vulkan) makes the window with SDL_WINDOW_METAL and
+  brings the presenter up on the Metal device, `SDL_Metal_CreateView/GetLayer`, the Metal surface
+  and swapchain. To share the bring-up with Vulkan, three pieces came out of `Initialize` into
+  helpers both use: `ConfigureShowAtTime`, `ReportPresentTiming` (the log lines name each
+  backend's own mechanism), `CreateFramesAndSwapchain`, plus `ReportScreen` (screen log, GPU line
+  of the bug report, Game Mode hint). `WaitIdle` goes through the RHI when there is no VkQueue.
+  The presenter now asks for a readable swapchain (Vulkan: as before, whatever the surface allows;
+  Metal: framebufferOnly off, as MoltenVK already did). Not on Metal: the renderer and the UI
+  (both Vulkan, so `GetVulkan()` is null and the game runs as headless: the CPU path's frame,
+  black here). Verified: Vulkan replay_check and post_check bit-identical after the refactor; a
+  30 s live run on Metal ran the game's whole start-up (fullscreen change rebuilt the swapchain
+  5120x2756 -> 5120x2880, tone and FSR1 pipelines compiled through SPIRV-Cross, 28 ms and 76 ms,
+  presents timed) with no abort, and `NFSMW_CHECK_PRESENT_SEC` read the presented frames back
+  (5120x2880). The frames are black (nothing draws), so the post passes' output on Metal is NOT
+  verified yet; that waits for a picture (renderer on the RHI) or a pass-level cross-backend
+  test. `rhi_metal_swapchain_test` failed once under `ctest -j2` and not in 8 later runs (cause
+  not found; a window test depends on the machine's state).
