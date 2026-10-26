@@ -52,6 +52,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <gpu/rhi/vulkan/vulkan_native.h>
 #include <chrono>
 #include <format>
 #include <iterator>
@@ -141,7 +142,12 @@ namespace video
         const bool s_upscaleAb = [] { const char* v = std::getenv("NFSMW_UPSCALE_AB"); return v && v[0] == '1'; }();
         uint64_t s_abFrames[3]{}, s_abNs[3]{}, s_abAaNs[3]{};  // by upscale::Pass; main thread
         std::vector<VkSemaphore> s_renderDone;  // one per swapchain image
-        std::mutex s_queueMutex;
+        // The device and its queue belong to the RHI's Vulkan backend (gpu/rhi/vulkan),
+        // which made them from what Initialize chose; the lock is its queue lock
+        // (a placeholder one until the device exists).
+        std::unique_ptr<gpu::rhi::Device> s_rhi;
+        std::mutex s_noQueueMutex;
+        std::mutex* s_queueMutexPtr = &s_noQueueMutex;
         VulkanContext s_context{};
         bool s_contextReady = false;
         uint32_t s_frameIndex = 0;
@@ -224,7 +230,7 @@ namespace video
         std::atomic<bool> s_visible{ true };  // not minimized, hidden or covered
         // The app is inactive or in the background (iOS, and other systems
         // that send SDL's app events): no GPU work may start. Changed under
-        // s_queueMutex (WaitForeground waits on s_foreground for it); RunFrame
+        // the queue lock (WaitForeground waits on s_foreground for it); RunFrame
         // reads it without the lock.
         std::atomic<bool> s_background{ false };
         std::condition_variable s_foreground;
@@ -303,7 +309,7 @@ namespace video
         // shared queue, wait on it under the queue mutex.
         void WaitIdle()
         {
-            std::lock_guard lock(s_queueMutex);
+            std::lock_guard lock(*s_queueMutexPtr);
             vkQueueWaitIdle(s_queue);
         }
 
@@ -2906,11 +2912,6 @@ void main()
         if (s_displayTiming)
             devExts.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
 
-        float priority = 1.0f;
-        VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
-        qci.queueFamilyIndex = s_queueFamily;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &priority;
         VkPhysicalDeviceFeatures supported;
         vkGetPhysicalDeviceFeatures(s_physical, &supported);
         VkPhysicalDeviceFeatures features{};
@@ -2977,14 +2978,22 @@ void main()
             hostQueryReset.pNext = const_cast<void*>(dci.pNext);
             dci.pNext = &hostQueryReset;
         }
-        dci.pEnabledFeatures = &features;
-        dci.queueCreateInfoCount = 1;
-        dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = uint32_t(devExts.size());
-        dci.ppEnabledExtensionNames = devExts.data();
-        if (!Check(vkCreateDevice(s_physical, &dci, nullptr, &s_device), "vkCreateDevice"))
+        gpu::rhi::vulkan::DeviceConfig deviceConfig;
+        deviceConfig.instance = s_instance;
+        deviceConfig.physical = s_physical;
+        deviceConfig.queueFamily = s_queueFamily;
+        deviceConfig.extensions = devExts;
+        deviceConfig.features = &features;
+        deviceConfig.next = dci.pNext;
+        s_rhi = gpu::rhi::vulkan::CreateDevice(deviceConfig);
+        if (!s_rhi)
             return false;
-        vkGetDeviceQueue(s_device, s_queueFamily, 0, &s_queue);
+        {
+            const gpu::rhi::vulkan::Native& native = gpu::rhi::vulkan::GetNative(*s_rhi);
+            s_device = native.device;
+            s_queue = native.queue;
+            s_queueMutexPtr = native.queueMutex;
+        }
         if (s_presentTiming)
             s_waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(s_device, "vkWaitForPresentKHR");
         s_presentTiming = s_waitForPresent != nullptr;
@@ -3062,7 +3071,7 @@ void main()
             s_timestampPeriod = props.limits.timestampPeriod;
         }
         CreateSwapchain();
-        s_context = { s_instance, s_physical, s_device, s_queueFamily, s_queue, &s_queueMutex,
+        s_context = { s_instance, s_physical, s_device, s_queueFamily, s_queue, s_queueMutexPtr,
             hostImport ? (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(s_device, "vkGetMemoryHostPointerPropertiesEXT") : nullptr,
             (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdBeginRenderingKHR"),
             (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdEndRenderingKHR"), rateW, rateH, occlusionCounting,
@@ -3136,7 +3145,7 @@ void main()
                 s_resolutionHint = std::format("Steam gives this game {}x{} of your {}x{} display. For full sharpness, set this game's "
                     "Properties > General > Game Resolution to Native in Steam.", mode->w, mode->h, nativeW, nativeH);
         }
-        s_uiReady = ui::Initialize(s_window, { s_instance, s_physical, s_device, s_queueFamily, s_queue, &s_queueMutex,
+        s_uiReady = ui::Initialize(s_window, { s_instance, s_physical, s_device, s_queueFamily, s_queue, s_queueMutexPtr,
             VK_API_VERSION_1_2, s_swapFormat });
         if (!s_resolutionHint.empty())
         {
@@ -3497,7 +3506,7 @@ void main()
         // app). What was submitted finishes, its completions running their
         // guest callbacks at the frozen time.
         {
-            std::lock_guard lock(s_queueMutex);
+            std::lock_guard lock(*s_queueMutexPtr);
             if (!s_background.load(std::memory_order_relaxed) && s_queue)
             {
                 s_background.store(true, std::memory_order_release);
@@ -3522,7 +3531,7 @@ void main()
         // still at the frozen time.
         bool held;
         {
-            std::lock_guard lock(s_queueMutex);
+            std::lock_guard lock(*s_queueMutexPtr);
             held = s_background.exchange(false, std::memory_order_acq_rel);
         }
         if (s_window)
@@ -4431,7 +4440,7 @@ void main()
         si.pCommandBuffers = &cmd;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_renderDone[imageIndex];
-        std::unique_lock queueLock(s_queueMutex);
+        std::unique_lock queueLock(*s_queueMutexPtr);
         vkQueueSubmit(s_queue, 1, &si, f.inFlight);
         frontLock.unlock();
 

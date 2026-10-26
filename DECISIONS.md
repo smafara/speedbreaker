@@ -430,3 +430,18 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   the backend yet).
   Next (step 2): move the presenter's instance/device creation and swapchain/present timing
   onto the backend; the presenter then holds an `rhi::Device`.
+- 2026-10-26: presenter refactor STEP 2a done: the presenter's device is made by the RHI's
+  Vulkan backend. New `gpu/rhi/vulkan/vulkan_native.h`: `DeviceConfig` (instance, physical
+  device, queue family, extension list, features, pNext chain: the policy the presenter decides
+  from settings, env and the platform) -> `CreateDevice()` (the backend creates the VkDevice,
+  gets the queue, reads the memory properties, makes the pipeline cache, fills
+  `Capabilities`, owns the queue lock) and `GetNative()` (instance, physical, device,
+  queue family, queue, queue mutex) for code that still speaks Vulkan. `CreateHeadlessDevice`
+  now goes through the same function. In `presenter.cpp`: the `vkCreateDevice` + queue code is
+  gone, `s_queueMutex` became `*s_queueMutexPtr` (a placeholder mutex until the device
+  exists, then the backend's; the renderer's and ui's `VulkanContext::queueMutex` is the same
+  lock as before in effect), `s_rhi` holds the device. Not changed: the presenter still
+  creates the instance and the surface (SDL), chooses the GPU, builds the feature chain,
+  and, as before, never destroys the device or instance (the process exits). Gate: replay
+  check passes on both captures (frames and presented picture), `rhi_vulkan_test` passes.
+  Next (2b): the swapchain, its images and the present timing behind an `rhi::Swapchain`.

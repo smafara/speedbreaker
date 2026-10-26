@@ -1,5 +1,6 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING).
 #include "vulkan_device.h"
+#include "vulkan_native.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -50,6 +51,7 @@ namespace gpu::rhi::vulkan
             PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties = nullptr;
             std::string deviceName;
             Capabilities caps;
+            Native native;
 
             uint32_t FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) const
             {
@@ -564,6 +566,7 @@ namespace gpu::rhi::vulkan
             }
 
             const Capabilities& GetCapabilities() const override { return m_c->caps; }
+            const vulkan::Native& Native() const { return m_c->native; }
 
             std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) override
             {
@@ -819,8 +822,6 @@ namespace gpu::rhi::vulkan
             vkDestroyInstance(c->instance, nullptr);
             return nullptr;
         }
-        vkGetPhysicalDeviceMemoryProperties(c->physical, &c->memory);
-        c->nonCoherentAtom = std::max<VkDeviceSize>(props.limits.nonCoherentAtomSize, 1);
 
         count = 0;
         vkEnumerateDeviceExtensionProperties(c->physical, nullptr, &count, nullptr);
@@ -846,7 +847,37 @@ namespace gpu::rhi::vulkan
         features.samplerAnisotropy = supported.samplerAnisotropy;
         features.textureCompressionBC = supported.textureCompressionBC;
         features.occlusionQueryPrecise = supported.occlusionQueryPrecise;
-        c->preciseOcclusion = supported.occlusionQueryPrecise;
+
+        DeviceConfig config;
+        config.instance = c->instance;
+        config.physical = c->physical;
+        config.queueFamily = c->family;
+        config.extensions = devExts;
+        config.features = &features;
+        std::unique_ptr<Device> device = CreateDevice(config);
+        if (!device)
+            vkDestroyInstance(c->instance, nullptr);
+        return device;
+    }
+
+    std::unique_ptr<Device> CreateDevice(const DeviceConfig& config)
+    {
+        auto c = std::make_unique<Context>();
+        c->instance = config.instance;
+        c->physical = config.physical;
+        c->family = config.queueFamily;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(c->physical, &props);
+        vkGetPhysicalDeviceMemoryProperties(c->physical, &c->memory);
+        c->nonCoherentAtom = std::max<VkDeviceSize>(props.limits.nonCoherentAtomSize, 1);
+        auto has = [&](const char* name) {
+            return std::any_of(config.extensions.begin(), config.extensions.end(), [name](const char* e) { return strcmp(e, name) == 0; });
+        };
+        const bool pushDescriptor = has(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+        const bool hostImport = has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        VkPhysicalDeviceFeatures supported;
+        vkGetPhysicalDeviceFeatures(c->physical, &supported);
+        c->preciseOcclusion = config.features && config.features->occlusionQueryPrecise;
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -854,17 +885,19 @@ namespace gpu::rhi::vulkan
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
         VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
-        dci.pEnabledFeatures = &features;
+        dci.pNext = config.next;
+        dci.pEnabledFeatures = config.features;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = uint32_t(devExts.size());
-        dci.ppEnabledExtensionNames = devExts.data();
-        if (vkCreateDevice(c->physical, &dci, nullptr, &c->device) != VK_SUCCESS)
+        dci.enabledExtensionCount = uint32_t(config.extensions.size());
+        dci.ppEnabledExtensionNames = config.extensions.data();
+        if (VkResult r = vkCreateDevice(c->physical, &dci, nullptr, &c->device); r != VK_SUCCESS)
         {
-            vkDestroyInstance(c->instance, nullptr);
+            fprintf(stderr, "[rhi/vulkan] vkCreateDevice failed (%d)\n", int(r));
             return nullptr;
         }
         vkGetDeviceQueue(c->device, c->family, 0, &c->queue);
+        c->native = { c->instance, c->physical, c->device, c->family, c->queue, &c->queueMutex };
         c->pushDescriptor = pushDescriptor ? reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
             vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR")) : nullptr;
         c->hostPointerProperties = hostImport ? reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
@@ -888,9 +921,14 @@ namespace gpu::rhi::vulkan
             caps.hostMemoryAlignment = std::max<uint64_t>(host.minImportedHostPointerAlignment, 1);
         }
         caps.maxBufferSize = props.limits.maxStorageBufferRange;
-        caps.textureCompressionBC = supported.textureCompressionBC;
-        caps.occlusionQueries = supported.occlusionQueryPrecise;
+        caps.textureCompressionBC = config.features && config.features->textureCompressionBC;
+        caps.occlusionQueries = c->preciseOcclusion;
         caps.timestampQueries = props.limits.timestampComputeAndGraphics;
         return std::make_unique<VkDeviceObject>(std::move(c));
+    }
+
+    const Native& GetNative(const rhi::Device& device)
+    {
+        return static_cast<const VkDeviceObject&>(device).Native();
     }
 }
