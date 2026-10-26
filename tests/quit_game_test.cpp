@@ -343,7 +343,12 @@ namespace
                 loop = int(i);
         CHECK(loop > 0, "main.cpp's game loop runs video::RunFrame");
         bool save = false, renderer = false, video = false, flush = false, exit0 = false, otherExit = false;
-        for (size_t i = loop + 1; loop > 0 && i < main.size() && Trim(main[i]) != "}"; i++)
+        // The loop's own body (the replay's way out) is skipped: its closing
+        // brace is the one at main()'s indentation.
+        size_t after = size_t(loop) + 1;
+        while (loop > 0 && after < main.size() && main[after] != "    }")
+            after++;
+        for (size_t i = after + 1; loop > 0 && i < main.size() && Trim(main[i]) != "}"; i++)
         {
             save |= Has(main[i], "settings::Save()");
             renderer |= Has(main[i], "gpu::renderer::Shutdown()");

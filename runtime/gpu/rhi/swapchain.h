@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 #include "types.h"
 
@@ -95,6 +96,10 @@ namespace gpu::rhi
         bool readable = false;           // CopySrc wanted (screenshots, NFSMW_CHECK_PRESENT_SEC); see Swapchain::Readable
         std::function<void(const PresentShown&)> onShown;      // empty: presents aren't timed
         std::function<void(const PresentReport&)> onReport;    // empty: not wanted
+        bool reportAll = false;          // reports for every present, not only the ones with a notBefore (diagnostics)
+        // Runs first on the backend's callback thread: the caller names it
+        // (hang reports) and sets its priority; the backend knows neither.
+        std::function<void()> onThreadStart;
     };
 
     // One request to show the image acquired last.
@@ -126,6 +131,8 @@ namespace gpu::rhi
         virtual bool Readable() const = 0;
         // For the log: "FIFO", "MAILBOX", "IMMEDIATE", "displaySync".
         virtual const char* PresentModeName() const = 0;
+        // The mode and what else the surface offers, for the system summary.
+        virtual std::string Describe() const = 0;
 
         // The next image to draw, usable as RenderTarget and CopyDst (and
         // CopySrc when Readable) and transitioned Undefined -> ... -> Present

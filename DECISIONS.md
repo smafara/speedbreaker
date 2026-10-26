@@ -114,7 +114,7 @@ implements it with push descriptors / descriptor sets, Metal with argument table
 Rejected: descriptor sets and pools as RHI objects, bindless (needs shader translator
 changes, deferred by D4).
 
-### D11. Swapchain and present timing (2026-10-26, DRAFT: awaiting the user's review)
+### D11. Swapchain and present timing (2026-10-26; the user said go ahead; implemented for Vulkan)
 `runtime/gpu/rhi/swapchain.h` (+ `Device::CreateSwapchain`, `SubmitToSwapchain`). The
 interface is not the Vulkan calls: Vulkan learns when a present reached the screen by
 waiting for it on a thread (VK_KHR_present_wait) and polls the driver's reports
@@ -474,3 +474,18 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   Next: `rhi::Swapchain` (images, acquire/present, present timing) and the presenter's
   post passes on top.
 - 2026-10-26: swapchain interface drafted (D11) for review; nothing implements it yet.
+- 2026-10-26: D11 implemented. `VkSurfaceObject`/`VkSwapchainObject` in the Vulkan backend:
+  acquire/present semaphores, the present-wait thread (owned by the swapchain, joined before it
+  is destroyed, so `video/swapchain_use.h` and its test are gone), driver reports polled after
+  each wait and sent as `PresentReport`, `notBefore` converted to display timing's
+  desiredPresentTime. The presenter now builds its swapchain through `Device::CreateSwapchain`,
+  acquires/presents through it, and keeps its pacing policy (callbacks `OnShown`, `OnReport`). Its
+  command buffers are still raw Vulkan (transitional accessors `NativeImage/NativeView/
+  NativeSubmitSemaphores/NativeFormat` in vulkan_native.h, to go when the post passes move to the
+  RHI); it takes the queue lock for its submit only, Present takes it inside. Every present now
+  has an id. `NFSMW_VBLANK_LOG`'s `.actual.csv` holds steady-clock ns now (was Metal host time).
+  Checks: replay check PASSED (incl. the presented picture), ctest 71/71 (quit_game_test fixed:
+  it scanned main()'s loop to the first `}`, which the replay exit had broken), live run 50 s:
+  presents timed, refresh fit valid (16.668 ms), and with NFSMW_PRESENT_AT=12.5 907 presents
+  shown at a time, 823 driver reports, no watchdog trip.
+  Next: the post passes against the RHI (AA, FSR1, tone, scale), then slim `RunFrame`.

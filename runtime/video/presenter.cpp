@@ -17,7 +17,6 @@
 #include "present_schedule.h"
 #include "hfr_schedule.h"
 #include <game/hfr.h>
-#include "swapchain_use.h"
 #include "picture_fit.h"
 #include "frame_rate.h"
 #include "swapchain_policy.h"
@@ -77,14 +76,16 @@ namespace video
         uint32_t s_queueFamily = 0;
         VkQueue s_queue = VK_NULL_HANDLE;
 
-        VkSwapchainKHR s_swapchain = VK_NULL_HANDLE;
+        // The window's surface and the swapchain on it (gpu/rhi/swapchain.h), and
+        // the image acquired this frame (the swapchain's, valid until it is presented).
+        std::unique_ptr<gpu::rhi::Surface> s_rhiSurface;
+        std::unique_ptr<gpu::rhi::Swapchain> s_swapchain;
+        gpu::rhi::Image* s_acquired = nullptr;
         VkFormat s_swapFormat = VK_FORMAT_B8G8R8A8_UNORM;
         VkExtent2D s_swapExtent{};
         // The last swapchain's extent (width << 32 | height), for FrameRegion
         // on other threads: the renderer's Auto internal resolution follows it.
         std::atomic<uint64_t> s_regionExtent{ 0 };
-        std::vector<VkImage> s_swapImages;
-        std::vector<VkImageView> s_swapViews;  // for the post-processing pass
         bool s_swapReadable = false;
         // The present scale (iOS): Settings > Display > Screen Resolution's
         // 100% or 75%, or NFSMW_PRESENT_SCALE=<0.5..1> (an experiment for
@@ -119,7 +120,6 @@ namespace video
         struct Frame
         {
             VkCommandBuffer cmd = VK_NULL_HANDLE;
-            VkSemaphore imageAvailable = VK_NULL_HANDLE;
             VkFence inFlight = VK_NULL_HANDLE;
             VkBuffer staging = VK_NULL_HANDLE;
             VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
@@ -141,7 +141,6 @@ namespace video
         // the UI included, as in [perf]): the same scenes, the same clocks.
         const bool s_upscaleAb = [] { const char* v = std::getenv("NFSMW_UPSCALE_AB"); return v && v[0] == '1'; }();
         uint64_t s_abFrames[3]{}, s_abNs[3]{}, s_abAaNs[3]{};  // by upscale::Pass; main thread
-        std::vector<VkSemaphore> s_renderDone;  // one per swapchain image
         // The device and its queue belong to the RHI's Vulkan backend (gpu/rhi/vulkan),
         // which made them from what Initialize chose; the lock is its queue lock
         // (a placeholder one until the device exists).
@@ -331,40 +330,30 @@ namespace video
         }
 
         // ---------------------------------------------------------------
-        // Present timing. With VK_KHR_present_id and VK_KHR_present_wait a
-        // thread waits for each present to reach the screen and timestamps
-        // it. The times measure the display's refresh (RefreshFit), which the
+        // Present timing. Where the device can time presents (the RHI's
+        // Capabilities::presentTiming: Vulkan's VK_KHR_present_id and
+        // VK_KHR_present_wait, which the backend's thread waits on) the swapchain
+        // tells OnShown when each present reached the screen. The times measure the display's refresh (RefreshFit), which the
         // guest vblank locks to (GuestVblank), and show a game frame kept on
         // screen for more refreshes than the game gave it vblanks (repeated).
-        // The waits run beside presents to the same swapchain, as the
-        // extension is used: the WSIs synchronise the two internally (Mesa's,
-        // MoltenVK's), though the spec leaves that to the caller. The waiter
-        // uses a swapchain (its waits, the driver's reports) only through
-        // s_swapchainUse, and destroying one waits until no use is on it
-        // (video/swapchain_use.h).
+        // The backend's thread waits beside the presents to the same swapchain
+        // and joins before the swapchain is destroyed (so, off it for good).
         bool s_presentTiming = false;
-        PFN_vkWaitForPresentKHR s_waitForPresent = nullptr;
         uint64_t s_presentId = 0;  // main thread: the last present's
         struct PresentTiming
         {
             uint64_t id;
-            uint64_t swapchain;  // its generation (s_swapchainUse)
-            int64_t presented;  // vkQueuePresentKHR (ns, steady clock)
+            int64_t presented;  // Present was called (ns, steady clock)
             int64_t vblank;     // a new game frame: the guest vblank it followed; 0: a redraw
             int64_t ready;      // ready to present (= presented, but for a frame held for its refresh: VblankLock::PresentAt)
             float between = 0;  // an in-between picture's fraction of the step (game/hfr.h; its vblank is 0)
             int64_t desired = 0;  // macOS: the time it was asked to be shown at (0: when ready)
         };
-        // Never destroyed: the waiter is detached and blocks on them, and
-        // glibc's pthread_cond_destroy waits for blocked waiters, so an exit
-        // through main's return (no xex, a cancelled install) would hang.
+        // What each present in flight was for, by id, until it is seen on screen
+        // (pushed before the present, so the callback always finds it). Never
+        // destroyed: the backend's thread may be in them at exit.
         std::mutex& s_timingMutex = *new std::mutex;
-        std::condition_variable& s_timingCv = *new std::condition_variable;
-        std::deque<PresentTiming>& s_timings = *new std::deque<PresentTiming>;  // presented, not yet seen on screen
-        // The swapchain the waiter may use (never destroyed either), and its
-        // generation (main thread; 0: none).
-        SwapchainUse<VkSwapchainKHR>& s_swapchainUse = *new SwapchainUse<VkSwapchainKHR>;
-        uint64_t s_swapchainGeneration = 0;
+        std::deque<PresentTiming>& s_timings = *new std::deque<PresentTiming>;
         FILE* s_timingLog = nullptr;          // NFSMW_VBLANK_LOG=<file>: one CSV line per present
         // Display refreshes per 60 Hz guest vblank the fit should expect: the
         // display mode's rate over 60 where that is 2-4 (video/refresh_multiple.h),
@@ -402,7 +391,6 @@ namespace video
         int64_t s_showAfterVblankNs = 0;
 #if defined(__APPLE__) && !TARGET_OS_IOS
         constexpr int64_t kShowAfterVblankNs = 12'500'000;
-        uint32_t s_displayTimingId = 0;  // main thread
         // The decision and the watchdog (main thread: Wanted; the waiter:
         // the driver's reports), and the frames shown at a time not reported
         // on yet: present id -> the time asked for (steady clock). The
@@ -438,7 +426,6 @@ namespace video
         // never shown; the first line gives the steady clock against it). The
         // present wait returns well before it there (Metal's scheduling, not
         // the panel).
-        PFN_vkGetPastPresentationTimingGOOGLE s_pastTiming = nullptr;
         FILE* s_actualLog = nullptr;
 
         int64_t NowNs()
@@ -447,57 +434,54 @@ namespace video
         }
 
 #if defined(__APPLE__) && !TARGET_OS_IOS
-        // Metal's host time is mach_absolute_time's (CLOCK_UPTIME_RAW); the
-        // steady clock goes on through sleep. Steady = host + this.
-        int64_t HostToSteadyNs()
+        void LogWatchdogTrip()
         {
-            return NowNs() - int64_t(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+            if (s_schedule.GetReason() == PresentSchedule::Reason::Unreported)
+                fprintf(stderr, "[vblank] new frames shown when ready from now on: %u frames shown at a time were presented and the "
+                    "driver reported none of them (VK_GOOGLE_display_timing)\n", PresentSchedule::kUnreported);
+            else
+                fprintf(stderr, "[vblank] new frames shown when ready from now on: the time asked for wasn't kept for %u of the last %u "
+                    "frames shown at a time (the driver's reports, VK_GOOGLE_display_timing: %llu shown over %lld ms early, %llu never "
+                    "shown)\n", s_schedule.BadInWindow(), s_schedule.ReportedInWindow(), (unsigned long long)s_schedule.Early(),
+                    (long long)(PresentSchedule::kEarlyNs / 1'000'000), (unsigned long long)s_schedule.NotShown());
         }
 
-        // Waiter thread, after each present wait (`t` the present waited
-        // for): the driver's reports on the presents shown since the last
-        // call, to NFSMW_VBLANK_LOG's .actual.csv and, for frames shown at a
-        // time, to the watchdog; and `t`, if shown at a time, counted as
-        // presented (the driver reports it a present or so later). The
-        // reports are read only while `t`'s swapchain is the current one,
-        // and it isn't destroyed under the read: a swapchain destroyed since
-        // the wait (a fullscreen toggle, a resize) has none left to read.
-        void ReadDriverReports(const PresentTiming& t)
+        // The backend's thread: the driver's report on a present shown at a
+        // time (swapchain.h PresentReport), to NFSMW_VBLANK_LOG's .actual.csv
+        // and the watchdog. Arrives a present or so after it was shown.
+        void OnReport(const gpu::rhi::PresentReport& e)
         {
-            uint32_t count = 0;
-            std::vector<VkPastPresentationTimingGOOGLE> past;
-            s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
-                if (s_pastTiming(s_device, swapchain, &count, nullptr) == VK_SUCCESS && count)
-                {
-                    past.resize(count);
-                    if (s_pastTiming(s_device, swapchain, &count, past.data()) < VK_SUCCESS)
-                        count = 0;
-                    past.resize(count);
-                }
-            });
-            const int64_t hostToSteady = HostToSteadyNs();
             bool tripped = false;
             {
                 std::lock_guard lock(s_scheduleMutex);
-                for (const VkPastPresentationTimingGOOGLE& e : past)
-                {
-                    if (s_actualLog)
-                        fprintf(s_actualLog, "%u,%llu\n", e.presentID, (unsigned long long)e.actualPresentTime);
-                    for (ScheduledPresent& p : s_scheduled)
-                        if (p.id == e.presentID && p.desiredNs)
-                        {
-                            const bool shown = e.actualPresentTime != 0;
-                            tripped |= s_schedule.Reported(shown, shown ? int64_t(e.actualPresentTime) + hostToSteady - p.desiredNs : 0);
-                            if (const int64_t now = NowNs(); s_hfrShowAdapt && shown && now < s_hfrActiveUntil.load(std::memory_order_relaxed))
-                                if (s_hfrAdapt.Report(int64_t(e.actualPresentTime) + hostToSteady - p.desiredNs, now))
-                                    fprintf(stderr, "[hfr] pictures shown %.2f ms after their vblank's time (+%.2f: %s; next earlier after %.0f s "
-                                                    "without a late one)\n", double(s_showAfterVblankNs + s_hfrAdapt.ExtraNs()) / 1e6,
-                                        double(s_hfrAdapt.ExtraNs()) / 1e6, "the real pictures weren't ready by their time" ,
-                                        double(s_hfrAdapt.HoldNs()) / 1e9);
-                            p = {};
-                            break;
-                        }
-                }
+                if (s_actualLog)
+                    fprintf(s_actualLog, "%llu,%lld\n", (unsigned long long)e.id, (long long)e.onScreen);
+                for (ScheduledPresent& p : s_scheduled)
+                    if (p.id == uint32_t(e.id) && p.desiredNs)
+                    {
+                        const bool shown = e.onScreen != 0;
+                        tripped |= s_schedule.Reported(shown, shown ? e.onScreen - p.desiredNs : 0);
+                        if (const int64_t now = NowNs(); s_hfrShowAdapt && shown && now < s_hfrActiveUntil.load(std::memory_order_relaxed))
+                            if (s_hfrAdapt.Report(e.onScreen - p.desiredNs, now))
+                                fprintf(stderr, "[hfr] pictures shown %.2f ms after their vblank's time (+%.2f: %s; next earlier after %.0f s "
+                                                "without a late one)\n", double(s_showAfterVblankNs + s_hfrAdapt.ExtraNs()) / 1e6,
+                                    double(s_hfrAdapt.ExtraNs()) / 1e6, "the real pictures weren't ready by their time" ,
+                                    double(s_hfrAdapt.HoldNs()) / 1e9);
+                        p = {};
+                        break;
+                    }
+            }
+            if (tripped)
+                LogWatchdogTrip();
+        }
+
+        // `t`, if shown at a time, counted as presented (the driver reports
+        // it a present or so later).
+        void CountScheduledPresented(const PresentTiming& t)
+        {
+            bool tripped = false;
+            {
+                std::lock_guard lock(s_scheduleMutex);
                 for (ScheduledPresent& p : s_scheduled)
                     if (p.id == uint32_t(t.id) && p.desiredNs && !p.waited)
                     {
@@ -507,16 +491,7 @@ namespace video
                     }
             }
             if (tripped)
-            {
-                if (s_schedule.GetReason() == PresentSchedule::Reason::Unreported)
-                    fprintf(stderr, "[vblank] new frames shown when ready from now on: %u frames shown at a time were presented and the "
-                        "driver reported none of them (VK_GOOGLE_display_timing)\n", PresentSchedule::kUnreported);
-                else
-                    fprintf(stderr, "[vblank] new frames shown when ready from now on: the time asked for wasn't kept for %u of the last %u "
-                        "frames shown at a time (the driver's reports, VK_GOOGLE_display_timing: %llu shown over %lld ms early, %llu never "
-                        "shown)\n", s_schedule.BadInWindow(), s_schedule.ReportedInWindow(), (unsigned long long)s_schedule.Early(),
-                        (long long)(PresentSchedule::kEarlyNs / 1'000'000), (unsigned long long)s_schedule.NotShown());
-            }
+                LogWatchdogTrip();
         }
 #endif
 
@@ -571,8 +546,7 @@ namespace video
                     (long long)t.presented, (long long)onScreen, timed, display.valid, display.periodNs, (long long)display.gridNs,
                     display.rmsNs, (long long)t.ready, display.multiple, t.between, (long long)t.desired);
 #if defined(__APPLE__) && !TARGET_OS_IOS
-            if (s_pastTiming)
-                ReadDriverReports(t);
+            CountScheduledPresented(t);
 #endif
             if (t.between != 0)
                 s_betweenShown++;
@@ -618,59 +592,32 @@ namespace video
             vblank.Observe(t.vblank, t.presented, onScreen, t.ready);
         }
 
-        void PresentWaiter()
+        // The backend's thread: a present reached the screen. Its entry (pushed
+        // before the present) goes; older ones were never reported (the
+        // backend drops the oldest of many waiting) and go with it.
+        void OnShown(const gpu::rhi::PresentShown& shown)
         {
-            SetHostThreadName("nfsmw-present");
-#if defined(__APPLE__) && !TARGET_OS_IOS
-            // As the threads that present (the main thread) and draw: it
-            // takes MoltenVK's swapchain locks beside their presents.
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-            while (true)
+            PresentTiming t{};
             {
-                PresentTiming t;
-                {
-                    std::unique_lock lock(s_timingMutex);
-                    s_timingCv.wait(lock, [] { return !s_timings.empty(); });
-                    t = s_timings.front();
-                }
-                int64_t start = NowNs();
-                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;  // its swapchain is gone
-                s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
-                    r = s_waitForPresent(s_device, swapchain, t.id, 50'000'000);
-                });
-                int64_t now = NowNs();
-                {
-                    std::lock_guard lock(s_timingMutex);
-                    // Not on screen yet: wait again. A hidden window may show
-                    // nothing for a long time; past 8 waiting, drop the oldest.
-                    if (r == VK_TIMEOUT && s_timings.size() <= 8)
-                        continue;
-                    if (!s_timings.empty() && s_timings.front().id == t.id)
-                        s_timings.pop_front();
-                }
-                if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)
-                    OnScreen(t, now, now - start > 50'000);
+                std::lock_guard lock(s_timingMutex);
+                auto it = std::find_if(s_timings.begin(), s_timings.end(), [&](const PresentTiming& e) { return e.id == shown.id; });
+                if (it == s_timings.end())
+                    return;
+                t = *it;
+                s_timings.erase(s_timings.begin(), it + 1);
             }
+            t.presented = shown.presented;
+            OnScreen(t, shown.onScreen, shown.timed);
         }
 
-        // The surface's extent: Vulkan's current extent, else (Wayland: the
-        // swapchain decides) the window's pixels.
-        Extent SurfaceExtent(const VkSurfaceCapabilitiesKHR& caps)
-        {
-            if (caps.currentExtent.width != UINT32_MAX)
-                return { caps.currentExtent.width, caps.currentExtent.height };
-            int w = 0, h = 0;
-            SDL_GetWindowSizeInPixels(s_window, &w, &h);
-            return { uint32_t(std::max(w, 0)), uint32_t(std::max(h, 0)) };
-        }
-
+        // The surface's extent (the window's pixels where the surface leaves it
+        // to the swapchain: Wayland).
         Extent SurfaceExtent()
         {
-            VkSurfaceCapabilitiesKHR caps{};
-            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps) != VK_SUCCESS)
+            if (!s_rhiSurface)
                 return {};
-            return SurfaceExtent(caps);
+            const gpu::rhi::Extent3D e = s_rhiSurface->CurrentExtent();
+            return { e.width, e.height };
         }
 
         // The interface's orientation and whether the app is landscape-only
@@ -750,22 +697,10 @@ namespace video
 
         void DestroySwapchain()
         {
-            {
-                s_swapchainUse.Retire();  // the waiter is off it after this, and stays off
-                std::lock_guard lock(s_timingMutex);
-                std::erase_if(s_timings, [](const PresentTiming& t) { return t.swapchain == s_swapchainGeneration; });
-                s_swapchainGeneration = 0;
-            }
-            for (VkSemaphore s : s_renderDone)
-                vkDestroySemaphore(s_device, s, nullptr);
-            s_renderDone.clear();
-            for (VkImageView v : s_swapViews)
-                vkDestroyImageView(s_device, v, nullptr);
-            s_swapViews.clear();
-            if (s_swapchain)
-                vkDestroySwapchainKHR(s_device, s_swapchain, nullptr);
-            s_swapchain = VK_NULL_HANDLE;
-            s_swapImages.clear();
+            // Its thread is joined and the display is done with its images when
+            // this returns (the callers have waited for the GPU).
+            s_acquired = nullptr;
+            s_swapchain.reset();
         }
 
         bool CreateSwapchain()
@@ -777,13 +712,11 @@ namespace video
             if ((s_presentScale < 1.0f || s_viewScaled) && platform::ios::SetDrawableScale(s_window, s_presentScale))
                 s_viewScaled = true;
 #endif
-            VkSurfaceCapabilitiesKHR caps;
-            vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps);
             const VkExtent2D previous = s_swapExtent;
             // A landscape-only iPhone takes no portrait swapchain under a
             // landscape interface (swapchain_policy.h): the same size turned,
             // while the view is fitted back to its window.
-            const Extent surface = SurfaceExtent(caps);
+            const Extent surface = SurfaceExtent();
             const ExtentChoice choice = ChooseExtent(surface, InterfaceNow(), LandscapeOnlyHere());
             s_swapExtent = { choice.extent.width, choice.extent.height };
             if (s_swapExtent.width == 0 || s_swapExtent.height == 0)
@@ -796,89 +729,55 @@ namespace video
             // drawables' with iOS's present scale), not the window's pixels.
             ui::SetFramebufferSize(s_swapExtent.width, s_swapExtent.height);
 
-            uint32_t count = 0;
-            vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, nullptr);
-            std::vector<VkSurfaceFormatKHR> formats(count);
-            vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, formats.data());
-            // B8G8R8A8_UNORM in plain sRGB: the picture is sRGB-encoded.
-            // MoltenVK lists each format in every color space it knows (asked
-            // for VK_EXT_swapchain_colorspace or not), and the last
-            // B8G8R8A8_UNORM entry is Display P3 *linear*: the layer showed
-            // the picture's values as linear light, washed out and pale
-            // (captures of the swapchain looked right: its values were).
-            auto pick = [&](VkFormat format) {
-                return std::find_if(formats.begin(), formats.end(), [&](const VkSurfaceFormatKHR& f) {
-                    return (format == VK_FORMAT_UNDEFINED || f.format == format) && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-                });
-            };
-            auto chosen = pick(VK_FORMAT_B8G8R8A8_UNORM);
-            if (chosen == formats.end())
-                chosen = pick(VK_FORMAT_UNDEFINED);
-            if (chosen == formats.end())
-                chosen = formats.begin();
-            s_swapFormat = chosen->format;
-            VkColorSpaceKHR colorSpace = chosen->colorSpace;
-            static bool formatLogged = false;
-            if (!std::exchange(formatLogged, true))
-                fprintf(stderr, "[video] swapchain format %d, color space %d (%zu offered)\n", int(s_swapFormat), int(colorSpace), formats.size());
-
-            VkSwapchainCreateInfoKHR info{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
-            info.surface = s_surface;
-#ifdef __APPLE__
+            gpu::rhi::SwapchainDesc desc;
+            desc.extent = { s_swapExtent.width, s_swapExtent.height, 1 };
+            desc.preferredFormat = gpu::rhi::Format::BGRA8;
+            desc.vsync = s_vsync;
             // MoltenVK takes the CAMetalLayer drawable inside vkQueuePresentKHR,
             // which holds the queue mutex: with 2 drawables (its minimum) that
             // waited for the display to free one, and the command processor
             // waited behind it (on an iPhone 86% of its time, "queue lock" in
             // NFSMW_LOG_LATENCY). Linux drivers ask for 3 themselves.
-            info.minImageCount = std::max(caps.minImageCount, 3u);
+#ifdef __APPLE__
+            desc.minImages = 3;
 #else
-            info.minImageCount = std::max(caps.minImageCount, 2u);
+            desc.minImages = 2;
 #endif
-            if (caps.maxImageCount)
-                info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
-            info.imageFormat = s_swapFormat;
-            info.imageColorSpace = colorSpace;
-            info.imageExtent = s_swapExtent;
-            info.imageArrayLayers = 1;
-            info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);  // NFSMW_CHECK_PRESENT_SEC captures
-            s_swapReadable = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
-            info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            info.preTransform = caps.currentTransform;
-            info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-            // V-Sync off: mailbox (no tearing, newest frame) where there is
-            // one, else immediate.
-            info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-            if (!s_vsync)
+            if (s_presentTiming)
             {
-                uint32_t modeCount = 0;
-                vkGetPhysicalDeviceSurfacePresentModesKHR(s_physical, s_surface, &modeCount, nullptr);
-                std::vector<VkPresentModeKHR> modes(modeCount);
-                vkGetPhysicalDeviceSurfacePresentModesKHR(s_physical, s_surface, &modeCount, modes.data());
-                for (VkPresentModeKHR wanted : { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR })
-                    if (std::find(modes.begin(), modes.end(), wanted) != modes.end())
-                    {
-                        info.presentMode = wanted;
-                        break;
-                    }
+                desc.onShown = OnShown;
+                desc.onThreadStart = [] {
+                    SetHostThreadName("nfsmw-present");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+                    // As the threads that present (the main thread) and draw: it
+                    // takes MoltenVK's swapchain locks beside their presents.
+                    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+                };
             }
-            info.clipped = VK_TRUE;
-            if (!Check(vkCreateSwapchainKHR(s_device, &info, nullptr, &s_swapchain), "vkCreateSwapchainKHR"))
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            if (s_displayTiming)
+            {
+                desc.onReport = OnReport;
+                desc.reportAll = s_actualLog != nullptr;
+            }
+#endif
+            s_swapchain = s_rhi->CreateSwapchain(*s_rhiSurface, desc);
+            if (!s_swapchain)
                 return false;
+            s_swapFormat = gpu::rhi::vulkan::NativeFormat(*s_swapchain);
+            s_swapReadable = s_swapchain->Readable();
             {
                 // Once per change: the V-Sync setting's effect, in the log.
-                static int logged = -1;
-                if (logged != int(info.presentMode) * 2 + s_vsync)
+                static std::string logged;
+                const std::string mode = std::format("{} {}", s_swapchain->PresentModeName(), s_vsync);
+                if (logged != mode)
                 {
-                    logged = int(info.presentMode) * 2 + s_vsync;
-                    const char* mode = info.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO"
-                        : info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR           ? "MAILBOX"
-                                                                                    : "IMMEDIATE";
-                    fprintf(stderr, "[video] present mode %s (V-Sync %s%s)\n", mode, s_vsync ? "on" : "off",
-                        !s_vsync && info.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "; the surface offers nothing else" : "");
+                    logged = mode;
+                    fprintf(stderr, "[video] present mode %s (V-Sync %s%s)\n", s_swapchain->PresentModeName(), s_vsync ? "on" : "off",
+                        !s_vsync && std::string_view(s_swapchain->PresentModeName()) == "FIFO" ? "; the surface offers nothing else" : "");
                 }
             }
-            s_swapchainGeneration = s_swapchainUse.Publish(s_swapchain);
             if (s_uiReady)
                 ui::SetFormat(s_swapFormat);
             s_swapPolicy.Created({ s_swapExtent.width, s_swapExtent.height });
@@ -901,29 +800,12 @@ namespace video
                     s_sameSizeLogged == 10 ? "; no more same-size rebuilds logged" : "");
             }
 
-            vkGetSwapchainImagesKHR(s_device, s_swapchain, &count, nullptr);
-            s_swapImages.resize(count);
-            vkGetSwapchainImagesKHR(s_device, s_swapchain, &count, s_swapImages.data());
 #ifdef _WIN32
             {
                 // The present mode with what else the surface offers, and
                 // the images the driver made (once per change; the system
                 // summary's "Present").
-                uint32_t modeCount = 0;
-                vkGetPhysicalDeviceSurfacePresentModesKHR(s_physical, s_surface, &modeCount, nullptr);
-                std::vector<VkPresentModeKHR> modes(modeCount);
-                vkGetPhysicalDeviceSurfacePresentModesKHR(s_physical, s_surface, &modeCount, modes.data());
-                std::string offered;
-                for (VkPresentModeKHR m : modes)
-                    offered += std::format("{}{}", offered.empty() ? "" : ", ",
-                        m == VK_PRESENT_MODE_IMMEDIATE_KHR ? "IMMEDIATE" : m == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
-                        : m == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : m == VK_PRESENT_MODE_FIFO_RELAXED_KHR ? "FIFO_RELAXED"
-                        : std::to_string(int(m)));
-                std::string text = std::format("{} (V-Sync {}), {} images (the surface offers {}, and {} images)",
-                    info.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "MAILBOX"
-                        : "IMMEDIATE", s_vsync ? "on" : "off", count, offered,
-                    caps.maxImageCount ? std::format("{} to {}", caps.minImageCount, caps.maxImageCount)
-                                       : std::format("{} or more", caps.minImageCount));
+                std::string text = std::format("{} (V-Sync {})", s_swapchain->Describe(), s_vsync ? "on" : "off");
                 if (text != s_presentText)
                 {
                     s_presentText = text;
@@ -935,20 +817,6 @@ namespace video
                 NoteDisplay(std::exchange(first, false) ? "seen at start" : "seen as the swapchain was rebuilt");
             }
 #endif
-            s_renderDone.resize(count);
-            VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            for (auto& s : s_renderDone)
-                vkCreateSemaphore(s_device, &si, nullptr, &s);
-            s_swapViews.resize(count);
-            for (uint32_t i = 0; i < count; i++)
-            {
-                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                vci.image = s_swapImages[i];
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = s_swapFormat;
-                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCreateImageView(s_device, &vci, nullptr, &s_swapViews[i]);
-            }
             return true;
         }
 
@@ -2994,15 +2862,16 @@ void main()
             s_queue = native.queue;
             s_queueMutexPtr = native.queueMutex;
         }
-        if (s_presentTiming)
-            s_waitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(s_device, "vkWaitForPresentKHR");
-        s_presentTiming = s_waitForPresent != nullptr;
+        s_rhiSurface = gpu::rhi::vulkan::CreateSurface(*s_rhi, s_surface, [] {
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(s_window, &w, &h);
+            return gpu::rhi::Extent3D{ uint32_t(std::max(w, 0)), uint32_t(std::max(h, 0)), 1 };
+        });
+        s_presentTiming = s_presentTiming && s_rhi->GetCapabilities().presentTiming;
 #if defined(__APPLE__) && !TARGET_OS_IOS
         // No frame is shown at a time without the driver's reports and the
-        // present waiter that reads them (the watchdog).
-        if (s_displayTiming && s_presentTiming)
-            s_pastTiming = (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(s_device, "vkGetPastPresentationTimingGOOGLE");
-        if (!s_pastTiming)
+        // present timing that goes with them (the watchdog).
+        if (!(s_displayTiming && s_presentTiming && s_rhi->GetCapabilities().scheduledPresent))
             s_displayTiming = false;
 #endif
         if (s_presentTiming)
@@ -3012,12 +2881,11 @@ void main()
                 {
                     fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns,ready,multiple,between,desired\n");
 #if defined(__APPLE__) && !TARGET_OS_IOS
-                    if (s_pastTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
+                    if (s_displayTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
                         fprintf(s_actualLog, "# steady_ns %lld uptime_raw_ns %llu\nid,actual_ns\n", (long long)NowNs(),
                             (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
 #endif
                 }
-            std::thread(PresentWaiter).detach();
         }
 #if defined(__APPLE__) && !TARGET_OS_IOS
         if (s_displayTiming && s_showAfterVblankNs > 0 && s_schedule.GetMode() != PresentSchedule::Mode::Off)
@@ -3050,8 +2918,6 @@ void main()
             cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             cai.commandBufferCount = 1;
             vkAllocateCommandBuffers(s_device, &cai, &f.cmd);
-            VkSemaphoreCreateInfo si{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            vkCreateSemaphore(s_device, &si, nullptr, &f.imageAvailable);
             VkFenceCreateInfo fi{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
             fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             vkCreateFence(s_device, &fi, nullptr, &f.inFlight);
@@ -4053,13 +3919,12 @@ void main()
             vkDestroyImageView(s_device, f.sourceView, nullptr);  // the last use of this frame slot has finished
             f.sourceView = VK_NULL_HANDLE;
         }
-        uint32_t imageIndex;
-        VkResult acquire = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX, f.imageAvailable, VK_NULL_HANDLE, &imageIndex);
+        const gpu::rhi::SurfaceStatus acquire = s_swapchain->Acquire(s_acquired);
         // Either is for the next frame's CheckSwapchain, which runs before
         // its acquire (one decision a frame: the policy counts in frames).
-        if (acquire == VK_SUBOPTIMAL_KHR)
+        if (acquire == gpu::rhi::SurfaceStatus::Suboptimal)
             s_swapPolicy.Reported(SurfaceResult::Suboptimal);  // this frame is drawn and presented anyway
-        if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
+        if (acquire == gpu::rhi::SurfaceStatus::OutOfDate)
         {
             s_swapPolicy.Reported(SurfaceResult::OutOfDate);
             // Screenshots wait for the next frame drawn.
@@ -4116,7 +3981,8 @@ void main()
             }
         }
 
-        VkImage dst = s_swapImages[imageIndex];
+        VkImage dst = gpu::rhi::vulkan::NativeImage(*s_acquired);
+        const VkImageView dstView = gpu::rhi::vulkan::NativeView(*s_acquired);
         VkBuffer captureBuffer = VK_NULL_HANDLE;
         VkDeviceMemory captureMemory = VK_NULL_HANDLE;
         VkDeviceSize captureSize = 0;
@@ -4260,7 +4126,7 @@ void main()
             Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
             VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
-            color.imageView = s_swapViews[imageIndex];
+            color.imageView = dstView;
             color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars
             color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -4411,7 +4277,7 @@ void main()
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
                 VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
-                color.imageView = s_swapViews[imageIndex];
+                color.imageView = dstView;
                 color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -4432,41 +4298,29 @@ void main()
         }
         vkEndCommandBuffer(cmd);
 
+        VkSemaphore acquireDone, renderDone;
+        gpu::rhi::vulkan::NativeSubmitSemaphores(*s_swapchain, acquireDone, renderDone);
         VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &f.imageAvailable;
+        si.pWaitSemaphores = &acquireDone;
         si.pWaitDstStageMask = &waitStage;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_renderDone[imageIndex];
+        si.pSignalSemaphores = &renderDone;
         std::unique_lock queueLock(*s_queueMutexPtr);
         vkQueueSubmit(s_queue, 1, &si, f.inFlight);
+        queueLock.unlock();  // (Present takes the backend's queue lock itself)
         frontLock.unlock();
 
-        VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_renderDone[imageIndex];
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &s_swapchain;
-        pi.pImageIndices = &imageIndex;
-        VkPresentIdKHR presentId{ VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
-        uint64_t id = 0;
-        if (s_presentTiming)
-        {
-            id = ++s_presentId;
-            presentId.swapchainCount = 1;
-            presentId.pPresentIds = &id;
-            pi.pNext = &presentId;
-        }
+        const uint64_t presentId = ++s_presentId;
 #if defined(__APPLE__) && !TARGET_OS_IOS
-        VkPresentTimeGOOGLE presentTime{};
-        VkPresentTimesInfoGOOGLE presentTimes{ VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE };
+        // The time to show a new frame at (steady clock; 0: when ready),
+        // where present_schedule.h says so. A redraw (menus over a paused
+        // game): when ready. The backend converts it for the driver.
+        int64_t notBefore = 0;
         if (s_displayTiming)
         {
-            presentTime.presentID = s_presentTiming ? uint32_t(id) : ++s_displayTimingId;
-            // A new frame, at its vblank's time where present_schedule.h
-            // says so. A redraw (menus over a paused game): when ready.
             if (frameVblank && s_showAfterVblankNs > 0)
             {
                 const bool locked = GuestVblank().Locked();
@@ -4479,8 +4333,7 @@ void main()
                     {
                         // HFR on a grid (HfrGrid; on a Mac only made up, NFSMW_HFR_GRID_HZ): its refresh.
                         frameDesired = frameTarget;
-                        s_scheduled[s_scheduledNext++ % std::size(s_scheduled)] = { presentTime.presentID, frameTarget, false };
-                        presentTime.desiredPresentTime = uint64_t(std::max<int64_t>(frameTarget - HostToSteadyNs(), 0));
+                        s_scheduled[s_scheduledNext++ % std::size(s_scheduled)] = { uint32_t(presentId), frameTarget, false };
                     }
                     else if (wanted)
                     {
@@ -4498,10 +4351,10 @@ void main()
                             s_hfrLastDesired = desired;
                         }
                         frameDesired = desired;
-                        s_scheduled[s_scheduledNext++ % std::size(s_scheduled)] = { presentTime.presentID, desired, false };
-                        presentTime.desiredPresentTime = uint64_t(std::max<int64_t>(desired - HostToSteadyNs(), 0));
+                        s_scheduled[s_scheduledNext++ % std::size(s_scheduled)] = { uint32_t(presentId), desired, false };
                     }
                 }
+                notBefore = frameDesired;
                 // A line when it changes (the first few).
                 static int last = -1, lines = 0;
                 if (int(wanted) != last && lines < 8)
@@ -4513,16 +4366,6 @@ void main()
                         : std::format("when ready: a {:.2f} Hz display", s_displayHz).c_str());
                 }
                 last = int(wanted);
-            }
-            // Only a frame shown at a time carries the driver's present
-            // times (and, for NFSMW_VBLANK_LOG, every present): the rest are
-            // presented exactly as in v0.1.3.
-            if (presentTime.desiredPresentTime || s_actualLog)
-            {
-                presentTimes.swapchainCount = 1;
-                presentTimes.pTimes = &presentTime;
-                presentTimes.pNext = pi.pNext;
-                pi.pNext = &presentTimes;
             }
         }
 #endif
@@ -4546,22 +4389,29 @@ void main()
         }
         if (at > ready && at - ready < 100'000'000)
         {
-            queueLock.unlock();
 #ifdef _WIN32
             platform::SleepUntil(at);  // a high-resolution timer: a 1 ms sleep_until wakes ~1.3 ms late here
 #else
             std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(at)));
 #endif
-            queueLock.lock();
             presented = NowNs();
         }
-        VkResult present = vkQueuePresentKHR(s_queue, &pi);
-        queueLock.unlock();
-        if (s_presentTiming && (present == VK_SUCCESS || present == VK_SUBOPTIMAL_KHR))
+        // What the present was for, before it: the backend's thread may see it on screen at once.
+        if (s_presentTiming)
         {
             std::lock_guard lock(s_timingMutex);
-            s_timings.push_back({ id, s_swapchainGeneration, presented, frameBetween != 0.0f ? 0 : frameVblank, ready, frameBetween, frameDesired });
-            s_timingCv.notify_one();
+            s_timings.push_back({ presentId, presented, frameBetween != 0.0f ? 0 : frameVblank, ready, frameBetween, frameDesired });
+        }
+        gpu::rhi::PresentRequest request;
+        request.id = presentId;
+        request.presented = presented;
+        request.notBefore = notBefore;
+        const gpu::rhi::SurfaceStatus present = s_swapchain->Present(request);
+        s_acquired = nullptr;
+        if (s_presentTiming && present == gpu::rhi::SurfaceStatus::OutOfDate)
+        {
+            std::lock_guard lock(s_timingMutex);
+            std::erase_if(s_timings, [&](const PresentTiming& e) { return e.id == presentId; });
         }
         s_lastPresent = std::chrono::steady_clock::now();
         if (frameBetween != 0.0f)
@@ -4616,8 +4466,8 @@ void main()
             SaveCompare(compareShots, captureIndex);
         }
         // The next frame's CheckSwapchain builds again (before its acquire).
-        if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR)
-            s_swapPolicy.Reported(present == VK_ERROR_OUT_OF_DATE_KHR ? SurfaceResult::OutOfDate : SurfaceResult::Suboptimal);
+        if (present != gpu::rhi::SurfaceStatus::Ok)
+            s_swapPolicy.Reported(present == gpu::rhi::SurfaceStatus::OutOfDate ? SurfaceResult::OutOfDate : SurfaceResult::Suboptimal);
         s_frameIndex = (s_frameIndex + 1) % FRAMES_IN_FLIGHT;
         return true;
     }
@@ -4863,7 +4713,7 @@ void main()
             s_uiReady = false;
         }
         hid::Shutdown();  // a rumble under way would otherwise carry on
-        s_swapchainUse.Retire();  // the present waiter is off the swapchain, and stays off
+        DestroySwapchain();  // nothing presents to the window from here on, and its present thread is joined
         // Then the title bar's styling lets go of the window (Retire first:
         // nothing presents to it while it is taken apart), then SDL frees it.
 #if defined(__APPLE__) && !TARGET_OS_IOS

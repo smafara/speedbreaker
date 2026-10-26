@@ -5,6 +5,7 @@
 // window's surface) and the renderer, until they have moved onto the RHI.
 // Nothing outside gpu/rhi/vulkan and these two should include this.
 #pragma once
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -46,4 +47,18 @@ namespace gpu::rhi::vulkan
         std::mutex* queueMutex = nullptr;
     };
     const Native& GetNative(const rhi::Device& device);
+
+    // The window's surface (made by the caller from SDL; the backend neither
+    // owns nor destroys it). `windowPixels` answers where the surface leaves
+    // its size to the swapchain (Wayland's currentExtent is 0xFFFFFFFF).
+    // The Vulkan objects behind an image of the RHI and the semaphores of the
+    // acquired swapchain image, for the presenter's own command buffers until
+    // its passes are on the RHI (it submits with vkQueueSubmit under
+    // `queueMutex`, waiting `wait` and signalling `signal`).
+    VkImage NativeImage(const Image& image);
+    VkImageView NativeView(const Image& image);
+    VkFormat NativeFormat(const Swapchain& swapchain);
+    void NativeSubmitSemaphores(const Swapchain& swapchain, VkSemaphore& wait, VkSemaphore& signal);
+
+    std::unique_ptr<Surface> CreateSurface(Device& device, VkSurfaceKHR surface, std::function<Extent3D()> windowPixels);
 }

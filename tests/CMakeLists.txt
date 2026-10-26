@@ -163,11 +163,6 @@ sb_test(audio_cadence_test)
 # until the next gear change): EA's budget rule as a model, the policy, and
 # the generated code (ppc/) read to check the functions and offsets it names.
 sb_test(ea_cpu_budget_test ARGS ${ROOT}/ppc)
-# The present waiter uses a swapchain only while it is the current one, and
-# none is destroyed under such a use (video/swapchain_use.h, header only):
-# fake swapchains destroyed and made again under a waiting thread; presenter.cpp
-# is read to check every waiter call that takes a swapchain is inside a use.
-sb_test(swapchain_use_test ARGS ${RT}/video/presenter.cpp)
 sb_test(frame_rate_policy_test SOURCES ${RT}/video/frame_rate_policy.cpp)
 # When the presenter builds its swapchain again and at what size (an iPhone's
 # view turned portrait by SDL, sizes seen while inactive, SUBOPTIMAL), and the
