@@ -735,3 +735,32 @@ replay on Metal).
   (Metal's own cache is the cache). The other ~25 of the 32 hitch lines also occur in the Vulkan
   log with no shader or pipeline work in them, so they are not this. If first-run stalls matter
   later, the lever is creating pipelines off the render path (or warming them at load), not a cache.
+- 2026-10-26 — **Merged upstream v0.2.0** (`origin/main` 312ce69, one squashed release commit,
+  84 files) into the branch (a merge, not a rebase: the branch is published on `fork`). Two
+  conflicts. `video/presenter.cpp`: the present-timing push keeps the RHI present and gains
+  upstream's new `frameRefresh` field (the rest of upstream's presenter changes, mostly non-Apple
+  Smooth Motion timing, merged as they were). `gpu/renderer.cpp`: took ours and ported upstream's
+  hunks onto the RHI by hand, since git's merge would have put raw Vulkan back in a file with none.
+  Ported: **deferred shadow resolves** (`ShadowLend`, `gpu/shadow_lend.h`; on by default on Apple
+  and Android): `PooledDepth` (an RHI image plus its depth views, shared through a pool; a render
+  target holds it as `shared` and reaches its image through `Img()`/`SampleView()`), lent textures
+  (`Texture::lend`, `LendView` as a depth-only `ImageView` with the R/zero/one swizzle),
+  `RunLend`, `LendTargetWrite`, `LendGuestRead`, `LendVertexCheck`, `NFSMW_SHADOW_VERIFY` (a
+  compute pass compares every lent texel with the resolve's packing), the `[shadow]` line, the
+  `NFSMW_SHADOW_EXP` bits 1 and 2, the split-screen scale cap (`NFSMW_SPLIT_SCALE`) and
+  `InternalResolutionScale`. New RHI format feature `kFormatSampleLinear` replaces upstream's
+  `vkGetPhysicalDeviceFormatProperties` check (Vulkan: sampled + linear filter; Metal: said of
+  depth formats only). Texture cache entries made while a texture was lent are rebuilt on each
+  hit (`TextureCacheEntry::lent`; upstream kept a stale view once the lend ended). Upstream's
+  `VertexBarrierIfNeeded` call lost its guard when `LendVertexCheck` was added as the `if` body
+  (no braces); both are inside the `s_passBarrier >= 2` block here. **Not ported:**
+  `NFSMW_SHADOW_COPY` (an experiment that lost on an M1 Pro; the RHI has no depth image copy)
+  and `NFSMW_SHADOW_EXP` bit 4 (no stencil in the shadow passes; the RHI's depth attachment has
+  one load/store op for both aspects). Checked: Vulkan replay with the deferral off is
+  bit-identical to the old baselines; with it on, `NFSMW_SHADOW_VERIFY` finds 0 of 15.4 M texels
+  differing (max |depth - texel| 6e-8, half a 24-bit step) and the world frames differ from the
+  baseline by 1 level in 0.02-0.06% of pixels (the 24-bit quantization upstream documents); Metal
+  with it on matches Metal with it off (mean 0.0157 vs 0.0154 against the Vulkan baseline), no
+  validation errors. ctest 78/79: `region_manifest_test` fails here only because this checkout
+  is reached through a symlink (/Users -> /Volumes; the test compares a canonical path with a
+  lexical one) and passes with a scratch folder on a real path.

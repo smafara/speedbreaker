@@ -307,6 +307,7 @@ namespace gpu::rhi
     {
         kFormatBlend   = 1 << 0,   // a render target it can blend in
         kFormatStorage = 1 << 1,   // a storage image
+        kFormatSampleLinear = 1 << 2,  // sampled with linear filtering (depth formats: the depth aspect)
     };
 
     // Guest memory (CreateGuestMemory): the GPU's view of the game's memory.

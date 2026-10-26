@@ -1779,8 +1779,10 @@ namespace gpu::rhi::metal
                 // Apple GPUs blend every colour format but the 32-bit float ones, and store to
                 // the ones that aren't packed or compressed.
                 const bool wide = format == Format::R32F || format == Format::RG32F || format == Format::RGBA32F;
+                // (Linear filtering: said of the depth formats only, the one thing asked so far.)
                 return (IsBlock(format) || HasDepth(format) || wide ? 0 : kFormatBlend) |
-                    (IsBlock(format) || HasDepth(format) || format == Format::A2B10G10R10 ? 0 : kFormatStorage);
+                    (IsBlock(format) || HasDepth(format) || format == Format::A2B10G10R10 ? 0 : kFormatStorage) |
+                    (HasDepth(format) ? kFormatSampleLinear : 0);
             }
 
             void GetMemoryUsage(uint64_t& used, uint64_t& budget) const override

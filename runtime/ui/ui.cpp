@@ -801,7 +801,7 @@ namespace ui
 #endif
             if (toggle && !e.key.repeat && !s_modal)
             {
-                s_settingsOpen ? CloseSettings() : OpenSettings();
+                ToggleSettings();
                 return;
             }
             if (s_settingsOpen && SettingsMenuTakesKey(e.key))
@@ -1265,6 +1265,13 @@ namespace ui
     bool SettingsOpen()
     {
         return s_settingsOpen;
+    }
+
+    void ToggleSettings()
+    {
+        if (!s_ready || s_modal)
+            return;
+        s_settingsOpen ? CloseSettings() : OpenSettings();
     }
 
     SDL_Window* GetWindow()

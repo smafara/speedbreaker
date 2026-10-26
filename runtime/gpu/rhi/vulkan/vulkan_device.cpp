@@ -1979,7 +1979,10 @@ namespace gpu::rhi::vulkan
                 VkFormatProperties fp;
                 vkGetPhysicalDeviceFormatProperties(m_c->physical, ToVk(format), &fp);
                 return ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) ? kFormatBlend : 0) |
-                    ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? kFormatStorage : 0);
+                    ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? kFormatStorage : 0) |
+                    ((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) ==
+                            (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
+                        ? kFormatSampleLinear : 0);
             }
 
             void GetMemoryUsage(uint64_t& used, uint64_t& budget) const override
