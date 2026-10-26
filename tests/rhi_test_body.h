@@ -718,6 +718,64 @@ namespace
             px[(3 * 8 + 5) * 4 + 2], px[(3 * 8 + 5) * 4 + 3]);
     }
 
+    // The renderer's lent shadow maps (ShadowLend): a depth image sampled in place through a depth-only
+    // view that names red, zero and one, with linear filtering.
+    void DepthView()
+    {
+        if (!(g_device->FormatFeatures(Format::D32F_S8) & kFormatSampleLinear))
+        {
+            printf("  depth view: depth isn't sampled with linear filtering here (skipped)\n");
+            return;
+        }
+        auto sampler = g_device->CreateSampler({ Filter::Linear, Filter::Linear, Filter::Nearest, AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge, AddressMode::ClampToEdge, 1.0f });
+        BindingLayoutDesc ld;
+        ld.tables.push_back({ { { 0, BindingKind::CombinedImageSampler, uint8_t(ShaderStage::Fragment), sampler.get() } }, true });
+        auto layout = g_device->CreateBindingLayout(ld);
+        auto pipeline = g_device->CreateGraphicsPipeline(FullscreenDesc(*layout, Format::RGBA8, Code(k_tex_frag, sizeof(k_tex_frag) / 4)));
+        CHECK(pipeline != nullptr, "textured pipeline");
+        auto depth = MakeImage(Format::D32F_S8, 4, 4, kImageDepthStencil | kImageSampled | kImageCopyDst);
+        ImageViewDesc vd;
+        vd.depthOnly = true;
+        vd.swizzle[0] = Swizzle::R;
+        vd.swizzle[1] = Swizzle::Zero;
+        vd.swizzle[2] = Swizzle::Zero;
+        vd.swizzle[3] = Swizzle::One;
+        auto view = g_device->CreateImageView(*depth, vd);
+        CHECK(view != nullptr, "a depth-only swizzled view");
+        if (!pipeline || !view)
+            return;
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget | kImageCopySrc);
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        Run([&](CommandList& cmd) {
+            ImageTransition t1[] = { { depth.get(), State::Undefined, State::CopyDst } };
+            cmd.Transition(t1, 1);
+            cmd.ClearImage(*depth, ClearDepthStencil{ 0.25f, 0 });
+            ImageTransition t2[] = { { depth.get(), State::CopyDst, State::ShaderRead }, { target.get(), State::Undefined, State::RenderTarget } };
+            cmd.Transition(t2, 2);
+            RenderingDesc rd;
+            rd.color[0] = { target.get(), LoadOp::DontCare, StoreOp::Store, {} };
+            rd.area = { 0, 0, 8, 8 };
+            cmd.BeginRendering(rd);
+            cmd.SetViewport(0, 0, 8, 8, 0, 1);
+            cmd.SetScissor({ 0, 0, 8, 8 });
+            cmd.SetPipeline(*pipeline);
+            BindingEntry e;
+            e.slot = 0;
+            e.image = { depth.get(), nullptr, view.get() };
+            cmd.PushBindings(*layout, 0, &e, 1);
+            cmd.Draw(3, 1, 0, 0);
+            cmd.EndRendering();
+            Readback(cmd, *target, *back, State::RenderTarget, 8, 8);
+        });
+        back->Invalidate(0, 8 * 8 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        bool ok = true;
+        for (int i = 0; i < 64; i++)
+            ok &= px[i * 4] >= 63 && px[i * 4] <= 64 && px[i * 4 + 1] == 0 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 255;
+        CHECK(ok, "the depth 0.25 came out as red, with green and blue zero and alpha one (%u,%u,%u,%u)", px[0], px[1], px[2], px[3]);
+    }
+
     // The renderer's images: one layout for life (`general`), work ordered by MemoryBarrier alone.
     void GeneralImage()
     {
@@ -805,6 +863,8 @@ int main()
     ImageClearsAndBlit();
     printf("swizzled view\n");
     SwizzledView();
+    printf("depth image through a depth-only view\n");
+    DepthView();
     printf("general image, memory barrier\n");
     GeneralImage();
     printf("guest memory, stream buffer\n");
