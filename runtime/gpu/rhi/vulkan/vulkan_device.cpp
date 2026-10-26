@@ -1845,6 +1845,25 @@ namespace gpu::rhi::vulkan
     VkImage NativeImage(const Image& image) { return static_cast<const VkImageObject&>(image).Handle(); }
     VkImageView NativeView(const Image& image) { return static_cast<const VkImageObject&>(image).View(); }
     VkFormat NativeFormat(const Swapchain& swapchain) { return static_cast<const VkSwapchainObject&>(swapchain).VkFormatOf(); }
+    std::unique_ptr<Image> WrapImage(Device& device, VkImage image, Format format, uint32_t width, uint32_t height, uint32_t usage)
+    {
+        Context& c = *static_cast<VkDeviceObject&>(device).Ctx();
+        VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vci.image = image;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = ToVk(format);
+        vci.subresourceRange = { Aspect(format), 0, 1, 0, 1 };
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(c.device, &vci, nullptr, &view) != VK_SUCCESS)
+            return nullptr;
+        ImageDesc desc;
+        desc.format = format;
+        desc.extent = { width, height, 1 };
+        desc.usage = usage;
+        desc.name = "wrapped";
+        return std::make_unique<VkImageObject>(c, desc, image, VK_NULL_HANDLE, view, 0);
+    }
+
     VkCommandBuffer NativeCommandBuffer(const CommandList& list) { return static_cast<const VkCommandList&>(list).Handle(); }
 
     const Native& GetNative(const rhi::Device& device)

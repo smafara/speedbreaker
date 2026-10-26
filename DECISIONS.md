@@ -508,3 +508,21 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   presenter's raw `vkQueueSubmit`, queue lock, wait stages and acquire/render-done semaphore
   accessors are gone. Its commands are still recorded raw into the list's native command
   buffer (`NativeCommandBuffer`). Replay check PASSED, rhi/quit tests pass.
+- 2026-10-26: post-processing moved onto the RHI (steps 2 and 3 of the port together: the
+  scale/tone and AA/EASU passes share one set of state and one render pass, so splitting them
+  would only have meant writing the glue twice). New `video/post_process.{h,cpp}`
+  (`PostProcessor`): the GLSL stays inline (D12) and is compiled with `CompileShader`; AA,
+  EASU, RCAS, scale and tone pipelines, the tone table and the AA/FSR images are RHI objects,
+  and the passes are recorded on the frame's `CommandList` (`Transition` replaces the
+  hand-written barriers; an old state is given to each transition so a write after last
+  frame's read waits for it). The presenter keeps the source image (the renderer's raw front
+  image, wrapped with the transitional `vulkan::WrapImage`, moved GENERAL -> SHADER_READ_ONLY
+  -> GENERAL around the passes with raw barriers), the swapchain pass, UI, captures and the
+  NFSMW_UPSCALE_COMPARE shots (still raw Vulkan, step 4). To check it: `scripts/replay/
+  post_check.sh` replays both captures under six settings sets (default, AA off, bilinear,
+  FSR 1, tone, FSR 1 + tone), each with its own baselines recorded from the build before the
+  port: all 12 presented pictures are bit-identical. Not covered by replay: the CPU-path
+  source (`s_source`, no renderer image) and the compare tool. ctest 71/71 (fsr1_test and
+  display_tone_test read the new file now); a 30 s live run shows FSR 1 at 60 fps.
+  Next: readbacks (screenshots, cover check, region capture, compare shots), then slim RunFrame.
+

@@ -59,6 +59,11 @@ namespace gpu::rhi::vulkan
     VkImageView NativeView(const Image& image);
     VkFormat NativeFormat(const Swapchain& swapchain);
     VkCommandBuffer NativeCommandBuffer(const CommandList& list);
+    // An image of someone else's (the renderer's front image, until the
+    // renderer is on the RHI) as an RHI image, with a view of its own made
+    // here: the image is not destroyed with it, and the caller keeps the
+    // layout it is in. Destroy it before the image goes.
+    std::unique_ptr<Image> WrapImage(Device& device, VkImage image, Format format, uint32_t width, uint32_t height, uint32_t usage);
 
     std::unique_ptr<Surface> CreateSurface(Device& device, VkSurfaceKHR surface, std::function<Extent3D()> windowPixels);
 }

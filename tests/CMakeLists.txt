@@ -121,10 +121,10 @@ target_link_libraries(settings_scaling_test PRIVATE ${SB_SETTINGS_LIBS})
 sb_test(scale_budget_test SOURCES ${RT}/video/scale_budget.cpp ${RT}/video/picture_fit.cpp)
 # Settings > Display > Brightness's curve and the 360's display gamma ramp
 # (video/display_tone.h, video/display_gamma.h: the DC_LUT_* registers as
-# Direct3D writes them), header only; presenter.cpp is read to check the
+# Direct3D writes them), header only; post_process.cpp is read to check the
 # tone shader's wrapping of the scale shaders, settings.cpp for the two
 # options' defaults (Xbox 360 Display Gamma on since v0.1.4).
-sb_test(display_tone_test ARGS ${RT}/video/presenter.cpp ${RT}/user/settings.cpp)
+sb_test(display_tone_test ARGS ${RT}/video/post_process.cpp ${RT}/user/settings.cpp)
 # The display's refresh measured from present completions, at 60 Hz and at
 # whole multiples of it (video/refresh_fit.cpp, video/refresh_multiple.h).
 sb_test(refresh_fit_test SOURCES ${RT}/video/refresh_fit.cpp)

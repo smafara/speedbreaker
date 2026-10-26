@@ -28,6 +28,7 @@
 #include "refresh_notice.h"
 #include "display_tone.h"
 #include "fsr1.h"
+#include "post_process.h"
 #include "upscale.h"
 #include <ui/ui.h>
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -124,7 +125,7 @@ namespace video
             VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
             void* stagingMapped = nullptr;
             VkDeviceSize stagingSize = 0;
-            VkImageView sourceView = VK_NULL_HANDLE;  // this frame's view of the presented image
+            std::unique_ptr<gpu::rhi::Image> source;  // the frame's input to post-processing (wraps the renderer's or s_source)
             bool timed = false;                       // wrote its post-processing timestamps
             upscale::Pass pass = upscale::Pass::Bicubic;  // the pass it drew with (NFSMW_UPSCALE_AB)
         } s_frames[FRAMES_IN_FLIGHT];
@@ -144,6 +145,7 @@ namespace video
         // which made them from what Initialize chose; the lock is its queue lock
         // (a placeholder one until the device exists).
         std::unique_ptr<gpu::rhi::Device> s_rhi;
+        std::unique_ptr<PostProcessor> s_postProcessor;  // made with the first frame
         std::mutex s_noQueueMutex;
         std::mutex* s_queueMutexPtr = &s_noQueueMutex;
         VulkanContext s_context{};
@@ -970,993 +972,6 @@ namespace video
             return frame;
         }
 
-        // ---------------------------------------------------------------
-        // Post-processing, when presenting: anti-aliasing at the game's
-        // resolution (compute, into s_aa), then scaling into the letterboxed
-        // part of the window (fragment). The 360 drew NFSMW with 2x MSAA; the
-        // renderer draws single-sampled, so edges get an FXAA-style pass
-        // (edge-directed, with a sub-pixel blend). Scaling is Catmull-Rom
-        // bicubic with optional sharpening, clamped to the 2x2 source texels
-        // around each sample so it can't ring.
-        // NFSMW_AA=0 turns the anti-aliasing off; NFSMW_SCALING=linear (or
-        // bicubic, the default); NFSMW_SHARPEN=<0..1> (default 0.3). If the
-        // pipelines can't be built, frames are blitted as before.
-        const char* kFullscreenVs = R"(#version 460
-layout(location = 0) out vec2 uv;
-void main()
-{
-    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-    uv = p;
-    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-}
-)";
-
-        const char* kAaCs = R"(#version 460
-layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-// band: the 16:9 band's columns x..y and rows z..w (video::BandOf), used
-// when bandOn is 1 (video/band_filter.h).
-layout(push_constant) uniform P { ivec2 size; float subpixel; uint bandOn; ivec4 band; } p;
-
-const float kEdgeMin = 0.0312;      // no AA on darker contrast than this
-const float kEdgeRelative = 0.125;  // ... or than this fraction of the local maximum
-
-// This pixel's span of the band's three along each axis, as uv: every fetch
-// stays between its first and last texel centres (band_filter.h's Clamp).
-vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);
-
-float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-vec3 at(vec2 uv)
-{
-    if (p.bandOn != 0u)
-        uv = clamp(uv, spanLo, spanHi);
-    return textureLod(src, uv, 0.0).rgb;
-}
-
-// band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
-vec2 spanOf(float t, int lo, int hi, int size)
-{
-    return t < float(lo) ? vec2(0.0, float(lo)) : t < float(hi) ? vec2(float(lo), float(hi)) : vec2(float(hi), float(size));
-}
-
-void main()
-{
-    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
-    if (pix.x >= p.size.x || pix.y >= p.size.y)
-        return;
-    vec2 texel = 1.0 / vec2(p.size);
-    vec2 uv = (vec2(pix) + 0.5) * texel;
-    if (p.bandOn != 0u)
-    {
-        vec2 sx = spanOf(float(pix.x) + 0.5, p.band.x, p.band.y, p.size.x), sy = spanOf(float(pix.y) + 0.5, p.band.z, p.band.w, p.size.y);
-        spanLo = (vec2(sx.x, sy.x) + 0.5) * texel;
-        spanHi = (vec2(sx.y, sy.y) - 0.5) * texel;
-    }
-    vec3 center = at(uv);
-    float lM = luma(center);
-    float lN = luma(at(uv + vec2(0.0, -texel.y))), lS = luma(at(uv + vec2(0.0, texel.y)));
-    float lW = luma(at(uv + vec2(-texel.x, 0.0))), lE = luma(at(uv + vec2(texel.x, 0.0)));
-    float lMin = min(lM, min(min(lN, lS), min(lW, lE)));
-    float lMax = max(lM, max(max(lN, lS), max(lW, lE)));
-    float range = lMax - lMin;
-    if (range < max(kEdgeMin, lMax * kEdgeRelative))
-    {
-        imageStore(dst, pix, vec4(center, 1.0));
-        return;
-    }
-    float lNW = luma(at(uv - texel)), lSE = luma(at(uv + texel));
-    float lNE = luma(at(uv + vec2(texel.x, -texel.y))), lSW = luma(at(uv + vec2(-texel.x, texel.y)));
-
-    // The edge's orientation: where luma changes most (across rows for a
-    // horizontal edge).
-    float acrossRows = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);
-    float acrossColumns = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
-    bool horizontal = acrossRows >= acrossColumns;
-
-    // Which side of this pixel the edge is on: the steeper neighbour.
-    float lBefore = horizontal ? lN : lW, lAfter = horizontal ? lS : lE;
-    float gBefore = abs(lBefore - lM), gAfter = abs(lAfter - lM);
-    bool before = gBefore >= gAfter;
-    float threshold = 0.25 * max(gBefore, gAfter);
-    float step = horizontal ? texel.y : texel.x;
-    float edgeLuma = 0.5 * ((before ? lBefore : lAfter) + lM);
-    if (before)
-        step = -step;
-
-    // Walk along the edge both ways until the luma leaves the edge's.
-    vec2 onEdge = uv;
-    if (horizontal) onEdge.y += 0.5 * step; else onEdge.x += 0.5 * step;
-    vec2 along = horizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
-    vec2 uvA = onEdge - along, uvB = onEdge + along;
-    float dA = luma(at(uvA)) - edgeLuma, dB = luma(at(uvB)) - edgeLuma;
-    bool endA = abs(dA) >= threshold, endB = abs(dB) >= threshold;
-    const float strides[10] = float[](1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
-    for (int i = 0; i < 10 && !(endA && endB); i++)
-    {
-        if (!endA) { uvA -= along * strides[i]; dA = luma(at(uvA)) - edgeLuma; endA = abs(dA) >= threshold; }
-        if (!endB) { uvB += along * strides[i]; dB = luma(at(uvB)) - edgeLuma; endB = abs(dB) >= threshold; }
-    }
-    float distA = horizontal ? uv.x - uvA.x : uv.y - uvA.y;
-    float distB = horizontal ? uvB.x - uv.x : uvB.y - uv.y;
-    bool nearerA = distA < distB;
-    float offset = 0.5 - min(distA, distB) / (distA + distB);
-    // Only blend from the end whose luma variation goes the way this
-    // pixel's does (otherwise this pixel is on the edge's far side).
-    if (((nearerA ? dA : dB) < 0.0) == (lM < edgeLuma))
-        offset = 0.0;
-
-    // Sub-pixel aliasing (thin lines, single-pixel features).
-    float average = (2.0 * (lN + lS + lW + lE) + lNW + lNE + lSW + lSE) / 12.0;
-    float sub = clamp(abs(average - lM) / range, 0.0, 1.0);
-    sub = (3.0 - 2.0 * sub) * sub * sub;
-    offset = max(offset, sub * sub * p.subpixel);
-
-    vec2 sampleUv = uv;
-    if (horizontal) sampleUv.y += offset * step; else sampleUv.x += offset * step;
-    imageStore(dst, pix, vec4(at(sampleUv), 1.0));
-}
-)";
-
-        const char* kScaleFs = R"(#version 460
-layout(location = 0) in vec2 uv;
-layout(location = 0) out vec4 color;
-layout(set = 0, binding = 0) uniform sampler2D src;
-// band: the 16:9 band's columns x..y and rows z..w in texels (video::BandOf),
-// used when bandOn is 1 (video/band_filter.h).
-layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; vec4 band; uint bandOn; } p;
-
-// The span of the band's three along each axis that this pixel's centre
-// falls in, as uv: every tap stays between its first and last texel centres
-// (band_filter.h's Clamp), so a strip's pixel reads only the strip.
-vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);
-
-vec3 at(vec2 t)
-{
-    if (p.bandOn != 0u)
-        t = clamp(t, spanLo, spanHi);
-    return textureLod(src, t, 0.0).rgb;
-}
-
-// band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
-vec2 spanOf(float t, float lo, float hi, float size)
-{
-    return t < lo ? vec2(0.0, lo) : t < hi ? vec2(lo, hi) : vec2(hi, size);
-}
-
-void setSpan()
-{
-    if (p.bandOn == 0u)
-        return;
-    vec2 pos = uv * p.size;
-    vec2 sx = spanOf(pos.x, p.band.x, p.band.y, p.size.x), sy = spanOf(pos.y, p.band.z, p.band.w, p.size.y);
-    spanLo = (vec2(sx.x, sy.x) + 0.5) / p.size;
-    spanHi = (vec2(sx.y, sy.y) - 0.5) / p.size;
-}
-
-// Catmull-Rom bicubic from 9 bilinear taps: the middle two weights of each
-// axis are folded into one bilinear fetch.
-vec3 catmullRom(vec2 t, vec2 texel)
-{
-    vec2 pos = t * p.size;
-    vec2 c = floor(pos - 0.5) + 0.5;
-    vec2 f = pos - c;
-    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    vec2 w3 = f * f * (-0.5 + 0.5 * f);
-    vec2 w12 = w1 + w2;
-    vec2 t0 = (c - 1.0) * texel, t12 = (c + w2 / w12) * texel, t3 = (c + 2.0) * texel;
-    return at(vec2(t0.x, t0.y)) * w0.x * w0.y + at(vec2(t12.x, t0.y)) * w12.x * w0.y + at(vec2(t3.x, t0.y)) * w3.x * w0.y +
-        at(vec2(t0.x, t12.y)) * w0.x * w12.y + at(vec2(t12.x, t12.y)) * w12.x * w12.y + at(vec2(t3.x, t12.y)) * w3.x * w12.y +
-        at(vec2(t0.x, t3.y)) * w0.x * w3.y + at(vec2(t12.x, t3.y)) * w12.x * w3.y + at(vec2(t3.x, t3.y)) * w3.x * w3.y;
-}
-
-void main()
-{
-    setSpan();
-    if (p.bicubic == 0u)
-    {
-        color = vec4(at(uv), 1.0);
-        return;
-    }
-    vec2 texel = 1.0 / p.size;
-    vec3 c = catmullRom(uv, texel);
-    // Sharpen against the bilinear sample, then clamp to the 2x2 texels
-    // around the sample: detail gets crisper without halos or ringing.
-    vec2 corner = (floor(uv * p.size - 0.5) + 0.5) * texel;
-    vec3 a = at(corner), b = at(corner + vec2(texel.x, 0.0)), d = at(corner + vec2(0.0, texel.y)), e = at(corner + texel);
-    vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
-    c = clamp(c + p.sharpen * (c - at(uv)), lo, hi);
-    color = vec4(c, 1.0);
-}
-)";
-
-        // NFSMW_FAST_SCALE=1 (default on Apple, below; for phones, where this pass at
-        // the screen's size is most of the post-processing): the same
-        // scaling from 7 fetches a pixel instead of 14 (above). The 2x2
-        // texels around the sample come from one gather per channel, and the
-        // bilinear sample sharpened against and Catmull-Rom's middle tap are
-        // blends of those 4; the 4 corner taps (at most 1.6% of the weight,
-        // 1.5 texels away diagonally) are left out and the rest renormalised.
-        // The clamp is the same. (A real frame: at most 3 levels apart.)
-        const char* kScaleFastFs = R"(#version 460
-layout(location = 0) in vec2 uv;
-layout(location = 0) out vec4 color;
-layout(set = 0, binding = 0) uniform sampler2D src;
-// band, bandOn: as kScaleFs's.
-layout(push_constant) uniform P { vec2 size; float sharpen; uint bicubic; vec4 band; uint bandOn; } p;
-
-vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);  // as kScaleFs's
-
-vec3 at(vec2 t)
-{
-    if (p.bandOn != 0u)
-        t = clamp(t, spanLo, spanHi);
-    return textureLod(src, t, 0.0).rgb;
-}
-
-vec2 spanOf(float t, float lo, float hi, float size)
-{
-    return t < lo ? vec2(0.0, lo) : t < hi ? vec2(lo, hi) : vec2(hi, size);
-}
-
-void main()
-{
-    vec2 sx = vec2(0.0), sy = vec2(0.0);
-    if (p.bandOn != 0u)
-    {
-        vec2 pos = uv * p.size;
-        sx = spanOf(pos.x, p.band.x, p.band.y, p.size.x);
-        sy = spanOf(pos.y, p.band.z, p.band.w, p.size.y);
-        spanLo = (vec2(sx.x, sy.x) + 0.5) / p.size;
-        spanHi = (vec2(sx.y, sy.y) - 0.5) / p.size;
-    }
-    if (p.bicubic == 0u)
-    {
-        color = vec4(at(uv), 1.0);
-        return;
-    }
-    vec2 texel = 1.0 / p.size;
-    vec2 pos = uv * p.size;
-    vec2 c = floor(pos - 0.5) + 0.5;
-    vec2 f = pos - c;
-    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    vec2 w3 = f * f * (-0.5 + 0.5 * f);
-    vec2 w12 = w1 + w2;
-    vec2 g = w2 / w12;
-    vec2 t0 = (c - 1.0) * texel, t12 = (c + g) * texel, t3 = (c + 2.0) * texel;
-    // Gathers return (x0,y1), (x1,y1), (x1,y0), (x0,y0).
-    vec2 mid = (c + 0.5) * texel;
-    vec4 r = textureGather(src, mid, 0), gr = textureGather(src, mid, 1), b = textureGather(src, mid, 2);
-    vec3 a = vec3(r.w, gr.w, b.w), e = vec3(r.z, gr.z, b.z), d = vec3(r.x, gr.x, b.x), h = vec3(r.y, gr.y, b.y);
-    if (p.bandOn != 0u)
-    {
-        // The gather's row or column past this pixel's span reads the
-        // span's edge one instead (band_filter.h's ClampTexel): rows a e
-        // (first) and d h, columns a d (first) and e h.
-        vec2 first = c - 0.5;
-        if (first.y < sy.x) { a = d; e = h; } else if (first.y + 1.0 >= sy.y) { d = a; h = e; }
-        if (first.x < sx.x) { a = e; d = h; } else if (first.x + 1.0 >= sx.y) { e = a; h = d; }
-    }
-    vec3 middle = mix(mix(a, e, g.x), mix(d, h, g.x), g.y);
-    vec3 bilinear = mix(mix(a, e, f.x), mix(d, h, f.x), f.y);
-    float wN = w12.x * w0.y, wW = w0.x * w12.y, wM = w12.x * w12.y, wE = w3.x * w12.y, wS = w12.x * w3.y;
-    vec3 cr = (at(vec2(t12.x, t0.y)) * wN + at(vec2(t0.x, t12.y)) * wW + middle * wM + at(vec2(t3.x, t12.y)) * wE +
-        at(vec2(t12.x, t3.y)) * wS) / (wN + wW + wM + wE + wS);
-    vec3 lo = min(min(a, e), min(d, h)), hi = max(max(a, e), max(d, h));
-    color = vec4(clamp(cr + p.sharpen * (cr - bilinear), lo, hi), 1.0);
-}
-)";
-        // NFSMW_FAST_SCALE: on by default on Apple (iPad: scale pass 1.26 ->
-        // 1.07 ms, the same picture within 3 levels) and arm64 Linux (Steam
-        // Frame: post-processing 0.47 -> 0.39 ms), off elsewhere until
-        // measured there; =0/=1 overrides.
-#if defined(__APPLE__) || (defined(__linux__) && defined(__aarch64__))
-        constexpr bool kFastScaleByDefault = true;
-#else
-        constexpr bool kFastScaleByDefault = false;
-#endif
-        const bool s_fastScale = [] { const char* v = std::getenv("NFSMW_FAST_SCALE"); return v ? v[0] == '1' : kFastScaleByDefault; }();
-
-        // Brightness and the 360's display gamma (video/display_tone.h): the
-        // scale shader in use, its main renamed scaleMain, then this main,
-        // which looks each channel of its result up in the tone table (256
-        // entries for the values k/255, linear between them). The tables
-        // are made on the CPU. With Brightness 0 and the 360's gamma off the
-        // plain scale pipeline draws, so that picture (v0.1.3's) is the same,
-        // bit for bit, as without this.
-        const char* kToneGlsl = R"(
-layout(set = 0, binding = 1) uniform sampler2D toneTable;
-
-vec3 toneOf(vec3 c)
-{
-    vec3 t = clamp(c, 0.0, 1.0) * (255.0 / 256.0) + (0.5 / 256.0);
-    return vec3(textureLod(toneTable, vec2(t.r, 0.5), 0.0).r, textureLod(toneTable, vec2(t.g, 0.5), 0.0).g,
-        textureLod(toneTable, vec2(t.b, 0.5), 0.0).b);
-}
-
-void main()
-{
-    scaleMain();
-    color = vec4(toneOf(color.rgb), color.a);
-}
-)";
-
-        // The tone variant of a scale shader's source ("" if it hasn't
-        // exactly one main to rename).
-        std::string ToneVariant(const char* scaleGlsl)
-        {
-            std::string glsl = scaleGlsl;
-            const std::string_view kMain = "void main()";
-            size_t at = glsl.find(kMain);
-            if (at == std::string::npos || glsl.find(kMain, at + 1) != std::string::npos)
-                return {};
-            glsl.replace(at, kMain.size(), "void scaleMain()");
-            return glsl + kToneGlsl;
-        }
-
-        struct ToneState
-        {
-            bool tried = false, ready = false;
-            VkDescriptorSetLayout set = VK_NULL_HANDLE;
-            VkPipelineLayout layout = VK_NULL_HANDLE;
-            VkShaderModule fs = VK_NULL_HANDLE;
-            VkPipeline pipeline = VK_NULL_HANDLE;
-            VkFormat format = VK_FORMAT_UNDEFINED;  // the swapchain format the pipeline was made for
-            // The table: 256 x 1 RGBA16F, written from a host-visible buffer.
-            VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            VkImageView view = VK_NULL_HANDLE;
-            VkBuffer staging = VK_NULL_HANDLE;
-            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-            void* stagingMapped = nullptr;
-            // What the table holds.
-            bool filled = false;
-            int32_t brightness = 0;
-            bool ramp = false;
-            uint64_t rampGeneration = 0;
-        } s_tone;
-
-        struct PostState
-        {
-            bool tried = false, ready = false;
-            VkSampler sampler = VK_NULL_HANDLE;
-            VkDescriptorSetLayout aaSet = VK_NULL_HANDLE, scaleSet = VK_NULL_HANDLE;
-            VkPipelineLayout aaLayout = VK_NULL_HANDLE, scaleLayout = VK_NULL_HANDLE;
-            VkPipeline aa = VK_NULL_HANDLE, scale = VK_NULL_HANDLE;
-            VkFormat scaleFormat = VK_FORMAT_UNDEFINED;
-            VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
-            PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet = nullptr;
-            // The anti-aliased frame, at the game's resolution.
-            VkImage aaImage = VK_NULL_HANDLE;
-            VkDeviceMemory aaMemory = VK_NULL_HANDLE;
-            VkImageView aaView = VK_NULL_HANDLE;
-            uint32_t aaWidth = 0, aaHeight = 0;
-        } s_post;
-        // Read every frame: the settings menu changes them live.
-        bool AaEnabled() { return settings::GetBool(settings::Id::AntiAliasing); }
-        bool Bicubic() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Bicubic); }
-        float Sharpen() { return std::clamp(settings::GetFloat(settings::Id::Sharpening), 0.0f, 1.0f); }
-
-        VkShaderModule PostModule(const char* glsl, int stage)
-        {
-            std::string log;
-            std::vector<uint32_t> spirv = gpu::renderer::CompileShader(glsl, stage, log);
-            if (spirv.empty())
-            {
-                fprintf(stderr, "[video] post-processing shader failed to compile:\n%s\n", log.c_str());
-                return VK_NULL_HANDLE;
-            }
-            VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            smci.codeSize = spirv.size() * 4;
-            smci.pCode = spirv.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            vkCreateShaderModule(s_device, &smci, nullptr, &module);
-            return module;
-        }
-
-        // A scale pipeline (the plain one or the tone variant) for the
-        // swapchain's format; VK_NULL_HANDLE if it can't be made.
-        VkPipeline MakeScalePipeline(VkShaderModule fs, VkPipelineLayout layout)
-        {
-            VkPipelineShaderStageCreateInfo stages[2] = {
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, s_post.vs, "main", nullptr },
-                { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr },
-            };
-            VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-            VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-            VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            vp.viewportCount = 1;
-            vp.scissorCount = 1;
-            VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            rs.polygonMode = VK_POLYGON_MODE_FILL;
-            rs.cullMode = VK_CULL_MODE_NONE;
-            rs.lineWidth = 1.0f;
-            VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-            VkPipelineColorBlendAttachmentState att{};
-            att.colorWriteMask = 0xF;
-            VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            cb.attachmentCount = 1;
-            cb.pAttachments = &att;
-            VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-            VkPipelineDynamicStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            ds.dynamicStateCount = 2;
-            ds.pDynamicStates = dyn;
-            VkPipelineRenderingCreateInfoKHR rci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR };
-            rci.colorAttachmentCount = 1;
-            rci.pColorAttachmentFormats = &s_swapFormat;
-            VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            gpci.pNext = &rci;
-            gpci.stageCount = 2;
-            gpci.pStages = stages;
-            gpci.pVertexInputState = &vi;
-            gpci.pInputAssemblyState = &ia;
-            gpci.pViewportState = &vp;
-            gpci.pRasterizationState = &rs;
-            gpci.pMultisampleState = &ms;
-            gpci.pColorBlendState = &cb;
-            gpci.pDynamicState = &ds;
-            gpci.layout = layout;
-            VkPipeline pipeline = VK_NULL_HANDLE;
-            if (vkCreateGraphicsPipelines(s_device, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline) != VK_SUCCESS)
-                return VK_NULL_HANDLE;
-            return pipeline;
-        }
-
-        // The scale pipeline for the swapchain's format (made again if it changes).
-        bool EnsureScalePipeline()
-        {
-            if (s_post.scale && s_post.scaleFormat == s_swapFormat)
-                return true;
-            if (s_post.scale)
-                vkDestroyPipeline(s_device, s_post.scale, nullptr);
-            s_post.scale = MakeScalePipeline(s_post.fs, s_post.scaleLayout);
-            if (!s_post.scale)
-                return false;
-            s_post.scaleFormat = s_swapFormat;
-            return true;
-        }
-
-        bool EnsurePostProcessing()
-        {
-            if (s_post.tried)
-                return s_post.ready && EnsureScalePipeline();
-            s_post.tried = true;
-            s_post.pushDescriptorSet = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
-                vkGetDeviceProcAddr(s_device, "vkCmdPushDescriptorSetKHR"));
-            if (!s_post.pushDescriptorSet || !s_context.cmdBeginRendering)
-                return false;
-            VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-            sci.magFilter = VK_FILTER_LINEAR;
-            sci.minFilter = VK_FILTER_LINEAR;
-            sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            vkCreateSampler(s_device, &sci, nullptr, &s_post.sampler);
-
-            VkDescriptorSetLayoutBinding aaBindings[2] = {
-                { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            VkDescriptorSetLayoutBinding scaleBinding = { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dslci.bindingCount = 2;
-            dslci.pBindings = aaBindings;
-            vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_post.aaSet);
-            dslci.bindingCount = 1;
-            dslci.pBindings = &scaleBinding;
-            vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_post.scaleSet);
-            VkPushConstantRange aaRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 32 }, scaleRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36 };
-            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci.setLayoutCount = 1;
-            plci.pSetLayouts = &s_post.aaSet;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges = &aaRange;
-            vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.aaLayout);
-            plci.pSetLayouts = &s_post.scaleSet;
-            plci.pPushConstantRanges = &scaleRange;
-            vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.scaleLayout);
-
-            VkShaderModule cs = PostModule(kAaCs, 2);
-            s_post.vs = PostModule(kFullscreenVs, 0);
-            s_post.fs = PostModule(s_fastScale ? kScaleFastFs : kScaleFs, 1);
-            if (!cs || !s_post.vs || !s_post.fs)
-                return false;
-            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr };
-            cpci.layout = s_post.aaLayout;
-            if (vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_post.aa) != VK_SUCCESS)
-                return false;
-            if (!EnsureScalePipeline())
-                return false;
-            s_post.ready = true;
-            const int32_t mode = settings::GetInt(settings::Id::Scaling);
-            fprintf(stderr, "[video] post-processing: %s, %s scaling%s%s\n", AaEnabled() ? "anti-aliasing" : "no anti-aliasing",
-                mode == int32_t(settings::ScalingMode::Fsr1) ? "FSR 1 (enlarging; else bicubic)" : Bicubic() ? "bicubic" : "linear",
-                mode != int32_t(settings::ScalingMode::Linear) ? std::format(", sharpen {:.2f}", Sharpen()).c_str() : "",
-                s_fastScale ? " (NFSMW_FAST_SCALE: 7 fetches)" : "");
-            return true;
-        }
-
-        void EnsureAaImage(uint32_t width, uint32_t height)
-        {
-            if (s_post.aaImage && s_post.aaWidth == width && s_post.aaHeight == height)
-                return;
-            WaitIdle();
-            if (s_post.aaImage)
-            {
-                vkDestroyImageView(s_device, s_post.aaView, nullptr);
-                vkDestroyImage(s_device, s_post.aaImage, nullptr);
-                vkFreeMemory(s_device, s_post.aaMemory, nullptr);
-            }
-            VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            ii.imageType = VK_IMAGE_TYPE_2D;
-            ii.format = VK_FORMAT_R8G8B8A8_UNORM;
-            ii.extent = { width, height, 1 };
-            ii.mipLevels = 1;
-            ii.arrayLayers = 1;
-            ii.samples = VK_SAMPLE_COUNT_1_BIT;
-            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            vkCreateImage(s_device, &ii, nullptr, &s_post.aaImage);
-            VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, s_post.aaImage, &req);
-            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &s_post.aaMemory);
-            vkBindImageMemory(s_device, s_post.aaImage, s_post.aaMemory, 0);
-            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = s_post.aaImage;
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R8G8B8A8_UNORM;
-            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCreateImageView(s_device, &vci, nullptr, &s_post.aaView);
-            s_post.aaWidth = width;
-            s_post.aaHeight = height;
-        }
-
-        // The tone pipeline's pieces, made the first time Brightness or the
-        // 360's display gamma is in use (the gamma is on by default, so
-        // usually on the first frame).
-        bool EnsureTone()
-        {
-            if (s_tone.tried)
-            {
-                if (!s_tone.ready)
-                    return false;
-            }
-            else
-            {
-                s_tone.tried = true;
-                std::string glsl = ToneVariant(s_fastScale ? kScaleFastFs : kScaleFs);
-                if (glsl.empty())
-                {
-                    fprintf(stderr, "[video] tone: the scale shader has no single main to wrap; Brightness is off\n");
-                    return false;
-                }
-                VkDescriptorSetLayoutBinding bindings[2] = {
-                    { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-                    { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-                };
-                VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-                dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-                dslci.bindingCount = 2;
-                dslci.pBindings = bindings;
-                VkPushConstantRange range{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 36 };  // the scale shaders' P
-                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-                plci.setLayoutCount = 1;
-                plci.pSetLayouts = &s_tone.set;
-                plci.pushConstantRangeCount = 1;
-                plci.pPushConstantRanges = &range;
-                if (!Check(vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_tone.set), "tone set layout") ||
-                    !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_tone.layout), "tone pipeline layout"))
-                    return false;
-                s_tone.fs = PostModule(glsl.c_str(), 1);
-                if (!s_tone.fs)
-                    return false;
-
-                VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-                ii.imageType = VK_IMAGE_TYPE_2D;
-                ii.format = VK_FORMAT_R16G16B16A16_SFLOAT;  // sampled with linear filtering on every Vulkan device
-                ii.extent = { 256, 1, 1 };
-                ii.mipLevels = 1;
-                ii.arrayLayers = 1;
-                ii.samples = VK_SAMPLE_COUNT_1_BIT;
-                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-                ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-                if (!Check(vkCreateImage(s_device, &ii, nullptr, &s_tone.image), "tone table image"))
-                    return false;
-                VkMemoryRequirements req;
-                vkGetImageMemoryRequirements(s_device, s_tone.image, &req);
-                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if (ai.memoryTypeIndex == UINT32_MAX || !Check(vkAllocateMemory(s_device, &ai, nullptr, &s_tone.memory), "tone table memory"))
-                    return false;
-                vkBindImageMemory(s_device, s_tone.image, s_tone.memory, 0);
-                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                vci.image = s_tone.image;
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                if (!Check(vkCreateImageView(s_device, &vci, nullptr, &s_tone.view), "tone table view"))
-                    return false;
-
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = 256 * 4 * sizeof(uint16_t);
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-                if (!Check(vkCreateBuffer(s_device, &bci, nullptr, &s_tone.staging), "tone staging buffer"))
-                    return false;
-                vkGetBufferMemoryRequirements(s_device, s_tone.staging, &req);
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                if (ai.memoryTypeIndex == UINT32_MAX || !Check(vkAllocateMemory(s_device, &ai, nullptr, &s_tone.stagingMemory), "tone staging memory"))
-                    return false;
-                vkBindBufferMemory(s_device, s_tone.staging, s_tone.stagingMemory, 0);
-                if (!Check(vkMapMemory(s_device, s_tone.stagingMemory, 0, VK_WHOLE_SIZE, 0, &s_tone.stagingMapped), "tone staging map"))
-                    return false;
-                s_tone.ready = true;
-            }
-            if (s_tone.pipeline && s_tone.format == s_swapFormat)
-                return true;
-            if (s_tone.pipeline)
-                vkDestroyPipeline(s_device, s_tone.pipeline, nullptr);
-            auto start = std::chrono::steady_clock::now();
-            s_tone.pipeline = MakeScalePipeline(s_tone.fs, s_tone.layout);
-            if (!s_tone.pipeline)
-            {
-                fprintf(stderr, "[video] tone: the pipeline couldn't be made; Brightness is off\n");
-                s_tone.ready = false;
-                return false;
-            }
-            s_tone.format = s_swapFormat;
-            fprintf(stderr, "[video] tone: pipeline made in %.0f ms\n",
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-            return true;
-        }
-
-        // Before the scale pass: whether this frame's picture goes through
-        // the tone table (Settings > Display > Brightness, Xbox 360 Display
-        // Gamma), with the table brought up to date in `cmd` when its inputs
-        // changed. At Brightness 0 with the gamma off it does nothing and
-        // returns false.
-        bool PrepareTone(VkCommandBuffer cmd)
-        {
-            const int32_t brightness = std::clamp(settings::GetInt(settings::Id::Brightness), tone::kBrightnessMin, tone::kBrightnessMax);
-            const bool useRamp = settings::GetBool(settings::Id::DisplayGamma);
-            if (tone::Neutral(brightness, useRamp) || !EnsureTone())
-                return false;
-            const uint64_t rampGeneration = useRamp ? display_gamma::Generation() : 0;
-            if (s_tone.filled && s_tone.brightness == brightness && s_tone.ramp == useRamp && s_tone.rampGeneration == rampGeneration)
-                return true;
-            display_gamma::Table ramp;
-            const bool haveRamp = useRamp && display_gamma::Latest(ramp) != 0;
-            const tone::Lut lut = tone::BuildLut(brightness, haveRamp ? &ramp : nullptr);
-            const auto texels = tone::ToHalfTexels(lut);
-            // The frames in flight may be reading the table: rare (a setting
-            // or the game's own ramp changed), so wait for them.
-            WaitIdle();
-            memcpy(s_tone.stagingMapped, texels.data(), sizeof(texels));
-            Barrier(cmd, s_tone.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            copy.imageExtent = { 256, 1, 1 };
-            vkCmdCopyBufferToImage(cmd, s_tone.staging, s_tone.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            Barrier(cmd, s_tone.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            fprintf(stderr, "[video] tone: brightness %+d, Xbox 360 display gamma %s; 64->%.1f 128->%.1f 192->%.1f (8-bit levels, red)\n",
-                brightness, !useRamp ? "off" : haveRamp ? std::format("on (the game's ramp #{})", rampGeneration).c_str() : "on (no ramp from the game yet)",
-                lut.entry[64][0] * 255.0, lut.entry[128][0] * 255.0, lut.entry[192][0] * 255.0);
-            s_tone.filled = true;
-            s_tone.brightness = brightness;
-            s_tone.ramp = useRamp;
-            s_tone.rampGeneration = rampGeneration;
-            return true;
-        }
-
-        // ---------------------------------------------------------------
-        // Settings > Graphics > Upscaling's FSR 1 (video/fsr1.h; when it is
-        // used: video/upscale.h): EASU (compute) from the anti-aliased frame
-        // into s_fsr.image, the picture's size on the screen, then RCAS
-        // (fragment) where the bicubic pass draws, with the tone table and
-        // then the UI after it as before. Made the first time a frame is
-        // enlarged with it; if that fails, those frames take the bicubic
-        // pass (logged once).
-        struct FsrState
-        {
-            bool tried = false, ready = false, toneTried = false;
-            VkDescriptorSetLayout easuSet = VK_NULL_HANDLE, rcasSet = VK_NULL_HANDLE;
-            VkPipelineLayout easuLayout = VK_NULL_HANDLE, rcasLayout = VK_NULL_HANDLE;
-            VkPipeline easu = VK_NULL_HANDLE;
-            VkShaderModule rcasFs = VK_NULL_HANDLE, rcasToneFs = VK_NULL_HANDLE;
-            VkPipeline rcas = VK_NULL_HANDLE, rcasTone = VK_NULL_HANDLE;
-            VkFormat rcasFormat = VK_FORMAT_UNDEFINED, rcasToneFormat = VK_FORMAT_UNDEFINED;  // the swapchain's they were made for
-            // EASU's picture, the size of the picture on the screen.
-            VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            VkImageView view = VK_NULL_HANDLE;
-            uint32_t width = 0, height = 0;
-        } s_fsr;
-
-        // The shaders' push constants (their P in video/fsr1.cpp).
-        struct EasuPush
-        {
-            uint32_t con[16];  // FsrEasuCon's con0..con3
-            int32_t band[4];   // the 16:9 band's columns x0..x1 and rows y0..y1 (video::BandOf)
-            int32_t outW, outH, srcW, srcH;
-            uint32_t bandOn;
-        };
-        static_assert(sizeof(EasuPush) == 100);
-        struct RcasPush
-        {
-            uint32_t con[4];  // FsrRcasCon's (con[0] 0: no sharpening)
-            int32_t band[4];
-            int32_t originX, originY, outW, outH, srcW, srcH;
-            uint32_t bandOn;
-        };
-        static_assert(sizeof(RcasPush) == 60);
-
-        bool EnsureFsr()
-        {
-            if (s_fsr.tried)
-                return s_fsr.ready;
-            s_fsr.tried = true;
-            auto start = std::chrono::steady_clock::now();
-            VkDescriptorSetLayoutBinding easuBindings[2] = {
-                { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            // RCAS: EASU's picture, and the tone table (its tone variant).
-            VkDescriptorSetLayoutBinding rcasBindings[2] = {
-                { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-            };
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dslci.bindingCount = 2;
-            dslci.pBindings = easuBindings;
-            VkDescriptorSetLayoutCreateInfo rcasDslci = dslci;
-            rcasDslci.pBindings = rcasBindings;
-            VkPushConstantRange easuRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EasuPush) };
-            VkPushConstantRange rcasRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(RcasPush) };
-            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci.setLayoutCount = 1;
-            plci.pSetLayouts = &s_fsr.easuSet;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges = &easuRange;
-            VkPipelineLayoutCreateInfo rcasPlci = plci;
-            rcasPlci.pSetLayouts = &s_fsr.rcasSet;
-            rcasPlci.pPushConstantRanges = &rcasRange;
-            if (!Check(vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_fsr.easuSet), "FSR 1 EASU set layout") ||
-                !Check(vkCreateDescriptorSetLayout(s_device, &rcasDslci, nullptr, &s_fsr.rcasSet), "FSR 1 RCAS set layout") ||
-                !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_fsr.easuLayout), "FSR 1 EASU pipeline layout") ||
-                !Check(vkCreatePipelineLayout(s_device, &rcasPlci, nullptr, &s_fsr.rcasLayout), "FSR 1 RCAS pipeline layout"))
-            {
-                fprintf(stderr, "[video] FSR 1 is off: its pipeline layouts couldn't be made; bicubic upscaling instead\n");
-                return false;
-            }
-            VkShaderModule cs = PostModule(fsr1::EasuGlsl().c_str(), 2);
-            s_fsr.rcasFs = PostModule(fsr1::RcasGlsl().c_str(), 1);
-            if (!cs || !s_fsr.rcasFs)
-            {
-                fprintf(stderr, "[video] FSR 1 is off: its shaders didn't compile; bicubic upscaling instead\n");
-                return false;
-            }
-            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr };
-            cpci.layout = s_fsr.easuLayout;
-            const bool made = Check(vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_fsr.easu), "FSR 1 EASU pipeline");
-            vkDestroyShaderModule(s_device, cs, nullptr);
-            if (!made)
-            {
-                fprintf(stderr, "[video] FSR 1 is off: its EASU pipeline couldn't be made; bicubic upscaling instead\n");
-                return false;
-            }
-            s_fsr.ready = true;
-            fprintf(stderr, "[video] FSR 1: EASU and RCAS compiled in %.0f ms\n",
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-            return true;
-        }
-
-        // RCAS's pipeline for the swapchain's format, plain or with the tone
-        // table (Brightness, the 360's display gamma); VK_NULL_HANDLE if it
-        // can't be made (the frame then takes the bicubic pass).
-        VkPipeline RcasPipeline(bool tone)
-        {
-            if (tone && !s_fsr.toneTried)
-            {
-                s_fsr.toneTried = true;
-                const std::string glsl = ToneVariant(fsr1::RcasGlsl().c_str());
-                s_fsr.rcasToneFs = glsl.empty() ? VK_NULL_HANDLE : PostModule(glsl.c_str(), 1);
-                if (!s_fsr.rcasToneFs)
-                    fprintf(stderr, "[video] FSR 1: the RCAS shader with Brightness couldn't be made; bicubic upscaling while the tone is in use\n");
-            }
-            VkShaderModule fs = tone ? s_fsr.rcasToneFs : s_fsr.rcasFs;
-            VkPipeline& pipeline = tone ? s_fsr.rcasTone : s_fsr.rcas;
-            VkFormat& format = tone ? s_fsr.rcasToneFormat : s_fsr.rcasFormat;
-            if (!fs)
-                return VK_NULL_HANDLE;
-            if (pipeline && format == s_swapFormat)
-                return pipeline;
-            if (pipeline)
-                vkDestroyPipeline(s_device, pipeline, nullptr);
-            pipeline = MakeScalePipeline(fs, s_fsr.rcasLayout);
-            format = pipeline ? s_swapFormat : VK_FORMAT_UNDEFINED;
-            return pipeline;
-        }
-
-        void EnsureFsrImage(uint32_t width, uint32_t height)
-        {
-            if (s_fsr.image && s_fsr.width == width && s_fsr.height == height)
-                return;
-            WaitIdle();
-            if (s_fsr.image)
-            {
-                vkDestroyImageView(s_device, s_fsr.view, nullptr);
-                vkDestroyImage(s_device, s_fsr.image, nullptr);
-                vkFreeMemory(s_device, s_fsr.memory, nullptr);
-            }
-            VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            ii.imageType = VK_IMAGE_TYPE_2D;
-            ii.format = VK_FORMAT_R8G8B8A8_UNORM;
-            ii.extent = { width, height, 1 };
-            ii.mipLevels = 1;
-            ii.arrayLayers = 1;
-            ii.samples = VK_SAMPLE_COUNT_1_BIT;
-            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            vkCreateImage(s_device, &ii, nullptr, &s_fsr.image);
-            VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, s_fsr.image, &req);
-            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &s_fsr.memory);
-            vkBindImageMemory(s_device, s_fsr.image, s_fsr.memory, 0);
-            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = s_fsr.image;
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = VK_FORMAT_R8G8B8A8_UNORM;
-            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCreateImageView(s_device, &vci, nullptr, &s_fsr.view);
-            s_fsr.width = width;
-            s_fsr.height = height;
-        }
-
-        // EASU: the w x h frame (scaleInput) enlarged to dw x dh in
-        // s_fsr.image, ready for RCAS's reads. Outside a rendering pass.
-        void RecordEasu(VkCommandBuffer cmd, VkImageView scaleInput, uint32_t w, uint32_t h, int32_t dw, int32_t dh,
-            const video::FrameBand& band, bool bandOn)
-        {
-            EnsureFsrImage(uint32_t(dw), uint32_t(dh));
-            // After the last frame's RCAS read it.
-            Barrier(cmd, s_fsr.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_fsr.view, VK_IMAGE_LAYOUT_GENERAL };
-            VkWriteDescriptorSet writes[2] = {
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
-            };
-            EasuPush pc{};
-            const std::array<uint32_t, 16> con = fsr1::EasuConstants(w, h, uint32_t(dw), uint32_t(dh));
-            std::copy(con.begin(), con.end(), pc.con);
-            pc.band[0] = band.x0;
-            pc.band[1] = band.x1;
-            pc.band[2] = band.y0;
-            pc.band[3] = band.y1;
-            pc.outW = dw;
-            pc.outH = dh;
-            pc.srcW = int32_t(w);
-            pc.srcH = int32_t(h);
-            pc.bandOn = bandOn ? 1u : 0u;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_fsr.easu);
-            s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_fsr.easuLayout, 0, 2, writes);
-            vkCmdPushConstants(cmd, s_fsr.easuLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(cmd, (uint32_t(dw) + 7) / 8, (uint32_t(dh) + 7) / 8, 1);
-            Barrier(cmd, s_fsr.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        }
-
-        // Inside a rendering pass on the swapchain image (or a capture's
-        // image of its format): the picture at dx, dy, dw x dh, by `pass`
-        // (FSR 1: RCAS over RecordEasu's image, with `rcas` its pipeline),
-        // through the tone table when `tone`.
-        void DrawPicture(VkCommandBuffer cmd, upscale::Pass pass, VkPipeline rcas, bool tone, VkImageView scaleInput, uint32_t w,
-            uint32_t h, const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh, float sharpen)
-        {
-            VkViewport viewport{ float(dx), float(dy), float(dw), float(dh), 0.0f, 1.0f };
-            VkRect2D scissor{ { dx, dy }, { uint32_t(dw), uint32_t(dh) } };
-            vkCmdSetViewport(cmd, 0, 1, &viewport);
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
-            const bool fsr = pass == upscale::Pass::Fsr1;
-            const VkPipelineLayout layout = fsr ? s_fsr.rcasLayout : tone ? s_tone.layout : s_post.scaleLayout;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fsr ? rcas : tone ? s_tone.pipeline : s_post.scale);
-            VkDescriptorImageInfo in{ s_post.sampler, fsr ? s_fsr.view : scaleInput, VK_IMAGE_LAYOUT_GENERAL };
-            VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
-                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr };
-            if (tone)
-            {
-                VkDescriptorImageInfo table{ s_post.sampler, s_tone.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                VkWriteDescriptorSet writes[2] = { write, write };
-                writes[1].dstBinding = 1;
-                writes[1].pImageInfo = &table;
-                s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, writes);
-            }
-            else
-                s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &write);
-            if (fsr)
-            {
-                RcasPush pc{};
-                const std::array<uint32_t, 4> con = fsr1::RcasConstants(upscale::RcasStops(sharpen));
-                std::copy(con.begin(), con.end(), pc.con);
-                pc.band[0] = band.x0;
-                pc.band[1] = band.x1;
-                pc.band[2] = band.y0;
-                pc.band[3] = band.y1;
-                pc.originX = dx;
-                pc.originY = dy;
-                pc.outW = dw;
-                pc.outH = dh;
-                pc.srcW = int32_t(w);
-                pc.srcH = int32_t(h);
-                pc.bandOn = bandOn ? 1u : 0u;
-                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            }
-            else
-            {
-                struct
-                {
-                    float width, height, sharpen;
-                    uint32_t bicubic;
-                    float band[4];
-                    uint32_t bandOn;
-                } pc = { float(w), float(h), sharpen, pass == upscale::Pass::Bicubic ? 1u : 0u,
-                    { float(band.x0), float(band.x1), float(band.y0), float(band.y1) }, bandOn ? 1u : 0u };
-                static_assert(sizeof(pc) == 36);
-                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-            }
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-        }
-
-        // The pass a frame takes (video/upscale.h), FSR 1 only where its
-        // pipelines are ready (made here the first time); a line in the log
-        // when the pass or the sizes change.
-        upscale::Pass ChoosePass(bool tone, uint32_t w, uint32_t h, int32_t dw, int32_t dh, VkPipeline& rcas)
-        {
-            rcas = VK_NULL_HANDLE;
-            upscale::Pass pass = upscale::Choose(settings::GetInt(settings::Id::Scaling), w, h, dw, dh);
-            if (pass == upscale::Pass::Fsr1 && EnsureFsr())
-                rcas = RcasPipeline(tone);
-            if (pass == upscale::Pass::Fsr1 && !rcas)
-                pass = upscale::Pass::Bicubic;
-            static upscale::Pass lastPass = upscale::Pass::Linear;
-            static uint32_t lastW = 0, lastH = 0;
-            static int32_t lastDw = 0, lastDh = 0;
-            static int lines = 0;
-            if ((pass != lastPass || w != lastW || h != lastH || dw != lastDw || dh != lastDh) && lines < 32)
-            {
-                lines++;
-                const bool fsrChosen = settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Fsr1);
-                fprintf(stderr, "[video] upscaling: %s, %ux%u -> %dx%d%s\n", upscale::PassName(pass), w, h, dw, dh,
-                    pass == upscale::Pass::Fsr1 ? std::format(" (RCAS at {:.2f} of its strength)", upscale::RcasAmount(Sharpen())).c_str()
-                    : !fsrChosen ? ""
-                    : upscale::Enlarged(w, h, dw, dh) ? " (FSR 1 unavailable)" : " (FSR 1 only enlarges)");
-            }
-            lastPass = pass;
-            lastW = w;
-            lastH = h;
-            lastDw = dw;
-            lastDh = dh;
-            return pass;
-        }
-
         // NFSMW_UPSCALE_COMPARE=<passes> (a diagnostic): with each
         // NFSMW_CHECK_PRESENT_SEC capture, the same frame drawn again by each
         // listed pass into an image of its own (the swapchain's size and
@@ -2016,9 +1031,10 @@ void main()
 
         // Records each listed pass's picture of this frame and its copy to
         // the host. Outside a rendering pass.
-        std::vector<CompareShot> RecordCompare(VkCommandBuffer cmd, bool tone, VkImageView scaleInput, uint32_t w, uint32_t h,
-            const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh)
+        std::vector<CompareShot> RecordCompare(gpu::rhi::CommandList& list, PostProcessor& postProcessor, bool tone, gpu::rhi::Image& scaleInput,
+            uint32_t w, uint32_t h, const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh)
         {
+            VkCommandBuffer cmd = gpu::rhi::vulkan::NativeCommandBuffer(list);
             std::vector<CompareShot> shots;
             for (const CompareEntry& entry : CompareList())
             {
@@ -2063,14 +1079,9 @@ void main()
                 vkAllocateMemory(s_device, &ai, nullptr, &shot.bufferMemory);
                 vkBindBufferMemory(s_device, shot.buffer, shot.bufferMemory, 0);
 
-                VkPipeline rcas = VK_NULL_HANDLE;
-                upscale::Pass pass = upscale::Choose(entry.mode, w, h, width, height);
-                if (pass == upscale::Pass::Fsr1 && EnsureFsr())
-                    rcas = RcasPipeline(tone);
-                if (pass == upscale::Pass::Fsr1 && !rcas)
-                    pass = upscale::Pass::Bicubic;
+                const upscale::Pass pass = postProcessor.PassFor(entry.mode, tone, w, h, width, height);
                 if (pass == upscale::Pass::Fsr1)
-                    RecordEasu(cmd, scaleInput, w, h, width, height, band, bandOn);
+                    postProcessor.RecordEasu(list, scaleInput, w, h, width, height, band, bandOn);
                 Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
                 VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
@@ -2084,8 +1095,8 @@ void main()
                 ri.colorAttachmentCount = 1;
                 ri.pColorAttachments = &color;
                 s_context.cmdBeginRendering(cmd, &ri);
-                DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, x, y, width, height,
-                    entry.sharpen >= 0.0f ? std::min(entry.sharpen, 1.0f) : Sharpen());
+                postProcessor.DrawPicture(list, pass, tone, scaleInput, w, h, band, bandOn, x, y, width, height,
+                    entry.sharpen >= 0.0f ? std::min(entry.sharpen, 1.0f) : PostProcessor::Sharpen());
                 s_context.cmdEndRendering(cmd);
                 Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -3903,11 +2914,7 @@ void main()
             }
             f.timed = false;
         }
-        if (f.sourceView)
-        {
-            vkDestroyImageView(s_device, f.sourceView, nullptr);  // the last use of this frame slot has finished
-            f.sourceView = VK_NULL_HANDLE;
-        }
+        f.source.reset();  // the last use of this frame slot has finished
         const gpu::rhi::SurfaceStatus acquire = s_swapchain->Acquire(s_acquired);
         // Either is for the next frame's CheckSwapchain, which runs before
         // its acquire (one decision a frame: the policy counts in frames).
@@ -4028,32 +3035,31 @@ void main()
             if (x1 > x0 && y1 > y0)
                 pictureRect = { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
         }
-        const bool post = haveSource && EnsurePostProcessing();
+        if (!s_postProcessor)
+            s_postProcessor = std::make_unique<PostProcessor>(*s_rhi, [] { WaitIdle(); });
+        PostProcessor& postProcessor = *s_postProcessor;
+        const bool post = haveSource && postProcessor.Ready(gpu::rhi::Format(s_swapchain->GetFormat()));
         if (post || !haveSource)
         {
             // Draw into the swapchain image: the scaled game frame (if any),
             // then the UI over it.
-            VkImageView scaleInput = VK_NULL_HANDLE;
+            gpu::rhi::Image* scaleInput = nullptr;
             if (post)
             {
                 if (!gpuImage)
-                    Barrier(cmd, s_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                    Barrier(cmd, s_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
                 else
-                {
-                    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-                    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-                    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                        0, 1, &mb, 0, nullptr, 0, nullptr);
-                }
-                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                vci.image = source;
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = gpuImage ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;  // the renderer's front image / s_source
-                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCreateImageView(s_device, &vci, nullptr, &f.sourceView);
-                scaleInput = f.sourceView;
+                    // Written by the renderer's earlier submission (and left in GENERAL, which
+                    // it expects back at the end of the frame).
+                    Barrier(cmd, source, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
+                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                // The renderer's front image / s_source.
+                f.source = gpu::rhi::vulkan::WrapImage(*s_rhi, source, gpuImage ? gpu::rhi::Format::RGBA8 : gpu::rhi::Format::BGRA8, w, h,
+                    gpu::rhi::kImageSampled);
+                scaleInput = f.source.get();
                 if (s_timestamps)
                 {
                     // From when the work before it is done (the renderer's frame).
@@ -4062,33 +3068,8 @@ void main()
                     f.timed = true;
                 }
 
-                if (AaEnabled())
-                {
-                    EnsureAaImage(w, h);
-                    Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    VkDescriptorImageInfo in{ s_post.sampler, f.sourceView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.aaView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkWriteDescriptorSet writes[2] = {
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
-                    };
-                    struct
-                    {
-                        int32_t width, height;
-                        float subpixel;
-                        uint32_t bandOn;
-                        int32_t band[4];
-                    } pc = { int32_t(w), int32_t(h), 0.5f, bandOn ? 1u : 0u, { band.x0, band.x1, band.y0, band.y1 } };
-                    static_assert(sizeof(pc) == 32);
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aa);
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aaLayout, 0, 2, writes);
-                    vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-                    Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-                    scaleInput = s_post.aaView;
-                }
+                if (PostProcessor::AntiAliasing())
+                    scaleInput = &postProcessor.RecordAntiAliasing(*f.list, *scaleInput, w, h, band, bandOn);
                 if (f.timed)
                     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 1);
             }
@@ -4096,17 +3077,16 @@ void main()
             // Brightness and the 360's display gamma: false at Brightness 0
             // with the gamma off, and then the scale pass below is exactly as
             // before.
-            const bool tone = scaleInput && PrepareTone(cmd);
+            const bool tone = scaleInput && postProcessor.PrepareTone(*f.list);
             // The pass that draws the picture (video/upscale.h): FSR 1's
             // EASU first, outside the swapchain image's pass.
-            VkPipeline rcas = VK_NULL_HANDLE;
-            upscale::Pass pass = scaleInput ? ChoosePass(tone, w, h, dw, dh, rcas) : upscale::Pass::Bicubic;
+            upscale::Pass pass = scaleInput ? postProcessor.ChoosePass(tone, w, h, dw, dh) : upscale::Pass::Bicubic;
             static uint64_t abCount = 0;
             if (s_upscaleAb && pass == upscale::Pass::Fsr1 && (abCount++ & 1))
                 pass = upscale::Pass::Bicubic;
             f.pass = pass;
             if (scaleInput && pass == upscale::Pass::Fsr1)
-                RecordEasu(cmd, scaleInput, w, h, dw, dh, band, bandOn);
+                postProcessor.RecordEasu(*f.list, *scaleInput, w, h, dw, dh, band, bandOn);
             Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
             VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
@@ -4124,7 +3104,7 @@ void main()
             s_context.cmdBeginRendering(cmd, &ri);
             if (scaleInput)
             {
-                DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh, Sharpen());
+                postProcessor.DrawPicture(*f.list, pass, tone, *scaleInput, w, h, band, bandOn, dx, dy, dw, dh, PostProcessor::Sharpen());
                 if (!captures.empty() && pictureRect.extent.width)
                 {
                     // The game's picture alone: pause the pass, copy it out,
@@ -4227,10 +3207,14 @@ void main()
                 Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             if (captureIndex >= 0 && scaleInput)
-                compareShots = RecordCompare(cmd, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh);
+                compareShots = RecordCompare(*f.list, postProcessor, tone, *scaleInput, w, h, band, bandOn, dx, dy, dw, dh);
             if (post && !gpuImage)
-                Barrier(cmd, s_source, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                Barrier(cmd, s_source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            else if (post)
+                // Back to the layout the renderer writes it in.
+                Barrier(cmd, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         }
         else
         {

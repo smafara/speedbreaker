@@ -201,21 +201,25 @@ namespace
         CHECK(Count(rcas, "!= centreSpan.") == 2 && rcas.find("t.x = centre.x;") != std::string::npos && rcas.find("t.y = centre.y;") != std::string::npos,
             "RCAS: RcasNeighbour on both axes");
         // The presenter: the pass from Choose, RCAS's tone variant from ToneVariant, EASU before the swapchain's pass.
-        const std::string presenter = Read(videoDir / "presenter.cpp");
-        CHECK(presenter.find("upscale::Choose(settings::GetInt(settings::Id::Scaling), w, h, dw, dh)") != std::string::npos, "ChoosePass");
-        CHECK(presenter.find("ToneVariant(fsr1::RcasGlsl().c_str())") != std::string::npos, "RCAS's tone variant");
-        const size_t easuAt = presenter.find("RecordEasu(cmd, scaleInput, w, h, dw, dh, band, bandOn);");
-        const size_t passAt = presenter.find("color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars");
+        // (post_process.cpp: the passes; presenter.cpp: the order of the frame's.)
+        const std::string post = Read(videoDir / "post_process.cpp");
+        const std::string frame = Read(videoDir / "presenter.cpp");
+        CHECK(post.find("upscale::Choose(mode, w, h, dw, dh)") != std::string::npos &&
+                post.find("Choose(settings::GetInt(settings::Id::Scaling), tone, w, h, dw, dh)") != std::string::npos,
+            "ChoosePass");
+        CHECK(post.find("ToneVariant(fsr1::RcasGlsl().c_str())") != std::string::npos, "RCAS's tone variant");
+        const size_t easuAt = frame.find("postProcessor.RecordEasu(*f.list, *scaleInput, w, h, dw, dh, band, bandOn);");
+        const size_t passAt = frame.find("color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars");
         CHECK(easuAt != std::string::npos && passAt != std::string::npos && easuAt < passAt, "EASU before the swapchain image's pass");
         // No FSR 1 shader or pipeline unless a frame's pass is FSR 1: the
         // GLSL is compiled only in EnsureFsr and RcasPipeline, and every
         // EnsureFsr() call is behind "pass == upscale::Pass::Fsr1".
-        const size_t ensureAt = presenter.find("bool EnsureFsr()"), imageAt = presenter.find("void EnsureFsrImage(");
+        const size_t ensureAt = post.find("bool EnsureFsr()"), imageAt = post.find("void EnsureFsrImage(");
         CHECK(ensureAt != std::string::npos && imageAt != std::string::npos && ensureAt < imageAt, "EnsureFsr, RcasPipeline, EnsureFsrImage in order");
         size_t glslAt = 0, glslCount = 0;
-        while ((glslAt = presenter.find("fsr1::", glslAt)) != std::string::npos)
+        while ((glslAt = post.find("fsr1::", glslAt)) != std::string::npos)
         {
-            if (presenter.compare(glslAt, 15, "fsr1::EasuGlsl(") == 0 || presenter.compare(glslAt, 15, "fsr1::RcasGlsl(") == 0)
+            if (post.compare(glslAt, 15, "fsr1::EasuGlsl(") == 0 || post.compare(glslAt, 15, "fsr1::RcasGlsl(") == 0)
             {
                 glslCount++;
                 CHECK(glslAt > ensureAt && glslAt < imageAt, "FSR 1 GLSL compiled outside EnsureFsr/RcasPipeline (offset %zu)", glslAt);
@@ -224,16 +228,16 @@ namespace
         }
         CHECK(glslCount == 3, "FSR 1 GLSL compiled in 3 places (EASU, RCAS, RCAS's tone variant): %zu", glslCount);
         size_t calls = 0;
-        for (size_t callAt = presenter.find("EnsureFsr()"); callAt != std::string::npos; callAt = presenter.find("EnsureFsr()", callAt + 11))
+        for (size_t callAt = post.find("EnsureFsr()"); callAt != std::string::npos; callAt = post.find("EnsureFsr()", callAt + 11))
         {
             if (callAt == ensureAt + 5)
                 continue;  // the definition
             calls++;
-            const size_t lineAt = presenter.rfind('\n', callAt) + 1;
-            CHECK(presenter.substr(lineAt, callAt - lineAt).find("pass == upscale::Pass::Fsr1 && ") != std::string::npos,
-                "EnsureFsr() called without the FSR 1 pass: %s", presenter.substr(lineAt, presenter.find('\n', callAt) - lineAt).c_str());
+            const size_t lineAt = post.rfind('\n', callAt) + 1;
+            CHECK(post.substr(lineAt, callAt - lineAt).find("pass == upscale::Pass::Fsr1 && ") != std::string::npos,
+                "EnsureFsr() called without the FSR 1 pass: %s", post.substr(lineAt, post.find('\n', callAt) - lineAt).c_str());
         }
-        CHECK(calls == 2, "EnsureFsr() called from ChoosePass and NFSMW_UPSCALE_COMPARE only: %zu", calls);
+        CHECK(calls == 1, "EnsureFsr() called from Choose only (ChoosePass and NFSMW_UPSCALE_COMPARE both go through it): %zu", calls);
         // iPhone and iPad: no FSR 1 in the menu (user/settings.cpp: its entry
         // compiled out there, so "fsr1" reads as unknown = bicubic).
         const std::string settingsCpp = Read(videoDir / ".." / "user" / "settings.cpp");

@@ -3,7 +3,7 @@
 // The picture's tone curve (video/display_tone.h: Settings > Display >
 // Brightness) and the 360's display gamma ramp as the game programs it
 // (video/display_gamma.h: the DC_LUT_* register protocol), header only. The
-// optional arguments are runtime/video/presenter.cpp (its tone shader wraps
+// optional arguments are runtime/video/post_process.cpp (its tone shader wraps
 // the scale shaders it uses, which must each have exactly one main) and
 // runtime/user/settings.cpp (the two options' defaults: Brightness 0, Xbox 360
 // Display Gamma on since v0.1.4).
@@ -307,7 +307,7 @@ namespace
             CHECK(std::abs(both.entry[k][0] - std::pow(ramp10[k] / 1023.0, tone::BrightnessExponent(2))) < 1e-6, "ramp then +2, %u", k);
     }
 
-    // presenter.cpp's scale shaders: the tone variant renames their one main.
+    // post_process.cpp's scale shaders: the tone variant renames their one main.
     void PresenterShaders(const char* path)
     {
         std::ifstream in(path);
@@ -331,9 +331,9 @@ namespace
         }
         // The plain scale pipeline is still made from those shaders, and the
         // tone pipeline only from ToneVariant.
-        CHECK(src.find("s_post.fs = PostModule(s_fastScale ? kScaleFastFs : kScaleFs, 1);") != std::string::npos, "the plain scale shader");
+        CHECK(src.find("scaleCode = Compile(s_fastScale ? kScaleFastFs : kScaleFs, 1);") != std::string::npos, "the plain scale shader");
         CHECK(src.find("ToneVariant(s_fastScale ? kScaleFastFs : kScaleFs)") != std::string::npos, "the tone variant's source");
-        CHECK(src.find("tone ? s_tone.pipeline : s_post.scale") != std::string::npos, "the scale pass picks the plain pipeline when neutral");
+        CHECK(src.find("tone ? *m.toneScale : *m.scale") != std::string::npos, "the scale pass picks the plain pipeline when neutral");
     }
 
     // settings.cpp's option table: Xbox 360 Display Gamma is on by default
@@ -372,7 +372,7 @@ int main(int argc, char** argv)
     if (argc > 1)
         PresenterShaders(argv[1]);
     else
-        printf("(presenter.cpp not given: its shader checks skipped)\n");
+        printf("(post_process.cpp not given: its shader checks skipped)\n");
     if (argc > 2)
         SettingsDefaults(argv[2]);
     else
