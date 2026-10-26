@@ -116,11 +116,10 @@ namespace video
         const float s_presentScale = 1.0f;
 #endif
 
-        VkCommandPool s_commandPool = VK_NULL_HANDLE;
         struct Frame
         {
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            VkFence inFlight = VK_NULL_HANDLE;
+            std::unique_ptr<gpu::rhi::CommandList> list;  // the frame's recording
+            std::unique_ptr<gpu::rhi::Fence> done;  // its submission finished (starts signalled)
             VkBuffer staging = VK_NULL_HANDLE;
             VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
             void* stagingMapped = nullptr;
@@ -2907,20 +2906,10 @@ void main()
         fprintf(stderr, "[vblank] %s on %s\n", s_timingText.c_str(), props.deviceName);
 #endif
 
-        VkCommandPoolCreateInfo pci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        pci.queueFamilyIndex = s_queueFamily;
-        vkCreateCommandPool(s_device, &pci, nullptr, &s_commandPool);
         for (Frame& f : s_frames)
         {
-            VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cai.commandPool = s_commandPool;
-            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cai.commandBufferCount = 1;
-            vkAllocateCommandBuffers(s_device, &cai, &f.cmd);
-            VkFenceCreateInfo fi{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-            fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-            vkCreateFence(s_device, &fi, nullptr, &f.inFlight);
+            f.list = s_rhi->CreateCommandList();
+            f.done = s_rhi->CreateFence(true);
         }
         if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
         {
@@ -3879,7 +3868,7 @@ void main()
         RegionCapture gameCapture;
 
         Frame& f = s_frames[s_frameIndex];
-        vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+        f.done->Wait();
         if (game::covers::Enabled())
             CoverCheckHarvest(s_frameIndex);
         if (f.timed)
@@ -3933,7 +3922,7 @@ void main()
                 s_captureRequests.push_back(std::move(promise));
             return true;
         }
-        vkResetFences(s_device, 1, &f.inFlight);
+        f.done->Reset();
 
         if (upload)
         {
@@ -3942,11 +3931,8 @@ void main()
             memcpy(f.stagingMapped, pixels.data(), size_t(w) * h * 4);
         }
 
-        VkCommandBuffer cmd = f.cmd;
-        vkResetCommandBuffer(cmd, 0);
-        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &bi);
+        f.list->Begin();
+        VkCommandBuffer cmd = gpu::rhi::vulkan::NativeCommandBuffer(*f.list);
 
         VkImage source = gpuImage;
         VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -4042,13 +4028,11 @@ void main()
             if (x1 > x0 && y1 > y0)
                 pictureRect = { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
         }
-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         const bool post = haveSource && EnsurePostProcessing();
         if (post || !haveSource)
         {
             // Draw into the swapchain image: the scaled game frame (if any),
             // then the UI over it.
-            waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             VkImageView scaleInput = VK_NULL_HANDLE;
             if (post)
             {
@@ -4272,7 +4256,6 @@ void main()
                     VK_PIPELINE_STAGE_TRANSFER_BIT, pictureRect);
             if (uiFrame)
             {
-                waitStage |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -4296,21 +4279,8 @@ void main()
                 Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         }
-        vkEndCommandBuffer(cmd);
-
-        VkSemaphore acquireDone, renderDone;
-        gpu::rhi::vulkan::NativeSubmitSemaphores(*s_swapchain, acquireDone, renderDone);
-        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &acquireDone;
-        si.pWaitDstStageMask = &waitStage;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &renderDone;
-        std::unique_lock queueLock(*s_queueMutexPtr);
-        vkQueueSubmit(s_queue, 1, &si, f.inFlight);
-        queueLock.unlock();  // (Present takes the backend's queue lock itself)
+        f.list->End();
+        s_rhi->SubmitToSwapchain(*f.list, *f.done, *s_swapchain);
         frontLock.unlock();
 
         const uint64_t presentId = ++s_presentId;
@@ -4427,7 +4397,7 @@ void main()
             CapturedFrame frame;
             if (gameCapture.buffer)
             {
-                vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+                f.done->Wait();
                 frame = FinishRegionCapture(gameCapture);
             }
             for (auto& promise : captures)
@@ -4435,7 +4405,7 @@ void main()
         }
         if (captureBuffer)
         {
-            vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+            f.done->Wait();
             void* mapped = nullptr;
             vkMapMemory(s_device, captureMemory, 0, captureSize, 0, &mapped);
             std::string path = captureIndex >= 0 ? std::format("build/present_check_{}.ppm", captureIndex)
@@ -4462,7 +4432,7 @@ void main()
         }
         if (!compareShots.empty())
         {
-            vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+            f.done->Wait();
             SaveCompare(compareShots, captureIndex);
         }
         // The next frame's CheckSwapchain builds again (before its acquire).

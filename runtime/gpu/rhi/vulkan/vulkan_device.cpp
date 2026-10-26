@@ -554,9 +554,10 @@ namespace gpu::rhi::vulkan
         class VkFenceObject final : public Fence
         {
         public:
-            explicit VkFenceObject(Context& c) : m_c(c)
+            VkFenceObject(Context& c, bool signaled) : m_c(c)
             {
                 VkFenceCreateInfo ci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+                ci.flags = signaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0;
                 Check(vkCreateFence(c.device, &ci, nullptr, &m_fence), "vkCreateFence");
             }
             ~VkFenceObject() override { vkDestroyFence(m_c.device, m_fence, nullptr); }
@@ -1597,7 +1598,7 @@ namespace gpu::rhi::vulkan
             }
 
             std::unique_ptr<CommandList> CreateCommandList() override { return std::make_unique<VkCommandList>(*m_c); }
-            std::unique_ptr<Fence> CreateFence() override { return std::make_unique<VkFenceObject>(*m_c); }
+            std::unique_ptr<Fence> CreateFence(bool signaled) override { return std::make_unique<VkFenceObject>(*m_c, signaled); }
             std::unique_ptr<Event> CreateEvent() override { return std::make_unique<VkEventObject>(*m_c); }
             std::unique_ptr<QueryPool> CreateQueryPool(QueryKind kind, uint32_t count) override
             {
@@ -1844,10 +1845,7 @@ namespace gpu::rhi::vulkan
     VkImage NativeImage(const Image& image) { return static_cast<const VkImageObject&>(image).Handle(); }
     VkImageView NativeView(const Image& image) { return static_cast<const VkImageObject&>(image).View(); }
     VkFormat NativeFormat(const Swapchain& swapchain) { return static_cast<const VkSwapchainObject&>(swapchain).VkFormatOf(); }
-    void NativeSubmitSemaphores(const Swapchain& swapchain, VkSemaphore& wait, VkSemaphore& signal)
-    {
-        static_cast<const VkSwapchainObject&>(swapchain).SubmitSemaphores(wait, signal);
-    }
+    VkCommandBuffer NativeCommandBuffer(const CommandList& list) { return static_cast<const VkCommandList&>(list).Handle(); }
 
     const Native& GetNative(const rhi::Device& device)
     {

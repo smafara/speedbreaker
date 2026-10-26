@@ -128,6 +128,20 @@ Pacing policy (hold before present, desired-time choice and watchdog, refresh fi
 swapchain rebuild policy, iOS scale, SDL) stays in the presenter. Open: whether images are
 exposed as `rhi::Image` (drafted so) and the Metal drawable's `framebufferOnly=NO` cost.
 
+### D12. Presenter shaders: GLSL compiled at run time, SPIR-V into the RHI (2026-10-26, "A'")
+The user first chose build-time compilation (A), then asked for a re-analysis once it showed
+the case for it was wrong: glslang is linked into the game anyway (the renderer compiles the
+translated shaders at run time), the presenter's compiles take 1-3 ms in the log, and a
+build-time step needs a glslang tool per host (iOS cross-builds) plus the variants
+(`ToneVariant`, `fsr1::EasuGlsl`) enumerated. So: keep the inline GLSL, compile with
+`CompileShader`, give the SPIR-V to `Device::Create*Pipeline` (which also puts the presenter's
+pipelines in the backend's pipeline cache). Found while re-analysing: (1) the front buffer is
+the renderer's own raw `VkImage`, written in GENERAL and read by the presenter in queue
+order: until the renderer moves, the presenter wraps it (transitional `WrapImage`, state
+`ShaderWrite` = GENERAL, which samples fine) ; (2) `ui::Draw(VkCommandBuffer)` (ImGui's
+Vulkan backend) needs the frame list's native command buffer: transitional
+`NativeCommandBuffer`; the ImGui Metal backend later needs the encoder instead.
+
 ## Findings from the survey (2026-10-25)
 
 Vulkan footprint (approximate counts of `Vk*`/`vk*`/`VK_*` references):
@@ -489,3 +503,8 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   presents timed, refresh fit valid (16.668 ms), and with NFSMW_PRESENT_AT=12.5 907 presents
   shown at a time, 823 driver reports, no watchdog trip.
   Next: the post passes against the RHI (AA, FSR1, tone, scale), then slim `RunFrame`.
+- 2026-10-26: presenter step 1 of the post-pass port: each frame slot has an `rhi::CommandList`
+  and `rhi::Fence` (`CreateFence(signaled)` added); submit is `SubmitToSwapchain`, so the
+  presenter's raw `vkQueueSubmit`, queue lock, wait stages and acquire/render-done semaphore
+  accessors are gone. Its commands are still recorded raw into the list's native command
+  buffer (`NativeCommandBuffer`). Replay check PASSED, rhi/quit tests pass.

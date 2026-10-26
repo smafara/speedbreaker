@@ -12,6 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "../command_list.h"
 #include "../device.h"
 
 namespace gpu::rhi::vulkan
@@ -51,14 +52,13 @@ namespace gpu::rhi::vulkan
     // The window's surface (made by the caller from SDL; the backend neither
     // owns nor destroys it). `windowPixels` answers where the surface leaves
     // its size to the swapchain (Wayland's currentExtent is 0xFFFFFFFF).
-    // The Vulkan objects behind an image of the RHI and the semaphores of the
-    // acquired swapchain image, for the presenter's own command buffers until
-    // its passes are on the RHI (it submits with vkQueueSubmit under
-    // `queueMutex`, waiting `wait` and signalling `signal`).
+    // The Vulkan objects behind an object of the RHI, for the presenter's own
+    // recording until its passes are on the RHI (a list's command buffer is
+    // recorded into between its Begin and End, mixed with the list's calls).
     VkImage NativeImage(const Image& image);
     VkImageView NativeView(const Image& image);
     VkFormat NativeFormat(const Swapchain& swapchain);
-    void NativeSubmitSemaphores(const Swapchain& swapchain, VkSemaphore& wait, VkSemaphore& signal);
+    VkCommandBuffer NativeCommandBuffer(const CommandList& list);
 
     std::unique_ptr<Surface> CreateSurface(Device& device, VkSurfaceKHR surface, std::function<Extent3D()> windowPixels);
 }

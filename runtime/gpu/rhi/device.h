@@ -291,7 +291,8 @@ namespace gpu::rhi
         virtual void LoadPipelineCache(const void* data, size_t size) = 0;
 
         virtual std::unique_ptr<CommandList> CreateCommandList() = 0;
-        virtual std::unique_ptr<Fence> CreateFence() = 0;
+        // `signaled`: starts signalled (a frame slot's first wait returns at once).
+        virtual std::unique_ptr<Fence> CreateFence(bool signaled = false) = 0;
         virtual std::unique_ptr<Event> CreateEvent() = 0;
         virtual std::unique_ptr<QueryPool> CreateQueryPool(QueryKind kind, uint32_t count) = 0;
 
