@@ -811,3 +811,10 @@ replay on Metal).
   runs each, world: Metal worst frame 272-282 ms, Vulkan 63-65 ms (first-use pipeline creation:
   78 pipelines), GPU busy 1.0 vs 0.7 ms per frame. Next steps are a longer live comparison and,
   for the first-use cost, creating pipelines off the render path.
+- 2026-10-26 — **Cold glslang cost measured** (world replay, `spirv` cache moved aside, then put
+  back). Pipelines: Metal 65 in 518 ms cold vs 247 warm; Vulkan 66 in 293 ms cold vs 30 warm. So
+  glslang (GLSL to SPIR-V) is ~270 ms for the ~85 shaders (~3 ms each), on a machine's first run
+  only. Warm, Metal still pays ~250 ms to Vulkan's 30: SPIRV-Cross runs again every launch, where
+  MoltenVK saves its conversions. Consequence: direct MSL emission would save ~270 ms once plus
+  ~250 ms a run, the second of which a disk cache of the generated MSL (keyed by the SPIR-V, the
+  layout and the SPIRV-Cross version) gets with far less code. Emitter not worth it for speed.
