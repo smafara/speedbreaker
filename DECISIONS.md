@@ -401,3 +401,7 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   `texture2d<uint, access::write>`. So the D4 path (GLSL -> SPIR-V -> MSL) is viable for the
   whole current shader set; it says nothing yet about correct results (that is the replay
   check on a Metal backend) or pipeline-state creation time.
+- 2026-10-26: the user installed the Metal Toolchain (`xcrun metal` 32023.921, air64-apple-darwin27.0.0).
+  The same 115 MSL files compile with the offline compiler (`xcrun metal -std=metal3.0 -c`):
+  115 of 115, 7 s. Agrees with the runtime compiler. Environment note: offline `metal`/`metallib`
+  now available for shader debugging and for precompiled shader libraries later.
