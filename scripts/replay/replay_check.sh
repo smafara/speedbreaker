@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # SpeedBreaker. GPL-3.0-or-later (see COPYING).
 #
-#   scripts/replay/replay_check.sh [--record] [--tolerance N] [--max-bad-percent P] [<capture name>...]
+#   scripts/replay/replay_check.sh [--record] [--set NAME] [--tolerance N] [--max-bad-percent P] [<capture name>...]
 #
 # Replays GPU captures (NFSMW_CAPTURE, gpu/trace.h; DECISIONS.md D7) and
 # compares every replayed frame with the recorded baseline. Captures are
 # build/captures/<name>.sbtrace, baselines build/baselines/frames/<name>/
 # (both hold game memory or game images: never commit them). With no name,
 # all captures there. --record replaces the baseline with this run's frames.
+# --set NAME keeps another set of baselines (build/baselines/frames/<name>.NAME),
+# for runs with other settings (post_check.sh).
 # Two kinds of picture are compared: frame_*.ppm, each swap's front buffer in
 # guest memory (what the renderer produced; backend-independent, 1280x720),
 # and presented.ppm, the last picture as the window shows it after the
@@ -20,11 +22,13 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 record=0
+set=
 args=()
 names=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --record) record=1 ;;
+        --set) set=".$2"; shift ;;
         --tolerance|--max-bad-percent) args+=("$1" "$2"); shift ;;
         *) names+=("$1") ;;
     esac
@@ -51,7 +55,7 @@ for name in "${names[@]}"; do
         NFSMW_DUMP_PRESENTED="$out/presented.ppm" \
         perl -e 'alarm 300; exec @ARGV' "$binary" >"$work/$name.log" 2>&1 || {
         echo "$name: the replay failed (log: $work/$name.log)"; trap - EXIT; status=1; continue; }
-    base="build/baselines/frames/$name"
+    base="build/baselines/frames/$name$set"
     if [ $record -eq 1 ]; then
         rm -rf "$base"
         mkdir -p "$base"
