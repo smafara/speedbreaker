@@ -49,6 +49,7 @@
 #include <memory>
 #include <vector>
 
+#include "swapchain.h"
 #include "types.h"
 
 namespace gpu::rhi
@@ -262,7 +263,8 @@ namespace gpu::rhi
         bool occlusionQueries = false;       // precise counting
         bool timestampQueries = false;
         bool fragmentShadingRate = false;
-        bool presentTiming = false;          // the Swapchain can time presents (step 2)
+        bool presentTiming = false;          // PresentShown is delivered (VK_KHR_present_wait; Metal always)
+        bool scheduledPresent = false;       // PresentRequest::notBefore is honoured (display timing; Metal)
         uint64_t memoryBudget = 0;           // bytes, 0 unknown
     };
 
@@ -293,8 +295,16 @@ namespace gpu::rhi
         virtual std::unique_ptr<Event> CreateEvent() = 0;
         virtual std::unique_ptr<QueryPool> CreateQueryPool(QueryKind kind, uint32_t count) = 0;
 
+        // The window (swapchain.h). The Surface comes from the backend's
+        // native header (a VkSurfaceKHR, a CAMetalLayer). nullptr on failure.
+        virtual std::unique_ptr<Swapchain> CreateSwapchain(Surface& surface, const SwapchainDesc& desc) = 0;
+
         // The queue. `fence` is signalled when the list has finished.
         virtual void Submit(CommandList& list, Fence& fence) = 0;
+        // The same for the list that draws the image acquired from
+        // `swapchain`: it waits for the image to be free (Vulkan: the acquire
+        // semaphore) and what Present shows waits for it (the render-done one).
+        virtual void SubmitToSwapchain(CommandList& list, Fence& fence, Swapchain& swapchain) = 0;
         virtual void WaitIdle() = 0;
     };
 }

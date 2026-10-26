@@ -114,6 +114,20 @@ implements it with push descriptors / descriptor sets, Metal with argument table
 Rejected: descriptor sets and pools as RHI objects, bindless (needs shader translator
 changes, deferred by D4).
 
+### D11. Swapchain and present timing (2026-10-26, DRAFT: awaiting the user's review)
+`runtime/gpu/rhi/swapchain.h` (+ `Device::CreateSwapchain`, `SubmitToSwapchain`). The
+interface is not the Vulkan calls: Vulkan learns when a present reached the screen by
+waiting for it on a thread (VK_KHR_present_wait) and polls the driver's reports
+(VK_GOOGLE_display_timing); Metal hands both over in a presented handler on the drawable.
+So the backend delivers **callbacks** (`PresentShown{id, presented, onScreen, timed}`,
+`PresentReport{id, onScreen}`), and a present request carries the caller's id and an optional
+`notBefore` time (steady clock; the backend converts: Vulkan/Apple host time, Metal
+presentAtTime). The waiter thread, its QoS and the `SwapchainUse` generation scheme move
+inside the Vulkan backend; Acquire/Submit/Present hide the acquire/render-done semaphores.
+Pacing policy (hold before present, desired-time choice and watchdog, refresh fit, repeats,
+swapchain rebuild policy, iOS scale, SDL) stays in the presenter. Open: whether images are
+exposed as `rhi::Image` (drafted so) and the Metal drawable's `framebufferOnly=NO` cost.
+
 ## Findings from the survey (2026-10-25)
 
 Vulkan footprint (approximate counts of `Vk*`/`vk*`/`VK_*` references):
@@ -459,3 +473,4 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   Max. Replay check unchanged (the game doesn't use these yet).
   Next: `rhi::Swapchain` (images, acquire/present, present timing) and the presenter's
   post passes on top.
+- 2026-10-26: swapchain interface drafted (D11) for review; nothing implements it yet.
