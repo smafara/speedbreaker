@@ -792,3 +792,22 @@ replay on Metal).
   deferral turned off it fails the first comparison (1 level in 0.02-0.03% of the world frames'
   pixels) and passes the second, so it sees small changes in Metal and big divergences between
   the backends.
+- 2026-10-26 — **Metal shaders compile with safe math** (`MTL::MathModeSafe`). The world frames'
+  differences from Vulkan's (MoltenVK) were put down to float rounding; the check was fast math,
+  which Metal's compiler has on by default. With it off the largest difference falls from 37 to 11
+  levels and the mean from 0.0157 to 0.0003 (intro stays identical), so the Metal replay check
+  against Vulkan's baselines now allows tolerance 16 and 1% of pixels (was 40 and 6%). Metal's own
+  baselines were recorded again. Not measured: what safe math costs in GPU time (the replays are
+  7 frames of first-use work; a steady-state A/B needs a live run).
+- 2026-10-26 — **Presentation checked**: the layer is BGRA8Unorm with an sRGB color space, as
+  MoltenVK makes it. SDL sets the color space on its layer (setting it here too changed nothing,
+  so it isn't); `rhi_metal_swapchain_test` now fails if the layer isn't sRGB. Display-sync follows
+  `vsync`, drawables 2-3, presents carry the display's own times as on Vulkan.
+- 2026-10-26 — **Housekeeping**: `THIRD_PARTY_NOTICES.md` and the README credits list SPIRV-Cross
+  (Apache-2.0); the README names the Metal backend, the Renderer setting and the
+  `-DSB_METAL`/`-DSB_SPIRV_CROSS_ROOT` build options. No CHANGELOG entry: it is written per
+  release, and this isn't one.
+- 2026-10-26 — **Replays can't be the steady-state A/B**: each capture is ~7 frames. Over three
+  runs each, world: Metal worst frame 272-282 ms, Vulkan 63-65 ms (first-use pipeline creation:
+  78 pipelines), GPU busy 1.0 vs 0.7 ms per frame. Next steps are a longer live comparison and,
+  for the first-use cost, creating pipelines off the render path.

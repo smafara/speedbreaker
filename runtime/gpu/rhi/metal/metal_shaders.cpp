@@ -62,6 +62,9 @@ namespace gpu::rhi::metal
             Pool pool;
             auto options = Own(MTL::CompileOptions::alloc()->init());
             options->setLanguageVersion(MTL::LanguageVersion3_0);
+            // Fast math makes world frames differ from MoltenVK's by up to 37 levels
+            // (mean 0.016); safe math, by up to 11 (mean 0.0003).
+            options->setMathMode(MTL::MathModeSafe);
             NS::Error* error = nullptr;
             NS::String* source = NS::String::string(msl.c_str(), NS::UTF8StringEncoding);
             Ptr<MTL::Library> library = Own(device.newLibrary(source, options.get(), &error));

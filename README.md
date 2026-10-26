@@ -678,8 +678,10 @@ translates the game's PowerPC code into C++ ahead of time, and that C++ is compi
 native program for x86-64 or arm64. A runtime written for this project stands in for the Xbox
 360: its kernel and system software, its GPU, its XMA audio and its controllers.
 
-- **Graphics:** a Vulkan renderer that translates the Xenos GPU's commands and shaders. On Mac,
-  iPhone and iPad it runs on Metal through MoltenVK.
+- **Graphics:** a renderer that translates the Xenos GPU's commands and shaders, through a small
+  graphics layer (`runtime/gpu/rhi`) with two backends: Vulkan (on Mac, iPhone and iPad it runs on
+  Metal through MoltenVK) and, on Apple platforms built with `-DSB_METAL=ON`, Metal directly
+  (Settings > Graphics > Renderer picks one; Metal is the default where it is built in).
 - **Platform layer:** SDL3 for windows, input and audio. The installer, the settings menu and the
   overlay are drawn with Dear ImGui.
 - **Audio:** XMA decoding done the way the hardware does it, frame by frame, with a patched,
@@ -732,6 +734,8 @@ The supported executable is 3,936,256 bytes, with SHA-256
   `scripts/macos/build_deps.sh`, for macOS 15 like the release (step 3). Homebrew's bottles of
   them (`brew install sdl3 vulkan-loader vulkan-headers glslang spirv-tools`) also work, for an
   app that runs only on the macOS you build on (step 3).
+  The Metal backend (`-DSB_METAL=ON`, with `-DSB_SPIRV_CROSS_ROOT=<folder>` holding SPIRV-Cross's
+  `include/spirv_cross` and its static `lib/libspirv-cross-{msl,glsl,core}.a`) needs SPIRV-Cross too.
 - **SteamOS:** build inside an Arch Linux distrobox (podman and distrobox ship with SteamOS). The
   development launcher, `scripts/steamos/speedbreaker.sh`, expects the container to be called
   `nfsmw-build`:
@@ -880,6 +884,7 @@ research.
 | [o1heap](https://github.com/pavel-kirienko/o1heap) (Pavel Kirienko) | The guest heap allocator | MIT |
 | [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (Khronos) | Shader compilation at runtime | BSD-3-Clause and others; Apache-2.0 |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) and the [Vulkan Loader](https://github.com/KhronosGroup/Vulkan-Loader) (Khronos) | Vulkan on Mac, iPhone and iPad | Apache-2.0 |
+| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) (Khronos) | SPIR-V to Metal shading language in the Metal backend | Apache-2.0 |
 | [toml++](https://github.com/marzer/tomlplusplus) (Mark Gillard) | `settings.toml` | MIT |
 | [SIMDe](https://github.com/simd-everywhere/simde) (Evan Nemerson and contributors) | SIMD in the recompiled code | MIT |
 | [libmspack](https://github.com/kyz/libmspack) (Stuart Caie) | LZX decompression | LGPL-2.1 |

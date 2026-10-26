@@ -6,6 +6,7 @@
 #include <gpu/rhi/metal/metal_native.h>
 #include <gpu/rhi/command_list.h>
 
+#include <QuartzCore/QuartzCore.hpp>
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -74,6 +75,13 @@ int main()
     if (!swapchain)
         return 1;
     printf("  %s\n", swapchain->Describe().c_str());
+    {
+        // The picture is sRGB-encoded: the layer has to be sRGB, as MoltenVK makes it
+        // (SDL sets it; nothing here does).
+        CGColorSpaceRef space = static_cast<CA::MetalLayer*>(layer)->colorspace();
+        CFStringRef name = space ? CGColorSpaceGetName(space) : nullptr;
+        CHECK(name && CFEqual(name, kCGColorSpaceSRGB), "the layer's color space is sRGB");
+    }
     CHECK(device->GetCapabilities().presentTiming && device->GetCapabilities().scheduledPresent, "timing offered");
 
     auto list = device->CreateCommandList();

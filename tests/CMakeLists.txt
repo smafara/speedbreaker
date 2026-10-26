@@ -431,6 +431,6 @@ if(SB_METAL)
     target_link_libraries(rhi_metal_test PRIVATE SbMetalBackend)
     # The swapchain on a real window (SDL3, as key_names_test above).
     sb_test(rhi_metal_swapchain_test SOURCES ${RHI_METAL_SOURCES})
-    target_link_libraries(rhi_metal_swapchain_test PRIVATE SbMetalBackend SDL3::SDL3)
+    target_link_libraries(rhi_metal_swapchain_test PRIVATE SbMetalBackend SDL3::SDL3 "-framework CoreGraphics")
     set_target_properties(rhi_metal_swapchain_test PROPERTIES SKIP_BUILD_RPATH OFF)
 endif()

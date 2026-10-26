@@ -7,10 +7,9 @@
 #  1. against Metal's own baselines (set "metal"; --record makes them from
 #     this run): every frame bit for bit, so a change that moves what Metal
 #     draws shows; the presented picture too (this machine's window);
-#  2. against the Vulkan baselines, within float rounding (tolerance 40, 6% of
-#     a frame's pixels; Metal's shaders round differently, a world frame
-#     differs by up to ~4% of its pixels): the two backends still draw the
-#     same game. The presented picture isn't compared (the window's size).
+#  2. against the Vulkan baselines, within float rounding (tolerance 16, 1% of
+#     a frame's pixels; a world frame differs by at most 11 levels): the two
+#     backends still draw the same game. The presented picture isn't compared (the window's size).
 # Run from the repository root, with build/main built with -DSB_METAL=ON.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -23,5 +22,5 @@ status=0
 echo "#### against Metal's baselines"
 scripts/replay/replay_check.sh --set metal "$@" || status=1
 echo "#### against Vulkan's baselines, within float rounding"
-scripts/replay/replay_check.sh --tolerance 40 --max-bad-percent 6 --ignore presented.ppm "$@" || status=1
+scripts/replay/replay_check.sh --tolerance 16 --max-bad-percent 1 --ignore presented.ppm "$@" || status=1
 exit $status
