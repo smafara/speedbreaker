@@ -723,3 +723,15 @@ replay on Metal).
   elsewhere Vulkan. The replay script now runs Vulkan explicitly (`NFSMW_BACKEND=vulkan`;
   `SB_REPLAY_ENV` overrides). Two source-reading tests looked for `vkCmdDraw` in renderer.cpp and
   now look for `Cmd().Draw`.
+- 2026-10-26 — **Metal pipeline cache: not needed.** The live Metal run had slow first-use
+  pipeline bursts (824 ms for 21 pipelines, 1307 ms for 50; Vulkan 11 and 26 ms). Built a Metal
+  binary archive behind `Save/LoadPipelineCache` and timed the stages of `CreateGraphicsPipeline`
+  over the world replay (78 pipelines): SPIRV-Cross to MSL ~255 ms (3.3 ms each, every run),
+  `newLibrary` from MSL source ~1940 ms cold (25 ms each) but ~4 ms once macOS's own shader cache
+  holds it, `newRenderPipelineState` ~11 ms either way. The archive only skips the last stage, so
+  it gains about 1 ms in 78; the cold cost is the library compile, which no archive holds, and the
+  system cache already removes it on repeat runs (it can go cold after an OS update or a purge).
+  The archive code was dropped; the Metal backend keeps its empty `Save/LoadPipelineCache`
+  (Metal's own cache is the cache). The other ~25 of the 32 hitch lines also occur in the Vulkan
+  log with no shader or pipeline work in them, so they are not this. If first-run stalls matter
+  later, the lever is creating pipelines off the render path (or warming them at load), not a cache.
