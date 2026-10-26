@@ -783,3 +783,12 @@ replay on Metal).
   the headers; the factories `MakeCommandList`, `MakeSwapchain`, `MakeSurface` etc. are how the
   device reaches the other files). Checked: rhi_vulkan/metal/metal_swapchain tests, ctest 78/79
   (the symlink one), Vulkan replays bit-identical, Metal replay frames unchanged.
+- 2026-10-26 — **Metal replay check** (`scripts/replay/metal_check.sh`): the capture replays on
+  Metal, compared (1) with Metal's own baselines (set `metal`, `--record` makes them; every frame
+  and the presented picture bit for bit) and (2) with Vulkan's within float rounding (tolerance
+  40, 6% of a frame's pixels; the presented picture is left out, its size is the window's).
+  `compare_frames.py` and `replay_check.sh` gained `--ignore FILE`. Baselines stay under `build/`
+  (never committed). Checked: it passes twice in a row (deterministic), and with the shadow
+  deferral turned off it fails the first comparison (1 level in 0.02-0.03% of the world frames'
+  pixels) and passes the second, so it sees small changes in Metal and big divergences between
+  the backends.

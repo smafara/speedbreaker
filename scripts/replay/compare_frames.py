@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # SpeedBreaker. GPL-3.0-or-later (see COPYING).
 #
-#   compare_frames.py <baseline dir> <new dir> [--tolerance N] [--max-bad-percent P]
+#   compare_frames.py <baseline dir> <new dir> [--tolerance N] [--max-bad-percent P] [--ignore NAME]...
 #
 # Compares the PPM frames (NFSMW_DUMP_FRAMES, see replay_check.sh) of two
 # runs, by file name. A pixel is bad when any channel differs by more than
 # --tolerance (default 0: bit-identical); a frame fails when more than
 # --max-bad-percent of its pixels are bad (default 0). Prints one line per
-# frame and exits 1 if any frame fails or the sets of frames differ.
+# frame and exits 1 if any frame fails or the sets of frames differ. --ignore
+# leaves a file out of both sets (presented.ppm, whose size is the window's).
 import argparse
 import os
 import sys
@@ -52,9 +53,10 @@ def main():
     parser.add_argument("new")
     parser.add_argument("--tolerance", type=int, default=0)
     parser.add_argument("--max-bad-percent", type=float, default=0.0)
+    parser.add_argument("--ignore", action="append", default=[])
     args = parser.parse_args()
 
-    names = lambda d: sorted(n for n in os.listdir(d) if n.endswith(".ppm"))
+    names = lambda d: sorted(n for n in os.listdir(d) if n.endswith(".ppm") and n not in args.ignore)
     base, new = names(args.baseline), names(args.new)
     failed = False
     if base != new:

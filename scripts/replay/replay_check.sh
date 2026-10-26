@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SpeedBreaker. GPL-3.0-or-later (see COPYING).
 #
-#   scripts/replay/replay_check.sh [--record] [--set NAME] [--tolerance N] [--max-bad-percent P] [<capture name>...]
+#   scripts/replay/replay_check.sh [--record] [--set NAME] [--tolerance N] [--max-bad-percent P] [--ignore FILE]... [<capture name>...]
 #
 # Replays GPU captures (NFSMW_CAPTURE, gpu/trace.h; DECISIONS.md D7) and
 # compares every replayed frame with the recorded baseline. Captures are
@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --record) record=1 ;;
         --set) set=".$2"; shift ;;
-        --tolerance|--max-bad-percent) args+=("$1" "$2"); shift ;;
+        --tolerance|--max-bad-percent|--ignore) args+=("$1" "$2"); shift ;;
         *) names+=("$1") ;;
     esac
     shift
