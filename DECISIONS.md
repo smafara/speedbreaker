@@ -641,3 +641,33 @@ replay on Metal).
   Occlusion results are read one query at a time (a query not ready counts 0, as before).
   `video::GetRhi()` gives the renderer the device. Replay: bit-identical, also with
   occlusion, GPU timing and pass profiling on.
+
+- D14 (RHI additions for the renderer; 2026-10-26). What `renderer.cpp` needs that the draft RHI
+  left out, found by reading it end to end:
+  * `ImageDesc::general`: the renderer keeps every image in one layout for life (Vulkan GENERAL)
+    and orders work with coarse barriers, not per-use states; `State::General` is the one
+    transition (Undefined -> General), and the backend picks GENERAL for every use of such an
+    image. `CommandList::MemoryBarrier(Full | Compute | NarrowAfterPass | NarrowAfterCompute)`
+    are the renderer's barriers (the Narrow ones leave the vertex stages out, the pass-barrier
+    levels measured on MoltenVK); Metal tracks hazards itself, so they cost it nothing.
+  * `ImageDesc::storeFormat` and `CreateImageView(image, ImageViewDesc)` (format, one layer as
+    2D, channel swizzle, depth only) with `ImageBinding::view`: textures sampled through
+    per-fetch swizzles, an R32_UINT store view of a texture a compute shader writes as words,
+    a depth-only view of a depth/stencil target. `SupportsImage`, `FormatFeatures` (blend,
+    storage) answer what the renderer asked Vulkan about formats.
+  * `BindingKind::SampledImage`, sampler LOD range, border colour and ClampToBorder, per-face
+    `SetStencil`, colour attachments with gaps (a pass may hold targets a draw doesn't write; the
+    pipeline and the pass both count four), `GraphicsPipelineDesc::shadingRateW/H` (the
+    NFSMW_SHADING_RATE experiment).
+  * Placement moves into the backend. `Device::CreateGuestMemory` (import, or a copy the CPU keeps
+    current; `GuestMemory::shadow` is where the CPU writes it) and `MemoryKind::Stream` (the
+    upload ring) are memory_plan.h's job in the Vulkan backend now, with its test hooks
+    (NFSMW_TEST_*) and log lines (`[rhi/vulkan] memory: ...`). Image memory in 64 MB blocks with
+    spares made off-thread (`vulkan_image_memory.h`, was in the renderer) is inside
+    `CreateImage`; `DeviceConfig::onThread` lets the host name and place its spare thread;
+    `GetImageMemoryStats` and `GetMemoryUsage` feed the [perf] line. The pipeline-cache header
+    check (`LoadPipelineCache`) is in the backend too. Capabilities gained the device kind,
+    vendor, storage-buffer range and anisotropy limit that the renderer read from Vulkan.
+  Metal: views are `newTextureView` with a swizzle, Stream is write-combined shared memory,
+  guest memory is `newBufferWithBytesNoCopy` or a copy, the barriers are no-ops. Tests:
+  `SwizzledView`, `GeneralImage` and `GuestAndStream` run on both backends.

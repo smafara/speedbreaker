@@ -70,7 +70,8 @@ namespace gpu::rhi
         virtual void SetPipeline(const Pipeline& pipeline) = 0;
         virtual void SetViewport(float x, float y, float width, float height, float minDepth, float maxDepth) = 0;
         virtual void SetScissor(const Rect2D& rect) = 0;
-        virtual void SetStencil(uint8_t reference, uint8_t compareMask, uint8_t writeMask) = 0;
+        struct StencilState { uint8_t reference = 0, compareMask = 0xFF, writeMask = 0xFF; };
+        virtual void SetStencil(const StencilState& front, const StencilState& back) = 0;
         virtual void SetDepthBias(float constant, float clamp, float slope) = 0;
         virtual void SetBlendConstants(const float rgba[4]) = 0;
 
@@ -101,6 +102,19 @@ namespace gpu::rhi
         // ---- synchronisation ----
         virtual void Transition(const ImageTransition* images, size_t imageCount,
             const BufferTransition* buffers = nullptr, size_t bufferCount = 0) = 0;
+        // Outside rendering, between work on `general` images and the buffers:
+        // everything before (of the kind `src`) -> everything after, except
+        // that Narrow ones leave out the vertex stages after them (a vertex
+        // shader that reads what was written needs a Full one first). The
+        // renderer's ordering (D14); the other kinds are Metal's to track.
+        enum class Barrier : uint8_t
+        {
+            Full,               // all work -> all work
+            Compute,            // compute shader writes -> all work
+            NarrowAfterPass,    // a pass's attachment writes (and its shaders' reads) -> fragment, compute and transfer work
+            NarrowAfterCompute, // compute shader writes -> fragment, compute and transfer work
+        };
+        virtual void MemoryBarrier(Barrier kind) = 0;
         // Outside a pass: `event` is signalled once everything recorded so far has executed.
         virtual void SignalEvent(Event& event) = 0;
 

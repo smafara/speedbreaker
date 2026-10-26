@@ -35,6 +35,7 @@ namespace gpu::rhi
         Device,       // GPU only; filled by copies
         Upload,       // CPU-mapped, write-combined is fine; the GPU reads (rings, staging)
         UploadCached, // CPU-mapped and cached: the CPU also reads it (shadow copies, readback)
+        Stream,       // written by the CPU every frame and read by the GPU (the renderer's ring): where the device likes that best
     };
 
     enum BufferUsage : uint32_t
@@ -74,13 +75,16 @@ namespace gpu::rhi
         IndexRead,         // buffers
         Present,           // swapchain images
         HostRead,          // buffers: the CPU reads it after the GPU's writes
+        General,           // images made `general` (ImageDesc): usable as anything; ordered by CommandList::MemoryBarrier
     };
 
     enum class ShaderStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 4 };
     inline uint8_t operator|(ShaderStage a, ShaderStage b) { return uint8_t(a) | uint8_t(b); }
 
     enum class Filter : uint8_t { Nearest, Linear };
-    enum class AddressMode : uint8_t { Repeat, ClampToEdge, MirrorRepeat };
+    enum class AddressMode : uint8_t { Repeat, ClampToEdge, MirrorRepeat, ClampToBorder };
+    // A view's component: a channel of the image, or a constant.
+    enum class Swizzle : uint8_t { Identity, R, G, B, A, Zero, One };
 
     // (No triangle fan: the renderer converts fans and polygons to lists, and Metal has no fan.)
     enum class Topology : uint8_t { PointList, LineList, LineStrip, TriangleList, TriangleStrip };

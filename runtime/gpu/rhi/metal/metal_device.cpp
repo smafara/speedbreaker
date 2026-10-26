@@ -273,6 +273,7 @@ namespace gpu::rhi::metal
         MTL::SamplerAddressMode ToMtl(AddressMode a)
         {
             return a == AddressMode::ClampToEdge ? MTL::SamplerAddressModeClampToEdge
+                : a == AddressMode::ClampToBorder ? MTL::SamplerAddressModeClampToBorderColor
                 : a == AddressMode::MirrorRepeat ? MTL::SamplerAddressModeMirrorRepeat : MTL::SamplerAddressModeRepeat;
         }
 
@@ -317,6 +318,17 @@ namespace gpu::rhi::metal
             uint64_t m_bytes;
         };
 
+        // A view of an image other than its own (ImageViewDesc).
+        class MetalImageView final : public ImageView
+        {
+        public:
+            explicit MetalImageView(Ptr<MTL::Texture> texture) : m_texture(std::move(texture)) {}
+            MTL::Texture* Handle() const { return m_texture.get(); }
+
+        private:
+            Ptr<MTL::Texture> m_texture;
+        };
+
         // ---- bindings (D10) ----------------------------------------------------
 
         // Where one slot of a layout lives in Metal's argument tables.
@@ -347,6 +359,7 @@ namespace gpu::rhi::metal
                         case BindingKind::StorageBuffer: m.buffer = buffers++; break;
                         case BindingKind::UniformBufferDynamic: m.buffer = buffers++; m.dynamicOrder = dynamic++; break;
                         case BindingKind::CombinedImageSampler: m.texture = textures++; m.sampler = samplers++; break;
+                        case BindingKind::SampledImage: m.texture = textures++; break;
                         case BindingKind::StorageImage: m.texture = textures++; break;
                         }
                         m_slots.push_back(m);
@@ -506,9 +519,9 @@ namespace gpu::rhi::metal
 
             // The depth-stencil state for the stencil masks set now. Metal keeps
             // them in the state object, Vulkan makes them dynamic.
-            MTL::DepthStencilState* DepthStencil(uint8_t compareMask, uint8_t writeMask) const
+            MTL::DepthStencilState* DepthStencil(const CommandList::StencilState& front, const CommandList::StencilState& back) const
             {
-                const uint16_t key = uint16_t(compareMask) << 8 | writeMask;
+                const uint32_t key = uint32_t(front.compareMask) << 24 | uint32_t(front.writeMask) << 16 | uint32_t(back.compareMask) << 8 | back.writeMask;
                 std::lock_guard lock(m_mutex);
                 auto it = m_states.find(key);
                 if (it != m_states.end())
@@ -518,19 +531,19 @@ namespace gpu::rhi::metal
                 d->setDepthWriteEnabled(desc.depthTest && desc.depthWrite);  // (Vulkan: writes only with the test on)
                 if (desc.stencilTest)
                 {
-                    auto face = [&](const StencilFace& f) {
+                    auto face = [&](const StencilFace& f, const CommandList::StencilState& state) {
                         auto s = Own(MTL::StencilDescriptor::alloc()->init());
                         s->setStencilFailureOperation(ToMtl(f.fail));
                         s->setDepthStencilPassOperation(ToMtl(f.pass));
                         s->setDepthFailureOperation(ToMtl(f.depthFail));
                         s->setStencilCompareFunction(ToMtl(f.compare));
-                        s->setReadMask(compareMask);
-                        s->setWriteMask(writeMask);
+                        s->setReadMask(state.compareMask);
+                        s->setWriteMask(state.writeMask);
                         return s;
                     };
-                    auto front = face(desc.stencilFront), back = face(desc.stencilBack);
-                    d->setFrontFaceStencil(front.get());
-                    d->setBackFaceStencil(back.get());
+                    auto frontFace = face(desc.stencilFront, front), backFace = face(desc.stencilBack, back);
+                    d->setFrontFaceStencil(frontFace.get());
+                    d->setBackFaceStencil(backFace.get());
                 }
                 Ptr<MTL::DepthStencilState> state = Own(device->newDepthStencilState(d.get()));
                 MTL::DepthStencilState* raw = state.get();
@@ -540,7 +553,7 @@ namespace gpu::rhi::metal
 
         private:
             mutable std::mutex m_mutex;
-            mutable std::map<uint16_t, Ptr<MTL::DepthStencilState>> m_states;
+            mutable std::map<uint32_t, Ptr<MTL::DepthStencilState>> m_states;
         };
 
         // ---- synchronisation ---------------------------------------------------------
@@ -846,7 +859,7 @@ namespace gpu::rhi::metal
                 {
                     const ColorAttachment& a = desc.color[i];
                     if (!a.image)
-                        break;
+                        continue;  // (a gap)
                     auto* image = static_cast<MetalImage*>(a.image);
                     MTL::RenderPassColorAttachmentDescriptor* d = pass->colorAttachments()->object(i);
                     d->setTexture(image->Handle());
@@ -957,15 +970,14 @@ namespace gpu::rhi::metal
                 if (m_render)
                     m_render->setScissorRect(Clamp(rect));
             }
-            void SetStencil(uint8_t reference, uint8_t compareMask, uint8_t writeMask) override
+            void SetStencil(const StencilState& front, const StencilState& back) override
             {
-                m_rs.stencilRef = reference;
-                m_rs.compareMask = compareMask;
-                m_rs.writeMask = writeMask;
+                m_rs.stencilFront = front;
+                m_rs.stencilBack = back;
                 if (m_render && m_graphicsPipeline)
                 {
-                    m_render->setStencilReferenceValue(reference);
-                    m_render->setDepthStencilState(m_graphicsPipeline->DepthStencil(compareMask, writeMask));
+                    m_render->setStencilReferenceValues(front.reference, back.reference);
+                    m_render->setDepthStencilState(m_graphicsPipeline->DepthStencil(front, back));
                 }
             }
             void SetDepthBias(float constant, float clamp, float slope) override
@@ -1150,6 +1162,9 @@ namespace gpu::rhi::metal
 
             // ---- synchronisation ----
             void Transition(const ImageTransition*, size_t, const BufferTransition*, size_t) override {}  // Metal tracks the hazards
+            // (Within a serial compute encoder a dispatch sees the one before; across encoders Metal tracks
+            // the hazards of the resources it knows.)
+            void MemoryBarrier(Barrier) override {}
             void SignalEvent(Event& event) override
             {
                 EndEncoder();
@@ -1218,7 +1233,7 @@ namespace gpu::rhi::metal
                 bool viewportSet = false, scissorSet = false;
                 MTL::Viewport viewport{};
                 Rect2D scissor;
-                uint8_t stencilRef = 0, compareMask = 0xFF, writeMask = 0xFF;
+                CommandList::StencilState stencilFront, stencilBack;
                 float biasConstant = 0, biasClamp = 0, biasSlope = 0;
                 float blend[4] = {};
                 Buffer* indexBuffer = nullptr;
@@ -1309,7 +1324,7 @@ namespace gpu::rhi::metal
             {
                 const MetalGraphicsPipeline& p = *m_graphicsPipeline;
                 m_render->setRenderPipelineState(p.state.get());
-                m_render->setDepthStencilState(p.DepthStencil(m_rs.compareMask, m_rs.writeMask));
+                m_render->setDepthStencilState(p.DepthStencil(m_rs.stencilFront, m_rs.stencilBack));
                 m_render->setCullMode(p.cull);
                 m_render->setFrontFacingWinding(p.winding);
                 m_render->setDepthClipMode(p.desc.depthClamp ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip);
@@ -1324,7 +1339,7 @@ namespace gpu::rhi::metal
             {
                 if (m_graphicsPipeline)
                     ApplyGraphicsPipeline();
-                m_render->setStencilReferenceValue(m_rs.stencilRef);
+                m_render->setStencilReferenceValues(m_rs.stencilFront.reference, m_rs.stencilBack.reference);
                 m_render->setBlendColor(m_rs.blend[0], m_rs.blend[1], m_rs.blend[2], m_rs.blend[3]);
                 m_render->setViewport(m_rs.viewportSet ? m_rs.viewport : MTL::Viewport{ 0, 0, double(m_rs.targetWidth), double(m_rs.targetHeight), 0.0, 1.0 });
                 m_render->setScissorRect(Clamp(m_rs.scissorSet ? m_rs.scissor : Rect2D{ 0, 0, m_rs.targetWidth, m_rs.targetHeight }));
@@ -1391,9 +1406,11 @@ namespace gpu::rhi::metal
                         break;
                     }
                     case BindingKind::CombinedImageSampler:
+                    case BindingKind::SampledImage:
                     case BindingKind::StorageImage:
                     {
-                        MTL::Texture* texture = static_cast<MetalImage*>(entries[i].image.image)->Handle();
+                        MTL::Texture* texture = entries[i].image.view ? static_cast<const MetalImageView*>(entries[i].image.view)->Handle()
+                                                                      : static_cast<MetalImage*>(entries[i].image.image)->Handle();
                         MTL::SamplerState* sampler = nullptr;
                         if (m->slot.kind == BindingKind::CombinedImageSampler)
                         {
@@ -1620,9 +1637,11 @@ namespace gpu::rhi::metal
             std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) override
             {
                 Pool pool;
+                // (Stream: the CPU writes it every frame, the GPU reads it: unified memory, write-combined.)
                 MTL::ResourceOptions options = desc.memory == MemoryKind::Device ? MTL::ResourceStorageModePrivate
-                    : desc.memory == MemoryKind::Upload ? (MTL::ResourceStorageModeShared | MTL::ResourceCPUCacheModeWriteCombined)
-                                                        : MTL::ResourceStorageModeShared;
+                    : desc.memory == MemoryKind::Upload || desc.memory == MemoryKind::Stream
+                        ? (MTL::ResourceStorageModeShared | MTL::ResourceCPUCacheModeWriteCombined)
+                        : MTL::ResourceStorageModeShared;
                 Ptr<MTL::Buffer> buffer = Own(m_c->device->newBuffer(desc.size, options));
                 if (!buffer)
                     return nullptr;
@@ -1643,6 +1662,95 @@ namespace gpu::rhi::metal
                 SetLabel(*buffer.get(), name);
                 return std::make_unique<MetalBuffer>(std::move(buffer), size, host);
             }
+
+            bool CreateGuestMemory(void* host, uint64_t size, GuestMemory& out) override
+            {
+                // Imported without a copy where the pointer and size are the pages' (16 KB), else a copy
+                // the CPU keeps current (the renderer's shadow mode).
+                out.buffer = ImportHostMemory(host, size, 0, "guest memory");
+                if (out.buffer)
+                {
+                    fprintf(stderr, "[rhi/metal] guest memory: imported (zero-copy)\n");
+                    return true;
+                }
+                Pool pool;
+                Ptr<MTL::Buffer> buffer = Own(m_c->device->newBuffer(size, MTL::ResourceStorageModeShared));
+                if (!buffer)
+                    return false;
+                SetLabel(*buffer.get(), "guest memory (copy)");
+                void* mapped = buffer->contents();
+                out.buffer = std::make_unique<MetalBuffer>(std::move(buffer), size, mapped);
+                out.shadow = static_cast<uint8_t*>(mapped);
+                fprintf(stderr, "[rhi/metal] guest memory: a copy kept current from the write watch (the host memory can't be imported)\n");
+                return true;
+            }
+
+            std::unique_ptr<ImageView> CreateImageView(const Image& image, const ImageViewDesc& desc) override
+            {
+                Pool pool;
+                const auto& img = static_cast<const MetalImage&>(image);
+                const ImageDesc& d = img.Desc();
+                const Format format = desc.format == Format::Undefined ? d.format : desc.format;
+                const MTL::PixelFormat pixel = ToMtl(format);
+                if (pixel == MTL::PixelFormatInvalid)
+                    return nullptr;
+                auto channel = [](Swizzle s, MTL::TextureSwizzle identity) {
+                    switch (s)
+                    {
+                    case Swizzle::R: return MTL::TextureSwizzleRed;
+                    case Swizzle::G: return MTL::TextureSwizzleGreen;
+                    case Swizzle::B: return MTL::TextureSwizzleBlue;
+                    case Swizzle::A: return MTL::TextureSwizzleAlpha;
+                    case Swizzle::Zero: return MTL::TextureSwizzleZero;
+                    case Swizzle::One: return MTL::TextureSwizzleOne;
+                    default: return identity;
+                    }
+                };
+                const MTL::TextureSwizzleChannels swizzle = MTL::TextureSwizzleChannels::Make(channel(desc.swizzle[0], MTL::TextureSwizzleRed),
+                    channel(desc.swizzle[1], MTL::TextureSwizzleGreen), channel(desc.swizzle[2], MTL::TextureSwizzleBlue),
+                    channel(desc.swizzle[3], MTL::TextureSwizzleAlpha));
+                MTL::TextureType type;
+                NS::Range slices(0, 1);
+                if (desc.layerCount)
+                {
+                    type = desc.layerCount > 1 ? MTL::TextureType2DArray : MTL::TextureType2D;
+                    slices = NS::Range(desc.layer, desc.layerCount);
+                }
+                else
+                {
+                    type = d.kind == ImageKind::Image3D ? MTL::TextureType3D : d.kind == ImageKind::Cube ? MTL::TextureTypeCube
+                        : d.layers > 1 ? MTL::TextureType2DArray : MTL::TextureType2D;
+                    slices = NS::Range(0, d.kind == ImageKind::Cube ? 6 : d.layers);
+                }
+                Ptr<MTL::Texture> view = Own(img.Handle()->newTextureView(pixel, type, NS::Range(0, d.levels), slices, swizzle));
+                if (!view)
+                    return nullptr;
+                return std::make_unique<MetalImageView>(std::move(view));
+            }
+
+            bool SupportsImage(const ImageDesc& desc) const override
+            {
+                return ToMtl(desc.format) != MTL::PixelFormatInvalid &&
+                    (desc.storeFormat == Format::Undefined || (ToMtl(desc.storeFormat) != MTL::PixelFormatInvalid &&
+                        BytesPerPixel(desc.storeFormat) == BytesPerPixel(desc.format)));
+            }
+
+            uint32_t FormatFeatures(Format format) const override
+            {
+                // Apple GPUs blend every colour format but the 32-bit float ones, and store to
+                // the ones that aren't packed or compressed.
+                const bool wide = format == Format::R32F || format == Format::RG32F || format == Format::RGBA32F;
+                return (IsBlock(format) || HasDepth(format) || wide ? 0 : kFormatBlend) |
+                    (IsBlock(format) || HasDepth(format) || format == Format::A2B10G10R10 ? 0 : kFormatStorage);
+            }
+
+            void GetMemoryUsage(uint64_t& used, uint64_t& budget) const override
+            {
+                used = m_c->device->currentAllocatedSize();
+                budget = m_c->device->recommendedMaxWorkingSetSize();
+            }
+
+            ImageMemoryStats GetImageMemoryStats() const override { return {}; }
 
             std::unique_ptr<Image> CreateImage(const ImageDesc& desc) override
             {
@@ -1672,6 +1780,8 @@ namespace gpu::rhi::metal
                     usage |= MTL::TextureUsageShaderRead;  // (a scaled copy from it samples it)
                 if ((desc.usage & kImageCopySrc) && !IsBlock(desc.format))
                     usage |= MTL::TextureUsageShaderRead;  // (the same, from any copy source)
+                if (desc.storeFormat != Format::Undefined)
+                    usage |= MTL::TextureUsagePixelFormatView | MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite;
                 d->setUsage(usage);
                 d->setStorageMode(MTL::StorageModePrivate);
                 Ptr<MTL::Texture> texture = Own(m_c->device->newTexture(d.get()));
@@ -1694,6 +1804,9 @@ namespace gpu::rhi::metal
                 d->setTAddressMode(ToMtl(desc.v));
                 d->setRAddressMode(ToMtl(desc.w));
                 d->setMaxAnisotropy(std::max<NS::UInteger>(1, NS::UInteger(desc.maxAnisotropy)));
+                d->setLodMinClamp(desc.minLod);
+                d->setLodMaxClamp(desc.maxLod);
+                d->setBorderColor(desc.whiteBorder ? MTL::SamplerBorderColorOpaqueWhite : MTL::SamplerBorderColorTransparentBlack);
                 return std::make_unique<MetalSampler>(Own(m_c->device->newSamplerState(d.get())));
             }
 
@@ -1903,6 +2016,10 @@ namespace gpu::rhi::metal
             caps.timestampPeriodNs = ratio;
         }
         caps.fragmentShadingRate = false;
+        caps.kind = Capabilities::Kind::Integrated;  // (unified memory)
+        caps.vendorId = 0x106B;                      // Apple
+        caps.maxStorageBufferRange = c->device->maxBufferLength();
+        caps.maxAnisotropy = 16.0f;
         caps.presentTiming = true;      // the drawable's presented handler
         caps.scheduledPresent = true;   // presentDrawable:atTime:
         caps.memoryBudget = c->device->recommendedMaxWorkingSetSize();

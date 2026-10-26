@@ -28,6 +28,9 @@ namespace gpu::rhi::vulkan
         VkPhysicalDevice physical = VK_NULL_HANDLE;
         uint32_t queueFamily = 0;               // one queue of it, graphics + compute
         std::vector<const char*> extensions;
+        // Called first on the backend's own threads (image memory's spare
+        // block thread), with the thread's name: the host names and places it.
+        std::function<void(const char*)> onThread;
         const VkPhysicalDeviceFeatures* features = nullptr;
         const void* next = nullptr;             // VkDeviceCreateInfo's pNext chain (feature structs)
     };

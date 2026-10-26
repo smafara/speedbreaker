@@ -651,6 +651,126 @@ namespace
         CHECK(n[1] > 0, "the lone draw is in front now (%llu)", (unsigned long long)n[1]);
     }
 
+
+    // The renderer's per-fetch swizzles: the 4x4 texture of Textures() through a view with red and blue swapped.
+    void SwizzledView()
+    {
+        auto sampler = g_device->CreateSampler({ Filter::Nearest, Filter::Nearest, Filter::Nearest, AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge, AddressMode::ClampToEdge, 1.0f });
+        BindingLayoutDesc ld;
+        ld.tables.push_back({ { { 0, BindingKind::CombinedImageSampler, uint8_t(ShaderStage::Fragment), sampler.get() } }, true });
+        auto layout = g_device->CreateBindingLayout(ld);
+        auto pipeline = g_device->CreateGraphicsPipeline(FullscreenDesc(*layout, Format::RGBA8, Code(k_tex_frag, sizeof(k_tex_frag) / 4)));
+        CHECK(pipeline != nullptr, "textured pipeline");
+        auto up = Make(4 * 4 * 4, MemoryKind::Upload, kBufferCopySrc);
+        for (int i = 0; i < 16; i++)
+        {
+            uint8_t* t = static_cast<uint8_t*>(up->Map()) + i * 4;
+            t[0] = uint8_t(i * 10);
+            t[1] = 100;
+            t[2] = 7;
+            t[3] = 20;
+        }
+        auto texture = MakeImage(Format::RGBA8, 4, 4, kImageSampled | kImageCopyDst);
+        ImageViewDesc vd;
+        vd.swizzle[0] = Swizzle::B;
+        vd.swizzle[2] = Swizzle::R;
+        vd.swizzle[3] = Swizzle::One;
+        auto view = g_device->CreateImageView(*texture, vd);
+        CHECK(view != nullptr, "a swizzled view");
+        if (!pipeline || !view)
+            return;
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget | kImageCopySrc);
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        Run([&](CommandList& cmd) {
+            ImageTransition up1[] = { { texture.get(), State::Undefined, State::CopyDst } };
+            cmd.Transition(up1, 1);
+            BufferImageCopy copy;
+            copy.region = { 0, 0, 4, 4 };
+            cmd.CopyBufferToImage(*up, *texture, &copy, 1);
+            ImageTransition up2[] = { { texture.get(), State::CopyDst, State::ShaderRead }, { target.get(), State::Undefined, State::RenderTarget } };
+            cmd.Transition(up2, 2);
+            RenderingDesc rd;
+            rd.color[0] = { target.get(), LoadOp::DontCare, StoreOp::Store, {} };
+            rd.area = { 0, 0, 8, 8 };
+            cmd.BeginRendering(rd);
+            cmd.SetViewport(0, 0, 8, 8, 0, 1);
+            cmd.SetScissor({ 0, 0, 8, 8 });
+            cmd.SetPipeline(*pipeline);
+            BindingEntry e;
+            e.slot = 0;
+            e.image = { texture.get(), nullptr, view.get() };
+            cmd.PushBindings(*layout, 0, &e, 1);
+            cmd.Draw(3, 1, 0, 0);
+            cmd.EndRendering();
+            Readback(cmd, *target, *back, State::RenderTarget, 8, 8);
+        });
+        back->Invalidate(0, 8 * 8 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        bool ok = true;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                const uint8_t* p = px + (y * 8 + x) * 4;
+                ok &= p[0] == 7 && p[1] == 100 && p[2] == ((y / 2) * 4 + x / 2) * 10 && p[3] == 255;
+            }
+        CHECK(ok, "red and blue were swapped and alpha forced to one (pixel 5,3 = %u,%u,%u,%u)", px[(3 * 8 + 5) * 4], px[(3 * 8 + 5) * 4 + 1],
+            px[(3 * 8 + 5) * 4 + 2], px[(3 * 8 + 5) * 4 + 3]);
+    }
+
+    // The renderer's images: one layout for life (`general`), work ordered by MemoryBarrier alone.
+    void GeneralImage()
+    {
+        ImageDesc desc;
+        desc.format = Format::RGBA8;
+        desc.extent = { 8, 8, 1 };
+        desc.usage = kImageRenderTarget | kImageCopySrc | kImageCopyDst;
+        desc.general = true;
+        auto image = g_device->CreateImage(desc);
+        CHECK(image != nullptr, "a general image");
+        if (!image)
+            return;
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        Run([&](CommandList& cmd) {
+            ImageTransition t[] = { { image.get(), State::Undefined, State::General } };
+            cmd.Transition(t, 1);
+            RenderingDesc rd;
+            rd.color[0] = { image.get(), LoadOp::Clear, StoreOp::Store, { { 1, 0.5f, 0, 1 } } };
+            rd.area = { 0, 0, 8, 8 };
+            cmd.BeginRendering(rd);
+            cmd.EndRendering();
+            cmd.MemoryBarrier(CommandList::Barrier::NarrowAfterPass);
+            BufferImageCopy copy;
+            copy.region = { 0, 0, 8, 8 };
+            cmd.CopyImageToBuffer(*image, *back, &copy, 1);
+            cmd.MemoryBarrier(CommandList::Barrier::Full);
+            BufferTransition h[] = { { back.get(), State::CopyDst, State::HostRead } };
+            cmd.Transition(nullptr, 0, h, 1);
+        });
+        back->Invalidate(0, 8 * 8 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        CHECK(px[0] == 255 && px[1] >= 127 && px[1] <= 128 && px[2] == 0 && px[3] == 255, "the pass cleared it and the copy read it, in one layout (%u,%u,%u,%u)",
+            px[0], px[1], px[2], px[3]);
+    }
+
+    // Guest memory (a buffer of the host's pages, imported or copied) and the ring's kind of memory.
+    void GuestAndStream()
+    {
+        const uint64_t size = 16ull << 20;
+        void* host = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        CHECK(host != MAP_FAILED, "host memory");
+        GuestMemory guest;
+        CHECK(g_device->CreateGuestMemory(host, size, guest), "guest memory");
+        CHECK(guest.buffer && guest.buffer->Size() == size, "its buffer");
+        printf("  guest memory %s\n", guest.shadow ? "copied (shadow)" : "imported");
+        auto ring = Make(1 << 20, MemoryKind::Stream, kBufferStorage | kBufferUniform | kBufferIndex);
+        CHECK(ring && ring->Map(), "a stream buffer the CPU can write");
+        if (ring && ring->Map())
+            memset(ring->Map(), 0xA5, 1 << 20);
+        guest = {};
+        munmap(host, size);
+    }
+
 int main()
 {
     g_device = MakeDevice();
@@ -683,6 +803,12 @@ int main()
     Textures();
     printf("image clear, blit, copy\n");
     ImageClearsAndBlit();
+    printf("swizzled view\n");
+    SwizzledView();
+    printf("general image, memory barrier\n");
+    GeneralImage();
+    printf("guest memory, stream buffer\n");
+    GuestAndStream();
     g_device.reset();
     printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;

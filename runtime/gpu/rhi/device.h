@@ -89,13 +89,19 @@ namespace gpu::rhi
         uint32_t layers = 1;      // 6 for a cube
         uint32_t levels = 1;
         uint32_t usage = 0;       // ImageUsage
+        // D14. The renderer keeps every image in one layout for life and orders
+        // its work with CommandList::MemoryBarrier, not per-use transitions.
+        // Vulkan: GENERAL. The first Transition is Undefined -> General.
+        bool general = false;
+        // Views of this image in this format (and as storage, whatever the
+        // image's own format allows) can be made with CreateImageView: a
+        // texture a compute shader stores into as 32-bit words.
+        Format storeFormat = Format::Undefined;
         const char* name = "";
     };
 
-    // An image with its one view over all of it. (Today's CreateImage takes a
-    // view type and aspect; the aspect follows the format here. Views in
-    // another format, which the renderer uses for a few resolves, are an open
-    // item: ImageDesc will gain a list of compatible view formats.)
+    // An image with one view over all of it (a cube as a cube, the aspect
+    // following the format); more through CreateImageView.
     class Image
     {
     public:
@@ -105,11 +111,23 @@ namespace gpu::rhi
         virtual uint64_t Bytes() const = 0;
     };
 
+    // A view of an image other than its own (Image's one view over all of it).
+    struct ImageViewDesc
+    {
+        Format format = Format::Undefined;      // Undefined: the image's
+        uint32_t layer = 0, layerCount = 0;     // 0 layers: all of them, as the image's kind; else a 2D view of those layers
+        Swizzle swizzle[4] = { Swizzle::Identity, Swizzle::Identity, Swizzle::Identity, Swizzle::Identity };
+        bool depthOnly = false;                 // a depth/stencil image's depth
+    };
+    class ImageView { public: virtual ~ImageView() = default; };
+
     struct SamplerDesc
     {
         Filter mag = Filter::Linear, min = Filter::Linear, mip = Filter::Linear;
         AddressMode u = AddressMode::Repeat, v = AddressMode::Repeat, w = AddressMode::Repeat;
         float maxAnisotropy = 1.0f;
+        float minLod = 0.0f, maxLod = 1000.0f;  // (1000: unclamped)
+        bool whiteBorder = false;               // ClampToBorder: opaque white, else transparent black
     };
     class Sampler { public: virtual ~Sampler() = default; };
 
@@ -120,6 +138,7 @@ namespace gpu::rhi
         StorageBuffer,
         UniformBufferDynamic,    // a uniform buffer whose offset is given at bind time
         CombinedImageSampler,
+        SampledImage,            // a texture without a sampler
         StorageImage,
     };
 
@@ -151,7 +170,8 @@ namespace gpu::rhi
     class BindingLayout { public: virtual ~BindingLayout() = default; };
 
     struct BufferBinding { Buffer* buffer = nullptr; uint64_t offset = 0, size = ~0ull; };
-    struct ImageBinding { Image* image = nullptr; Sampler* sampler = nullptr; };
+    // `view`: one made by CreateImageView, else the image's own.
+    struct ImageBinding { Image* image = nullptr; Sampler* sampler = nullptr; const ImageView* view = nullptr; };
     struct BindingEntry
     {
         uint32_t slot = 0;
@@ -195,7 +215,7 @@ namespace gpu::rhi
         const BindingLayout* layout = nullptr;
         Topology topology = Topology::TriangleList;
         bool primitiveRestart = false;
-        Format colorFormats[4] = {};          // Undefined: not attached
+        Format colorFormats[4] = {};          // Undefined: not attached (a gap is allowed: the next ones still are)
         Format depthFormat = Format::Undefined;
         BlendAttachment blend[4];
         bool depthTest = false, depthWrite = false;
@@ -206,6 +226,7 @@ namespace gpu::rhi
         bool frontCounterClockwise = false;
         bool depthClamp = false;
         bool depthBias = false;
+        uint32_t shadingRateW = 0, shadingRateH = 0;  // 0: off (an experiment: fragment shading rate, where offered)
         // Set by CommandList (viewport, scissor, stencil values, depth bias,
         // blend constants): dynamic state, as today.
     };
@@ -274,6 +295,37 @@ namespace gpu::rhi
         bool presentTiming = false;          // PresentShown is delivered (VK_KHR_present_wait; Metal always)
         bool scheduledPresent = false;       // PresentRequest::notBefore is honoured (display timing; Metal)
         uint64_t memoryBudget = 0;           // bytes, 0 unknown
+        enum class Kind : uint8_t { Other, Integrated, Discrete };
+        Kind kind = Kind::Other;
+        uint32_t vendorId = 0;               // PCI vendor (0x106B: Apple)
+        uint64_t maxStorageBufferRange = ~0ull;  // the most a storage binding covers
+        float maxAnisotropy = 1.0f;          // 1: no anisotropic filtering
+    };
+
+    // What the device can do with a format.
+    enum FormatFeature : uint32_t
+    {
+        kFormatBlend   = 1 << 0,   // a render target it can blend in
+        kFormatStorage = 1 << 1,   // a storage image
+    };
+
+    // Guest memory (CreateGuestMemory): the GPU's view of the game's memory.
+    struct GuestMemory
+    {
+        std::unique_ptr<Buffer> buffer;
+        // Not imported but copied: the GPU's copy, mapped here for the CPU to
+        // keep current (the renderer's shadow mode). nullptr when imported.
+        uint8_t* shadow = nullptr;
+        bool shadowInVram = false;
+    };
+
+    // The suballocation of image memory the Vulkan backend does (D14), for the
+    // [perf] line; zeros where there is none.
+    struct ImageMemoryStats
+    {
+        uint64_t blockBytes = 0, rangeBytes = 0, spareBytes = 0, ownBytes = 0;
+        uint32_t blocks = 0, ranges = 0, spares = 0, own = 0;
+        uint64_t images = 0, imageNs = 0, allocations = 0, allocationNs = 0, fromSpare = 0, blocksHere = 0, blocksFreed = 0, spareBlocks = 0, spareNs = 0;
     };
 
     class Device
@@ -285,8 +337,22 @@ namespace gpu::rhi
         virtual std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) = 0;
         // `host` (aligned as Capabilities says) as a buffer without a copy.
         virtual std::unique_ptr<Buffer> ImportHostMemory(void* host, uint64_t size, uint32_t usage, const char* name) = 0;
+        // The GPU's access to `size` bytes of the game's memory at `host`
+        // (aligned as Capabilities says): imported without a copy where the
+        // device can and it is the better place, else copied (D14: where, and
+        // how, is the backend's: memory_plan.h in Vulkan). False, with the
+        // reasons logged, when no place could hold it.
+        virtual bool CreateGuestMemory(void* host, uint64_t size, GuestMemory& out) = 0;
         // nullptr when the device turns the image down (the renderer tolerates it for scaled targets).
         virtual std::unique_ptr<Image> CreateImage(const ImageDesc& desc) = 0;
+        // nullptr when it turns the view down.
+        virtual std::unique_ptr<ImageView> CreateImageView(const Image& image, const ImageViewDesc& desc) = 0;
+        // Whether an image like `desc` can be made (formats, usages, store views).
+        virtual bool SupportsImage(const ImageDesc& desc) const = 0;
+        virtual uint32_t FormatFeatures(Format format) const = 0;   // FormatFeature bits
+        // Device memory in use by this process and its budget, in bytes (0: unknown).
+        virtual void GetMemoryUsage(uint64_t& used, uint64_t& budget) const = 0;
+        virtual ImageMemoryStats GetImageMemoryStats() const = 0;
         virtual std::unique_ptr<Sampler> CreateSampler(const SamplerDesc& desc) = 0;
 
         virtual std::unique_ptr<BindingLayout> CreateBindingLayout(const BindingLayoutDesc& desc) = 0;

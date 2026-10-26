@@ -15,13 +15,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include <vulkan/vulkan.h>
 
+#include "../../memory_plan.h"
+#include "../../pipeline_cache_header.h"
 #include "../command_list.h"
+#include "vulkan_image_memory.h"
 
 namespace gpu::rhi::vulkan
 {
@@ -52,6 +56,16 @@ namespace gpu::rhi::vulkan
             VkPipelineCache pipelineCache = VK_NULL_HANDLE;
             bool preciseOcclusion = false;
             PFN_vkResetQueryPool hostResetQueries = nullptr;  // VK_EXT_host_query_reset enabled (QueryPool::Reset)
+            VkPhysicalDeviceProperties props{};
+            bool memoryBudget = false;                        // VK_EXT_memory_budget
+            std::unique_ptr<ImageMemory> imageMemory;         // destroyed before the device (VkDeviceObject)
+            // Guest memory and the ring (gpu/memory_plan.h, D14).
+            memplan::Memory planMemory;
+            bool planned = false;
+            memplan::Gpu planGpu = memplan::Gpu::kOther;
+            uint32_t guestType = memplan::kNoType;            // the copy's memory type (kNoType: imported)
+            std::string guestChoice;                          // for the "memory" line
+            bool shadowInVram = false;
             PFN_vkCmdPushDescriptorSetKHR pushDescriptor = nullptr;
             PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties = nullptr;
             PFN_vkCmdBeginRenderingKHR beginRendering = nullptr;
@@ -96,6 +110,7 @@ namespace gpu::rhi::vulkan
             case BindingKind::StorageBuffer: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             case BindingKind::UniformBufferDynamic: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             case BindingKind::CombinedImageSampler: return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            case BindingKind::SampledImage: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             case BindingKind::StorageImage: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             }
             return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -216,6 +231,9 @@ namespace gpu::rhi::vulkan
                 layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; stages = VK_PIPELINE_STAGE_TRANSFER_BIT; access = VK_ACCESS_TRANSFER_WRITE_BIT; break;
             case State::Present:
                 layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; access = 0; break;
+            case State::General:
+                layout = VK_IMAGE_LAYOUT_GENERAL; stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT; break;
             default:
                 layout = VK_IMAGE_LAYOUT_UNDEFINED; stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT; access = 0; break;
             }
@@ -368,12 +386,19 @@ namespace gpu::rhi::vulkan
                 if (!m_memory)
                     return;
                 vkDestroyImage(m_c.device, m_image, nullptr);
-                vkFreeMemory(m_c.device, m_memory, nullptr);
+                if (m_pooled)
+                    m_c.imageMemory->Free(m_allocation);
+                else
+                    vkFreeMemory(m_c.device, m_memory, nullptr);
             }
             const ImageDesc& Desc() const override { return m_desc; }
             uint64_t Bytes() const override { return m_bytes; }
             VkImage Handle() const { return m_image; }
             VkImageView View() const { return m_view; }
+            // The layout the image is in for a use that would put it in `layout`: a `general` image stays in GENERAL.
+            VkImageLayout Layout(VkImageLayout layout) const { return m_desc.general ? VK_IMAGE_LAYOUT_GENERAL : layout; }
+            // Its memory is a range of a block (ImageMemory), freed with the image.
+            void SetAllocation(const ImageMemory::Allocation& a) { m_allocation = a; m_pooled = true; }
 
         private:
             Context& m_c;
@@ -382,6 +407,20 @@ namespace gpu::rhi::vulkan
             VkDeviceMemory m_memory;
             VkImageView m_view;
             uint64_t m_bytes;
+            ImageMemory::Allocation m_allocation;
+            bool m_pooled = false;
+        };
+
+        class VkImageViewObject final : public ImageView
+        {
+        public:
+            VkImageViewObject(Context& c, VkImageView view) : m_c(c), m_view(view) {}
+            ~VkImageViewObject() override { vkDestroyImageView(m_c.device, m_view, nullptr); }
+            VkImageView Handle() const { return m_view; }
+
+        private:
+            Context& m_c;
+            VkImageView m_view;
         };
 
         // ---- bindings (D10) ------------------------------------------------------
@@ -471,12 +510,15 @@ namespace gpu::rhi::vulkan
                     w.dstBinding = slot->index;
                     w.descriptorCount = 1;
                     w.descriptorType = ToVk(slot->kind);
-                    if (slot->kind == BindingKind::CombinedImageSampler || slot->kind == BindingKind::StorageImage)
+                    if (slot->kind == BindingKind::CombinedImageSampler || slot->kind == BindingKind::SampledImage ||
+                        slot->kind == BindingKind::StorageImage)
                     {
                         const ImageBinding& b = entries[i].image;
+                        const auto* image = static_cast<VkImageObject*>(b.image);
                         VkSampler sampler = b.sampler && !slot->immutableSampler ? static_cast<VkSamplerObject*>(b.sampler)->Handle() : VK_NULL_HANDLE;
-                        images.push_back({ sampler, static_cast<VkImageObject*>(b.image)->View(),
-                            slot->kind == BindingKind::StorageImage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                        VkImageView view = b.view ? static_cast<const VkImageViewObject*>(b.view)->Handle() : image->View();
+                        images.push_back({ sampler, view,
+                            image->Layout(slot->kind == BindingKind::StorageImage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) });
                         w.pImageInfo = &images.back();
                     }
                     else
@@ -666,15 +708,20 @@ namespace gpu::rhi::vulkan
                 };
                 auto storeOp = [](StoreOp op) { return op == StoreOp::Store ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE; };
                 VkRenderingAttachmentInfo colors[4]{};
-                uint32_t colorCount = 0;
-                for (const ColorAttachment& a : desc.color)
+                // Always four attachments, as the renderer's pipelines are: a pass
+                // may hold targets a draw in it doesn't write, and the counts of
+                // pipeline and pass must agree. A gap has no image.
+                constexpr uint32_t colorCount = 4;
+                for (uint32_t i = 0; i < 4; i++)
                 {
-                    if (!a.image)
-                        break;  // attachments are packed from 0
-                    VkRenderingAttachmentInfo& info = colors[colorCount++];
+                    const ColorAttachment& a = desc.color[i];
+                    VkRenderingAttachmentInfo& info = colors[i];
                     info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                    info.imageView = static_cast<VkImageObject*>(a.image)->View();
-                    info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    if (!a.image)
+                        continue;
+                    const auto* image = static_cast<VkImageObject*>(a.image);
+                    info.imageView = image->View();
+                    info.imageLayout = image->Layout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                     info.loadOp = loadOp(a.load);
                     info.storeOp = storeOp(a.store);
                     memcpy(info.clearValue.color.float32, a.clear.rgba, sizeof(a.clear.rgba));
@@ -682,9 +729,10 @@ namespace gpu::rhi::vulkan
                 VkRenderingAttachmentInfo depth{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
                 if (desc.depth.image)
                 {
-                    depth.imageView = static_cast<VkImageObject*>(desc.depth.image)->View();
-                    depth.imageLayout = desc.depth.readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                                            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    const auto* image = static_cast<VkImageObject*>(desc.depth.image);
+                    depth.imageView = image->View();
+                    depth.imageLayout = image->Layout(desc.depth.readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                                          : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
                     depth.loadOp = loadOp(desc.depth.load);
                     depth.storeOp = storeOp(desc.depth.store);
                     depth.clearValue.depthStencil = { desc.depth.clear.depth, desc.depth.clear.stencil };
@@ -739,11 +787,14 @@ namespace gpu::rhi::vulkan
                 VkRect2D s{ { r.x, r.y }, { r.width, r.height } };
                 vkCmdSetScissor(m_cmd, 0, 1, &s);
             }
-            void SetStencil(uint8_t reference, uint8_t compareMask, uint8_t writeMask) override
+            void SetStencil(const StencilState& front, const StencilState& back) override
             {
-                vkCmdSetStencilReference(m_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, reference);
-                vkCmdSetStencilCompareMask(m_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, compareMask);
-                vkCmdSetStencilWriteMask(m_cmd, VK_STENCIL_FACE_FRONT_AND_BACK, writeMask);
+                vkCmdSetStencilCompareMask(m_cmd, VK_STENCIL_FACE_FRONT_BIT, front.compareMask);
+                vkCmdSetStencilCompareMask(m_cmd, VK_STENCIL_FACE_BACK_BIT, back.compareMask);
+                vkCmdSetStencilWriteMask(m_cmd, VK_STENCIL_FACE_FRONT_BIT, front.writeMask);
+                vkCmdSetStencilWriteMask(m_cmd, VK_STENCIL_FACE_BACK_BIT, back.writeMask);
+                vkCmdSetStencilReference(m_cmd, VK_STENCIL_FACE_FRONT_BIT, front.reference);
+                vkCmdSetStencilReference(m_cmd, VK_STENCIL_FACE_BACK_BIT, back.reference);
             }
             void SetDepthBias(float constant, float clamp, float slope) override { vkCmdSetDepthBias(m_cmd, constant, clamp, slope); }
             void SetBlendConstants(const float rgba[4]) override { vkCmdSetBlendConstants(m_cmd, rgba); }
@@ -792,15 +843,15 @@ namespace gpu::rhi::vulkan
             {
                 auto& image = static_cast<VkImageObject&>(dst);
                 std::vector<VkBufferImageCopy> vk = CopyRegions(image, regions, count);
-                vkCmdCopyBufferToImage(m_cmd, static_cast<VkBufferObject&>(src).Handle(), image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    uint32_t(vk.size()), vk.data());
+                vkCmdCopyBufferToImage(m_cmd, static_cast<VkBufferObject&>(src).Handle(), image.Handle(),
+                    image.Layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), uint32_t(vk.size()), vk.data());
             }
             void CopyImageToBuffer(Image& src, Buffer& dst, const BufferImageCopy* regions, uint32_t count) override
             {
                 auto& image = static_cast<VkImageObject&>(src);
                 std::vector<VkBufferImageCopy> vk = CopyRegions(image, regions, count);
-                vkCmdCopyImageToBuffer(m_cmd, image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VkBufferObject&>(dst).Handle(),
-                    uint32_t(vk.size()), vk.data());
+                vkCmdCopyImageToBuffer(m_cmd, image.Handle(), image.Layout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                    static_cast<VkBufferObject&>(dst).Handle(), uint32_t(vk.size()), vk.data());
             }
             void BlitImage(Image& src, const Rect2D& srcRect, Image& dst, const Rect2D& dstRect, Filter filter) override
             {
@@ -813,8 +864,8 @@ namespace gpu::rhi::vulkan
                 blit.srcOffsets[1] = { srcRect.x + int32_t(srcRect.width), srcRect.y + int32_t(srcRect.height), 1 };
                 blit.dstOffsets[0] = { dstRect.x, dstRect.y, 0 };
                 blit.dstOffsets[1] = { dstRect.x + int32_t(dstRect.width), dstRect.y + int32_t(dstRect.height), 1 };
-                vkCmdBlitImage(m_cmd, s.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                    ToVk(filter));
+                vkCmdBlitImage(m_cmd, s.Handle(), s.Layout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL), d.Handle(),
+                    d.Layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), 1, &blit, ToVk(filter));
             }
             void FillBuffer(Buffer& dst, uint64_t offset, uint64_t size, uint32_t value) override
             {
@@ -831,14 +882,14 @@ namespace gpu::rhi::vulkan
                 VkClearColorValue value;
                 memcpy(value.float32, color.rgba, sizeof(color.rgba));
                 VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
-                vkCmdClearColorImage(m_cmd, i.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+                vkCmdClearColorImage(m_cmd, i.Handle(), i.Layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &value, 1, &range);
             }
             void ClearImage(Image& image, const ClearDepthStencil& depthStencil) override
             {
                 auto& i = static_cast<VkImageObject&>(image);
                 VkClearDepthStencilValue value{ depthStencil.depth, depthStencil.stencil };
                 VkImageSubresourceRange range{ Aspect(i.Desc().format), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
-                vkCmdClearDepthStencilImage(m_cmd, i.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+                vkCmdClearDepthStencilImage(m_cmd, i.Handle(), i.Layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL), &value, 1, &range);
             }
 
             void Transition(const ImageTransition* images, size_t imageCount, const BufferTransition* buffers, size_t bufferCount) override
@@ -865,6 +916,8 @@ namespace gpu::rhi::vulkan
                 for (size_t i = 0; i < imageCount; i++)
                 {
                     auto* image = static_cast<VkImageObject*>(images[i].image);
+                    if (image->Desc().general && images[i].before == State::General)
+                        continue;  // (a general image only ever leaves Undefined)
                     VkPipelineStageFlags s, d;
                     VkAccessFlags sa, da;
                     VkImageLayout from, to;
@@ -885,6 +938,43 @@ namespace gpu::rhi::vulkan
                 if (!bufferBarriers.empty() || !imageBarriers.empty())
                     vkCmdPipelineBarrier(m_cmd, srcStages, dstStages, 0, 0, nullptr, uint32_t(bufferBarriers.size()), bufferBarriers.data(),
                         uint32_t(imageBarriers.size()), imageBarriers.data());
+            }
+            void MemoryBarrier(Barrier kind) override
+            {
+                constexpr VkPipelineStageFlags kNonVertex = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+                VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+                mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                VkPipelineStageFlags src, dst;
+                switch (kind)
+                {
+                case Barrier::Full:
+                    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+                    src = dst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    break;
+                case Barrier::Compute:
+                    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                    dst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    break;
+                case Barrier::NarrowAfterPass:
+                    // The vertex stage is named in the source although Vulkan
+                    // implies it: MoltenVK maps stages one to one, and without
+                    // it a resolve overwriting what this pass's vertex shader
+                    // read would wait only for its fragment stage.
+                    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    src = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                    dst = kNonVertex;
+                    break;
+                default:  // NarrowAfterCompute
+                    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    src = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                    dst = kNonVertex;
+                    break;
+                }
+                vkCmdPipelineBarrier(m_cmd, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
             }
             void SignalEvent(Event& event) override
             {
@@ -1291,6 +1381,7 @@ namespace gpu::rhi::vulkan
             ~VkDeviceObject() override
             {
                 vkDeviceWaitIdle(m_c->device);
+                m_c->imageMemory.reset();
                 vkDestroyPipelineCache(m_c->device, m_c->pipelineCache, nullptr);
                 vkDestroyDevice(m_c->device, nullptr);
                 vkDestroyInstance(m_c->instance, nullptr);
@@ -1302,6 +1393,8 @@ namespace gpu::rhi::vulkan
 
             std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) override
             {
+                if (desc.memory == MemoryKind::Stream)
+                    return CreateStreamBuffer(desc);
                 VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
                 bci.size = desc.size;
                 bci.usage = ToVk(BufferUsage(desc.usage));
@@ -1386,39 +1479,399 @@ namespace gpu::rhi::vulkan
                 return result;
             }
 
+
+            // ---- where the big CPU-written allocations go (gpu/memory_plan.h, D14) ----
+            //
+            // Guest memory and the upload ring: a plan lists the places to try
+            // in turn; a place the driver refuses (out of memory, say) is logged
+            // and the next one tried; only when none is left does the caller
+            // give up. Test hooks for the plan's fallbacks, which the machines
+            // we test on never need:
+            //   NFSMW_TEST_BAR_HEAP_MB=<MB>: the heaps holding CPU-mapped VRAM
+            //     read as that size to the plan, and the copy's and the ring's
+            //     allocations from those types fail (out of device memory) once
+            //     they would pass it, as on a GPU without resizable BAR;
+            //   NFSMW_TEST_ALLOC_FAIL=<places>: those places fail as out of
+            //     device memory (comma-separated: import, copy-vram,
+            //     copy-system, copy-cached, ring-vram, ring-cached, ring-system);
+            //   NFSMW_TEST_GPU_KIND=integrated|discrete|other: the plan takes
+            //     the GPU for that kind (the Deck's choice on the Steam Machine).
+            struct MemoryTest
+            {
+                uint64_t barBytes = 0, barUsed = 0;
+                std::string fail;  // ",a,b,"
+                const char* kind = nullptr;
+            };
+            MemoryTest m_test = [] {
+                MemoryTest t;
+                if (const char* v = std::getenv("NFSMW_TEST_BAR_HEAP_MB"); v && std::atoi(v) > 0)
+                    t.barBytes = uint64_t(std::atoi(v)) << 20;
+                if (const char* v = std::getenv("NFSMW_TEST_ALLOC_FAIL"); v && v[0])
+                    t.fail = std::string(",") + v + ",";
+                t.kind = std::getenv("NFSMW_TEST_GPU_KIND");
+                return t;
+            }();
+
+            bool MemoryTestRefuses(memplan::Place place, bool ring)
+            {
+                const char* name = memplan::Name(place, ring);
+                if (m_test.fail.find(std::string(",") + name + ",") == std::string::npos)
+                    return false;
+                fprintf(stderr, "[rhi/vulkan] NFSMW_TEST_ALLOC_FAIL: %s refused (out of device memory)\n", name);
+                return true;
+            }
+
+            // The first type among `bits` with `want`, else the first among
+            // `bits` (the memory is the driver's to say yes or no to).
+            uint32_t FindTypeLoose(uint32_t bits, VkMemoryPropertyFlags want) const
+            {
+                const uint32_t type = m_c->FindMemoryType(bits, want);
+                if (type != UINT32_MAX)
+                    return type;
+                for (uint32_t i = 0; i < m_c->memory.memoryTypeCount; i++)
+                    if (bits & (1u << i))
+                        return i;
+                return 0;
+            }
+
+            // vkAllocateMemory for a planned place, through the test hooks.
+            VkResult AllocatePlanned(const memplan::Candidate& c, bool ring, VkDeviceSize size, VkDeviceMemory& memory)
+            {
+                if (MemoryTestRefuses(c.place, ring))
+                    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                const VkMemoryPropertyFlags bar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+                const bool mappedVram = (m_c->memory.memoryTypes[c.type].propertyFlags & bar) == bar;
+                if (mappedVram && m_test.barBytes && m_test.barUsed + size > m_test.barBytes)
+                {
+                    fprintf(stderr, "[rhi/vulkan] NFSMW_TEST_BAR_HEAP_MB: %llu MB of CPU-mapped VRAM refused (%llu of %llu MB taken)\n",
+                        (unsigned long long)(size >> 20), (unsigned long long)(m_test.barUsed >> 20), (unsigned long long)(m_test.barBytes >> 20));
+                    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                }
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = size;
+                mai.memoryTypeIndex = c.type;
+                const VkResult r = vkAllocateMemory(m_c->device, &mai, nullptr, &memory);
+                if (r == VK_SUCCESS && mappedVram)
+                    m_test.barUsed += size;
+                return r;
+            }
+
+            // The device's memory as the plan sees it (NFSMW_TEST_BAR_HEAP_MB
+            // applied), logged once: bug reports then show what a GPU offers.
+            void PlanDeviceMemory()
+            {
+                if (m_c->planned)
+                    return;
+                m_c->planned = true;
+                const VkPhysicalDeviceMemoryProperties& mp = m_c->memory;
+                memplan::Memory& m = m_c->planMemory;
+                std::string line;
+                for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+                {
+                    m.heaps.push_back(mp.memoryHeaps[h].size);
+                    line += std::format("{}{} {}{}", h ? ", " : "", h, memplan::Size(m.heaps.back()),
+                        (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " device-local" : "");
+                }
+                line += "; types (type:heap/flags):";
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                {
+                    m.types.push_back({ mp.memoryTypes[i].propertyFlags, mp.memoryTypes[i].heapIndex });
+                    line += std::format(" {}:{}/{:X}", i, m.types.back().heap, m.types.back().flags);
+                }
+                if (m_test.barBytes)
+                {
+                    memplan::ShrinkMappedVram(m, m_test.barBytes);
+                    line += std::format(" (NFSMW_TEST_BAR_HEAP_MB: CPU-mapped VRAM's heaps read as {} MB)", m_test.barBytes >> 20);
+                }
+                fprintf(stderr, "[rhi/vulkan] memory heaps: %s\n", line.c_str());
+            }
+
+            uint32_t DriverId() const
+            {
+                if (m_c->props.apiVersion < VK_API_VERSION_1_2)
+                    return 0;
+                VkPhysicalDeviceDriverProperties driver{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+                VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver };
+                vkGetPhysicalDeviceProperties2(m_c->physical, &props2);
+                return uint32_t(driver.driverID);
+            }
+
+            // Guest physical memory imported without a copy (unified memory, or
+            // a discrete GPU reading system memory over PCIe).
+            std::unique_ptr<Buffer> ImportGuest(void* host, uint64_t size)
+            {
+                if (!m_c->hostPointerProperties)  // (no host-memory import)
+                    return nullptr;
+                if (MemoryTestRefuses(memplan::Place::kImport, false))
+                {
+                    fprintf(stderr, "[rhi/vulkan] importing guest memory failed (%d)\n", int(VK_ERROR_OUT_OF_DEVICE_MEMORY));
+                    return nullptr;
+                }
+                VkMemoryHostPointerPropertiesEXT hpp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+                if (VkResult r = m_c->hostPointerProperties(m_c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hpp);
+                    r != VK_SUCCESS)
+                {
+                    // (A driver can refuse the pointer itself: on Windows guest
+                    // memory is a view of a file mapping, which only Intel's
+                    // driver is known to import. Logged, so a bug report tells
+                    // this from a refused allocation.)
+                    fprintf(stderr, "[rhi/vulkan] importing guest memory failed: the driver doesn't take its host pointer (%d)\n", int(r));
+                    return nullptr;
+                }
+                VkExternalMemoryBufferCreateInfo embci{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+                embci.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.pNext = &embci;
+                bci.size = size;
+                bci.usage = ToVk(BufferUsage(kBufferStorage | kBufferCopySrc | kBufferCopyDst));
+                VkBuffer buffer = VK_NULL_HANDLE;
+                Check(vkCreateBuffer(m_c->device, &bci, nullptr, &buffer), "vkCreateBuffer(shared)");
+                VkMemoryRequirements req;
+                vkGetBufferMemoryRequirements(m_c->device, buffer, &req);
+                VkImportMemoryHostPointerInfoEXT import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+                import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+                import.pHostPointer = host;
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.pNext = &import;
+                mai.allocationSize = size;
+                mai.memoryTypeIndex = FindTypeLoose(req.memoryTypeBits & hpp.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                VkResult r = vkAllocateMemory(m_c->device, &mai, nullptr, &memory);
+                if (r == VK_SUCCESS && (r = vkBindBufferMemory(m_c->device, buffer, memory, 0)) != VK_SUCCESS)
+                {
+                    vkFreeMemory(m_c->device, memory, nullptr);
+                    memory = VK_NULL_HANDLE;
+                }
+                if (r != VK_SUCCESS)
+                {
+                    fprintf(stderr, "[rhi/vulkan] importing guest memory failed (%d)\n", int(r));
+                    vkDestroyBuffer(m_c->device, buffer, nullptr);
+                    return nullptr;
+                }
+                auto result = std::make_unique<VkBufferObject>(*m_c, buffer, memory, size, host, true);
+                result->MarkImported();
+                return result;
+            }
+
+            // The buffer of guest memory's copy (an unbound one: a place that
+            // fails before binding leaves it for the next).
+            VkBuffer NewCopyBuffer(uint64_t size, VkMemoryRequirements& req)
+            {
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = size;
+                bci.usage = ToVk(BufferUsage(kBufferStorage | kBufferCopySrc | kBufferCopyDst));
+                VkBuffer buffer = VK_NULL_HANDLE;
+                Check(vkCreateBuffer(m_c->device, &bci, nullptr, &buffer), "vkCreateBuffer(shadow)");
+                vkGetBufferMemoryRequirements(m_c->device, buffer, &req);
+                return buffer;
+            }
+
+            // Guest memory's copy for the GPU in `c`'s memory type: on a
+            // discrete GPU in VRAM the CPU writes through resizable BAR when
+            // it holds the copy, else in system memory; on an integrated one
+            // in system memory (memory_plan.h). False, with nothing kept, when
+            // the driver refuses it; `buffer` is then still unbound, or replaced.
+            std::unique_ptr<Buffer> CreateShadowGuest(uint64_t size, VkBuffer& buffer, const VkMemoryRequirements& req,
+                const memplan::Candidate& c, void*& mapped)
+            {
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                void* p = nullptr;
+                const char* what = "vkAllocateMemory(shadow)";
+                VkResult r = AllocatePlanned(c, false, req.size, memory);
+                if (r == VK_SUCCESS && (r = vkMapMemory(m_c->device, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
+                    what = "vkMapMemory(shadow)";
+                else if (r == VK_SUCCESS && (r = vkBindBufferMemory(m_c->device, buffer, memory, 0)) != VK_SUCCESS)
+                {
+                    what = "vkBindBufferMemory(shadow)";
+                    vkDestroyBuffer(m_c->device, buffer, nullptr);  // (a buffer binds once)
+                    VkMemoryRequirements again;
+                    buffer = NewCopyBuffer(size, again);
+                }
+                if (r != VK_SUCCESS)
+                {
+                    fprintf(stderr, "[rhi/vulkan] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
+                        memplan::Name(c.place, false), c.type);
+                    if (memory)
+                        vkFreeMemory(m_c->device, memory, nullptr);
+                    return nullptr;
+                }
+                mapped = p;
+                const bool coherent = (m_c->memory.memoryTypes[c.type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+                return std::make_unique<VkBufferObject>(*m_c, buffer, memory, size, p, coherent);
+            }
+
+            // `failed`, a list of place names, as the log's ", after ... failed".
+            static std::string AfterFailed(const std::string& failed)
+            {
+                return failed.empty() ? std::string() : " after " + failed + " failed";
+            }
+
+            bool CreateGuestMemory(void* host, uint64_t size, GuestMemory& out) override
+            {
+                const VkPhysicalDeviceMemoryProperties& mp = m_c->memory;
+                PlanDeviceMemory();
+                memplan::GuestInput in;
+                in.gpu = m_c->caps.kind == Capabilities::Kind::Discrete ? memplan::Gpu::kDiscrete
+                    : m_c->caps.kind == Capabilities::Kind::Integrated ? memplan::Gpu::kIntegrated : memplan::Gpu::kOther;
+                if (const char* kind = m_test.kind)
+                {
+                    std::string_view k(kind);
+                    in.gpu = k == "integrated" ? memplan::Gpu::kIntegrated : k == "discrete" ? memplan::Gpu::kDiscrete
+                        : k == "other" ? memplan::Gpu::kOther : in.gpu;
+                    fprintf(stderr, "[rhi/vulkan] NFSMW_TEST_GPU_KIND=%s: memory planned as for %s GPU\n", kind,
+                        in.gpu == memplan::Gpu::kDiscrete ? "a discrete" : in.gpu == memplan::Gpu::kIntegrated ? "an integrated" : "another");
+                }
+                in.importable = m_c->hostPointerProperties != nullptr;
+                in.importRefusal = memplan::ImportRefusal(DriverId());
+                in.overrides = memplan::ParseOverrides(std::getenv("NFSMW_SHARED_MEMORY"), std::getenv("NFSMW_SHADOW_MEMORY"),
+                    std::getenv("NFSMW_RING_MEMORY"));
+                VkMemoryRequirements req;
+                VkBuffer copy = NewCopyBuffer(size, req);
+                in.bits = req.memoryTypeBits;
+                m_c->planGpu = in.gpu;
+                memplan::Plan plan = memplan::PlanGuestMemory(m_c->planMemory, in);
+                std::string failed;
+                const memplan::Candidate* placed = nullptr;
+                for (const memplan::Candidate& c : plan.order)
+                {
+                    void* mapped = nullptr;
+                    if (c.place == memplan::Place::kImport)
+                        out.buffer = ImportGuest(host, size);
+                    else
+                        out.buffer = CreateShadowGuest(size, copy, req, c, mapped);
+                    if (out.buffer)
+                    {
+                        placed = &c;
+                        out.shadow = static_cast<uint8_t*>(mapped);
+                        break;
+                    }
+                    failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, false);
+                }
+                if (!placed)
+                {
+                    fprintf(stderr, "[rhi/vulkan] guest memory: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+                    vkDestroyBuffer(m_c->device, copy, nullptr);
+                    return false;
+                }
+                if (placed->place == memplan::Place::kImport)
+                {
+                    vkDestroyBuffer(m_c->device, copy, nullptr);
+                    fprintf(stderr, "[rhi/vulkan] guest memory: imported (zero-copy)\n");
+                    m_c->guestChoice = "imported (zero-copy)";
+                }
+                else
+                {
+                    m_c->guestType = placed->type;
+                    m_c->shadowInVram = (mp.memoryTypes[placed->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+                    out.shadowInVram = m_c->shadowInVram;
+                    fprintf(stderr, "[rhi/vulkan] guest memory: GPU copy in %s (memory type %u, flags %X), updated from the write watch\n",
+                        m_c->shadowInVram ? "VRAM (CPU-mapped)" : "host memory", placed->type, mp.memoryTypes[placed->type].propertyFlags);
+                    m_c->guestChoice = std::format("as a GPU copy in {}, memory type {}", placed->place == memplan::Place::kVram ? "CPU-mapped VRAM"
+                        : placed->place == memplan::Place::kCached ? "cached host memory" : "host memory", placed->type);
+                }
+                m_c->guestChoice += " (" + plan.why + ")" + AfterFailed(failed);
+                return true;
+            }
+
+            // The upload ring: device-local when the host can map it
+            // (resizable BAR) and it fits, so the GPU reads constants and
+            // indices from VRAM; else cached system memory (memory_plan.h).
+            // NFSMW_RING_MEMORY=cached prefers cached system memory anyway: the
+            // CPU's ~40 MB of writes a frame then aren't write-combined PCIe
+            // stores (an A/B experiment: on the Steam Machine 2% less CPU,
+            // twice the GPU time); =vram|system name the other places.
+            std::unique_ptr<Buffer> CreateStreamBuffer(const BufferDesc& desc)
+            {
+                PlanDeviceMemory();
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = desc.size;
+                bci.usage = ToVk(BufferUsage(desc.usage));
+                VkBuffer buffer = VK_NULL_HANDLE;
+                Check(vkCreateBuffer(m_c->device, &bci, nullptr, &buffer), "vkCreateBuffer(ring)");
+                VkMemoryRequirements req;
+                vkGetBufferMemoryRequirements(m_c->device, buffer, &req);
+                const memplan::Overrides o = memplan::ParseOverrides(nullptr, nullptr, std::getenv("NFSMW_RING_MEMORY"));
+                memplan::Plan plan = memplan::PlanRing(m_c->planMemory, req.memoryTypeBits, m_c->guestType, o.ring);
+                std::string failed;
+                for (const memplan::Candidate& c : plan.order)
+                {
+                    VkDeviceMemory memory = VK_NULL_HANDLE;
+                    void* p = nullptr;
+                    const char* what = "vkAllocateMemory(ring)";
+                    VkResult r = AllocatePlanned(c, true, req.size, memory);
+                    if (r == VK_SUCCESS && (r = vkMapMemory(m_c->device, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
+                        what = "vkMapMemory(ring)";
+                    else if (r == VK_SUCCESS && (r = vkBindBufferMemory(m_c->device, buffer, memory, 0)) != VK_SUCCESS)
+                    {
+                        what = "vkBindBufferMemory(ring)";
+                        vkDestroyBuffer(m_c->device, buffer, nullptr);  // (a buffer binds once)
+                        Check(vkCreateBuffer(m_c->device, &bci, nullptr, &buffer), "vkCreateBuffer(ring)");
+                    }
+                    if (r != VK_SUCCESS)
+                    {
+                        fprintf(stderr, "[rhi/vulkan] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
+                            memplan::Name(c.place, true), c.type);
+                        if (memory)
+                            vkFreeMemory(m_c->device, memory, nullptr);
+                        failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, true);
+                        continue;
+                    }
+                    const VkMemoryPropertyFlags flags = m_c->memory.memoryTypes[c.type].propertyFlags;
+                    fprintf(stderr, "[rhi/vulkan] upload ring: memory type %u (flags %X)\n", c.type, flags);
+                    // The choice and why, in one line.
+                    fprintf(stderr, "[rhi/vulkan] memory: guest memory %s; upload ring in %s, memory type %u (%s)%s\n", m_c->guestChoice.c_str(),
+                        c.place == memplan::Place::kVram ? "CPU-mapped VRAM" : c.place == memplan::Place::kCached ? "cached host memory"
+                            : "host memory", c.type, plan.why.c_str(), AfterFailed(failed).c_str());
+                    // Issue #40: say so when the GPU reads guest memory across PCIe.
+                    if (const char* note = memplan::OverPcieNote(m_c->planGpu, m_c->guestType != memplan::kNoType && m_c->shadowInVram,
+                            (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0))
+                        fprintf(stderr, "[rhi/vulkan] note: %s\n", note);
+                    return std::make_unique<VkBufferObject>(*m_c, buffer, memory, desc.size, p,
+                        (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0);
+                }
+                fprintf(stderr, "[rhi/vulkan] upload ring: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+                vkDestroyBuffer(m_c->device, buffer, nullptr);
+                return nullptr;
+            }
+
             std::unique_ptr<Image> CreateImage(const ImageDesc& desc) override
             {
+                const auto start = std::chrono::steady_clock::now();
                 const VkFormat format = ToVk(desc.format);
                 const bool cube = desc.kind == ImageKind::Cube;
+                const bool store = desc.storeFormat != Format::Undefined;
+                // A store format: views in that format of an image whose own
+                // isn't storable, with the usage the view says (the image is
+                // sampled through views of its own format).
+                const VkFormat formats[2] = { format, store ? ToVk(desc.storeFormat) : format };
+                VkImageFormatListCreateInfo list{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, nullptr, 2, formats };
                 VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-                ici.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+                ici.pNext = store ? &list : nullptr;
+                ici.flags = (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+                    (store ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0);
                 ici.imageType = desc.kind == ImageKind::Image3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
                 ici.format = format;
                 ici.extent = { desc.extent.width, desc.extent.height, desc.extent.depth };
                 ici.mipLevels = desc.levels;
                 ici.arrayLayers = cube ? 6 : desc.layers;
                 ici.samples = VK_SAMPLE_COUNT_1_BIT;
-                ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ici.tiling = VK_IMAGE_TILING_OPTIMAL;  // (image memory blocks hold nothing linear)
                 ici.usage = ToVk(ImageUsage(desc.usage));
                 ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
                 VkImage image;
                 if (vkCreateImage(m_c->device, &ici, nullptr, &image) != VK_SUCCESS)
                     return nullptr;
-                VkMemoryRequirements req;
-                vkGetImageMemoryRequirements(m_c->device, image, &req);
-                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                mai.allocationSize = req.size;
-                mai.memoryTypeIndex = m_c->FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                VkDeviceMemory memory = VK_NULL_HANDLE;
-                if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(m_c->device, &mai, nullptr, &memory) != VK_SUCCESS ||
-                    vkBindImageMemory(m_c->device, image, memory, 0) != VK_SUCCESS)
+                ImageMemory::Allocation memory;
+                if (!m_c->imageMemory->Bind(image, memory))
                 {
+                    fprintf(stderr, "[rhi/vulkan] no memory for an image (%ux%u, format %d)\n", desc.extent.width, desc.extent.height, int(format));
                     vkDestroyImage(m_c->device, image, nullptr);
-                    if (memory)
-                        vkFreeMemory(m_c->device, memory, nullptr);
                     return nullptr;
                 }
+                VkImageViewUsageCreateInfo sampled{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_SAMPLED_BIT };
                 VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                vci.pNext = store ? &sampled : nullptr;
                 vci.image = image;
                 vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : desc.kind == ImageKind::Image3D ? VK_IMAGE_VIEW_TYPE_3D
                     : desc.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
@@ -1428,17 +1881,118 @@ namespace gpu::rhi::vulkan
                 if (vkCreateImageView(m_c->device, &vci, nullptr, &view) != VK_SUCCESS)
                 {
                     vkDestroyImage(m_c->device, image, nullptr);
-                    vkFreeMemory(m_c->device, memory, nullptr);
+                    m_c->imageMemory->Free(memory);
                     return nullptr;
                 }
-                return std::make_unique<VkImageObject>(*m_c, desc, image, memory, view, req.size);
+                auto result = std::make_unique<VkImageObject>(*m_c, desc, image, memory.memory, view, memory.bytes);
+                result->SetAllocation(memory);
+                m_c->imageMemory->Made(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+                return result;
             }
+
+            std::unique_ptr<ImageView> CreateImageView(const Image& image, const ImageViewDesc& desc) override
+            {
+                const auto& img = static_cast<const VkImageObject&>(image);
+                const ImageDesc& d = img.Desc();
+                auto component = [](Swizzle s) {
+                    switch (s)
+                    {
+                    case Swizzle::R: return VK_COMPONENT_SWIZZLE_R;
+                    case Swizzle::G: return VK_COMPONENT_SWIZZLE_G;
+                    case Swizzle::B: return VK_COMPONENT_SWIZZLE_B;
+                    case Swizzle::A: return VK_COMPONENT_SWIZZLE_A;
+                    case Swizzle::Zero: return VK_COMPONENT_SWIZZLE_ZERO;
+                    case Swizzle::One: return VK_COMPONENT_SWIZZLE_ONE;
+                    default: return VK_COMPONENT_SWIZZLE_IDENTITY;
+                    }
+                };
+                const Format format = desc.format == Format::Undefined ? d.format : desc.format;
+                const bool cube = d.kind == ImageKind::Cube;
+                VkImageViewUsageCreateInfo usage{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, 0 };
+                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                if (format != d.format)  // (a reinterpretation: the view's own usage is storage)
+                {
+                    usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+                    vci.pNext = &usage;
+                }
+                vci.image = img.Handle();
+                vci.format = ToVk(format);
+                if (desc.layerCount)
+                {
+                    vci.viewType = desc.layerCount > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    vci.subresourceRange = { Aspect(format), 0, 1, desc.layer, desc.layerCount };
+                }
+                else
+                {
+                    vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : d.kind == ImageKind::Image3D ? VK_IMAGE_VIEW_TYPE_3D
+                        : d.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    vci.subresourceRange = { Aspect(format), 0, d.levels, 0, cube ? 6 : d.layers };
+                }
+                if (desc.depthOnly)
+                    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                vci.components = { component(desc.swizzle[0]), component(desc.swizzle[1]), component(desc.swizzle[2]), component(desc.swizzle[3]) };
+                VkImageView view;
+                if (vkCreateImageView(m_c->device, &vci, nullptr, &view) != VK_SUCCESS)
+                    return nullptr;
+                return std::make_unique<VkImageViewObject>(*m_c, view);
+            }
+
+            bool SupportsImage(const ImageDesc& desc) const override
+            {
+                const bool cube = desc.kind == ImageKind::Cube;
+                const bool store = desc.storeFormat != Format::Undefined;
+                // (The image's format list is Vulkan 1.2.)
+                if (store && m_c->props.apiVersion < VK_API_VERSION_1_2)
+                    return false;
+                if (store)
+                {
+                    VkFormatProperties fp;
+                    vkGetPhysicalDeviceFormatProperties(m_c->physical, ToVk(desc.storeFormat), &fp);
+                    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+                        return false;
+                }
+                VkImageFormatProperties props;
+                if (vkGetPhysicalDeviceImageFormatProperties(m_c->physical, ToVk(desc.format), VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                        ToVk(ImageUsage(desc.usage)),
+                        (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+                            (store ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT : 0),
+                        &props) != VK_SUCCESS)
+                    return false;
+                return !cube || props.maxArrayLayers >= 6;
+            }
+
+            uint32_t FormatFeatures(Format format) const override
+            {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(m_c->physical, ToVk(format), &fp);
+                return ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) ? kFormatBlend : 0) |
+                    ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ? kFormatStorage : 0);
+            }
+
+            void GetMemoryUsage(uint64_t& used, uint64_t& budget) const override
+            {
+                used = budget = 0;
+                if (!m_c->memoryBudget)
+                    return;
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT info{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+                VkPhysicalDeviceMemoryProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &info };
+                vkGetPhysicalDeviceMemoryProperties2(m_c->physical, &props);
+                for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++)
+                    if (props.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    {
+                        used += info.heapUsage[h];
+                        budget += info.heapBudget[h];
+                    }
+            }
+
+            ImageMemoryStats GetImageMemoryStats() const override { return m_c->imageMemory->Stats(); }
 
             std::unique_ptr<Sampler> CreateSampler(const SamplerDesc& desc) override
             {
                 auto filter = [](Filter f) { return f == Filter::Nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR; };
                 auto address = [](AddressMode a) {
                     return a == AddressMode::ClampToEdge ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                        : a == AddressMode::ClampToBorder ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER
                         : a == AddressMode::MirrorRepeat ? VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT : VK_SAMPLER_ADDRESS_MODE_REPEAT;
                 };
                 VkSamplerCreateInfo ci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -1450,7 +2004,9 @@ namespace gpu::rhi::vulkan
                 ci.addressModeW = address(desc.w);
                 ci.anisotropyEnable = desc.maxAnisotropy > 1.0f ? VK_TRUE : VK_FALSE;
                 ci.maxAnisotropy = desc.maxAnisotropy;
-                ci.maxLod = VK_LOD_CLAMP_NONE;
+                ci.minLod = desc.minLod;
+                ci.maxLod = desc.maxLod >= 1000.0f ? VK_LOD_CLAMP_NONE : desc.maxLod;
+                ci.borderColor = desc.whiteBorder ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
                 VkSampler sampler;
                 Check(vkCreateSampler(m_c->device, &ci, nullptr, &sampler), "vkCreateSampler");
                 return std::make_unique<VkSamplerObject>(*m_c, sampler);
@@ -1517,12 +2073,14 @@ namespace gpu::rhi::vulkan
                 depth.front = face(desc.stencilFront);
                 depth.back = face(desc.stencilBack);
                 VkPipelineColorBlendAttachmentState attachments[4]{};
-                VkFormat colorFormats[4];
-                uint32_t colorCount = 0;
-                for (uint32_t i = 0; i < 4 && desc.colorFormats[i] != Format::Undefined; i++, colorCount++)
+                VkFormat colorFormats[4] = {};
+                constexpr uint32_t colorCount = 4;  // (see BeginRendering; a gap has no format and writes nothing)
+                for (uint32_t i = 0; i < 4; i++)
                 {
-                    const BlendAttachment& b = desc.blend[i];
                     colorFormats[i] = ToVk(desc.colorFormats[i]);
+                    if (desc.colorFormats[i] == Format::Undefined)
+                        continue;
+                    const BlendAttachment& b = desc.blend[i];
                     attachments[i].blendEnable = b.enable ? VK_TRUE : VK_FALSE;
                     attachments[i].srcColorBlendFactor = ToVk(b.srcColor);
                     attachments[i].dstColorBlendFactor = ToVk(b.dstColor);
@@ -1548,6 +2106,14 @@ namespace gpu::rhi::vulkan
                 {
                     rendering.depthAttachmentFormat = ToVk(desc.depthFormat);
                     rendering.stencilAttachmentFormat = HasDepth(desc.depthFormat) ? ToVk(desc.depthFormat) : VK_FORMAT_UNDEFINED;
+                }
+                // An experiment (NFSMW_SHADING_RATE): every draw shades once per w x h pixels.
+                VkPipelineFragmentShadingRateStateCreateInfoKHR rate{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
+                if (desc.shadingRateW)
+                {
+                    rate.fragmentSize = { desc.shadingRateW, desc.shadingRateH };
+                    rate.combinerOps[0] = rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+                    rendering.pNext = &rate;
                 }
                 VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
                 gpci.pNext = &rendering;
@@ -1602,6 +2168,23 @@ namespace gpu::rhi::vulkan
             }
             void LoadPipelineCache(const void* data, size_t size) override
             {
+                // A cache another GPU, driver or OS version made is set aside
+                // by the driver without a word (MoltenVK's device ID carries
+                // the macOS version, so every macOS update does it), and the
+                // first drive afterwards stutters while the pipelines compile
+                // again. The header says so in advance
+                // (gpu/pipeline_cache_header.h): one line for the log, and the
+                // stale data isn't handed over. The next save writes this
+                // device's header, so it's said once.
+                gpu::pipeline_cache::Maker device{ m_c->props.vendorID, m_c->props.deviceID, {} };
+                std::memcpy(device.uuid.data(), m_c->props.pipelineCacheUUID, device.uuid.size());
+                const auto check = gpu::pipeline_cache::CheckHeader(static_cast<const uint8_t*>(data), size, device);
+                if (const std::string line = gpu::pipeline_cache::LogLine(check, device); !line.empty())
+                {
+                    fprintf(stderr, "%s\n", line.c_str());
+                    data = nullptr;
+                    size = 0;
+                }
                 VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
                 ci.initialDataSize = size;
                 ci.pInitialData = data;
@@ -1839,7 +2422,24 @@ namespace gpu::rhi::vulkan
 
         // What the device offers.
         c->deviceName = props.deviceName;
+        c->props = props;
+        {
+            uint32_t extensionCount = 0;
+            vkEnumerateDeviceExtensionProperties(c->physical, nullptr, &extensionCount, nullptr);
+            std::vector<VkExtensionProperties> extensions(extensionCount);
+            vkEnumerateDeviceExtensionProperties(c->physical, nullptr, &extensionCount, extensions.data());
+            for (const VkExtensionProperties& e : extensions)
+                c->memoryBudget |= strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+        }
+        Context* raw = c.get();
+        c->imageMemory = std::make_unique<ImageMemory>(
+            c->device, [raw](uint32_t bits) { return raw->FindMemoryType(bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); }, config.onThread);
         Capabilities& caps = c->caps;
+        caps.kind = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? Capabilities::Kind::Discrete
+            : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? Capabilities::Kind::Integrated : Capabilities::Kind::Other;
+        caps.vendorId = props.vendorID;
+        caps.maxStorageBufferRange = props.limits.maxStorageBufferRange;
+        caps.maxAnisotropy = supported.samplerAnisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
         caps.backend = "Vulkan";
         caps.deviceName = c->deviceName.c_str();
         caps.unifiedMemory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;

@@ -22,6 +22,7 @@
 #include "swapchain_policy.h"
 #include "fullscreen_policy.h"
 #include <cpu/guest_thread.h>
+#include <cpu/host_cpu.h>
 #include <cpu/guest_time.h>
 #include "vblank_lock.h"
 #include "refresh_multiple.h"
@@ -1885,6 +1886,10 @@ namespace video
         deviceConfig.extensions = devExts;
         deviceConfig.features = &features;
         deviceConfig.next = dci.pNext;
+        deviceConfig.onThread = [](const char* name) {
+            SetHostThreadName(name);
+            hostcpu::LeaveReservedCore();  // started by a thread that may hold a core of its own
+        };
         s_rhi = gpu::rhi::vulkan::CreateDevice(deviceConfig);
         if (!s_rhi)
             return false;
