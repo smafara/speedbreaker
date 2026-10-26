@@ -682,3 +682,17 @@ replay on Metal).
   `FormatFeatures`. The presenter now keeps the device past `Shutdown` (the renderer's static
   objects are destroyed with the process, after it). Replay: bit-identical (world: 3x3 scale,
   scaled resolve memory, directly stored textures).
+- Slices 3-4, pipelines and recording: the renderer's compute programs (`MakeCompute`: one pushed
+  table, `RunCompute`), set 0 (`rhi::BindingSet`, per-slot sets on Windows), the texture layouts,
+  graphics pipelines (`BuildPipeline` makes a `GraphicsPipelineDesc` from SPIR-V; the key holds
+  RHI formats and topology), samplers, texture bindings (`TexBinding`: image, view, sampler), the
+  pipeline cache file (the backend checks the header), passes (`RenderingDesc`), draws, stencil,
+  clears, barriers (`MemoryBarrier`), copies, and the front image handed to the presenter as an
+  `rhi::Image` all go through the RHI. `renderer.cpp` includes no Vulkan header now. The
+  presenter gives it `RendererPolicy` (shading-rate experiment, occlusion counting, Intel
+  defaults) instead of `VulkanContext`. A `general` image's Transition from a used state is a
+  global memory barrier (the presenter's reads of the renderer's front image rely on it). A
+  draw that culls both faces is skipped (the RHI has no both-faces cull). Not built here
+  (Windows only): the `_WIN32` branches (black check, slot sets, depth-clear map) were converted
+  by hand. Replay and post checks bit-identical, also with occlusion, GPU timing and pass
+  profiling on.

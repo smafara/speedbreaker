@@ -128,7 +128,6 @@ namespace video
             std::unique_ptr<gpu::rhi::Fence> done;  // its submission finished (starts signalled)
             std::unique_ptr<gpu::rhi::Buffer> staging;  // the CPU path's frame, on its way to s_source
             uint64_t stagingSize = 0;
-            std::unique_ptr<gpu::rhi::Image> source;  // the frame's input to post-processing (wraps the renderer's or s_source)
             bool timed = false;                       // wrote its post-processing timestamps
             upscale::Pass pass = upscale::Pass::Bicubic;  // the pass it drew with (NFSMW_UPSCALE_AB)
         } s_frames[FRAMES_IN_FLIGHT];
@@ -153,6 +152,7 @@ namespace video
         std::mutex* s_queueMutexPtr = &s_noQueueMutex;
         VulkanContext s_context{};
         bool s_contextReady = false;
+        RendererPolicy s_policy;
         uint32_t s_frameIndex = 0;
 
         // The source image the front buffer is copied into before scaling.
@@ -167,14 +167,14 @@ namespace video
         bool s_pendingNew = false;
         // Or a GPU image from the renderer (VK_IMAGE_LAYOUT_GENERAL, written by
         // an earlier queue submission).
-        VkImage s_pendingImage = VK_NULL_HANDLE;
+        gpu::rhi::Image* s_pendingImage = nullptr;
         int64_t s_pendingVblank = 0;  // the guest vblank the frame followed
         float s_pendingShift = 0.0f;  // shown that much of a vblank early (game/hfr.h: a step's own picture drawn between)
         int64_t s_pendingTarget = 0;  // when to show it (game/hfr.h on a grid that isn't a multiple of 60 Hz; 0: the usual way)
         // An in-between picture (game/hfr.h: drawn between two world steps,
         // presented before the real picture of the later one) from the
         // renderer, with its fraction of the step; shown before s_pending*.
-        VkImage s_betweenImage = VK_NULL_HANDLE;
+        gpu::rhi::Image* s_betweenImage = nullptr;
         uint32_t s_betweenWidth = 0, s_betweenHeight = 0, s_betweenAspectW = 0, s_betweenAspectH = 0;
         int64_t s_betweenVblank = 0;  // the guest vblank before it
         float s_betweenT = 0.0f;
@@ -189,7 +189,7 @@ namespace video
         // The last frame shown, drawn again under the UI while the game
         // presents nothing new (null image: the CPU path's, in s_source).
         // Main thread, under s_frontUseMutex.
-        VkImage s_lastImage = VK_NULL_HANDLE;
+        gpu::rhi::Image* s_lastImage = nullptr;
         uint32_t s_lastWidth = 0, s_lastHeight = 0, s_lastAspectW = 0, s_lastAspectH = 0;
         // Held from taking the renderer's image until the frame using it is
         // submitted, so ReleaseFrontImage can make it safe to destroy.
@@ -1924,6 +1924,12 @@ namespace video
 #ifdef _WIN32
         s_context.integratedGpuDefaults = integratedGpuDefaults;
 #endif
+        s_policy.shadingRateW = rateW;
+        s_policy.shadingRateH = rateH;
+        s_policy.occlusionCounting = occlusionCounting;
+#ifdef _WIN32
+        s_policy.integratedGpuDefaults = integratedGpuDefaults;
+#endif
         s_contextReady = true;
         s_settingsGeneration = settings::Generation();
         fprintf(stderr, "[video] %s, swapchain %ux%u%s\n", props.deviceName, s_swapExtent.width, s_swapExtent.height, GeometryNote().c_str());
@@ -2021,23 +2027,23 @@ namespace video
         }
     }
 
-    void ReleaseFrontImage(VkImage image)
+    void ReleaseFrontImage(gpu::rhi::Image* image)
     {
         std::lock_guard use(s_frontUseMutex);
         std::lock_guard lock(s_pendingMutex);
         if (s_pendingImage == image)
         {
-            s_pendingImage = VK_NULL_HANDLE;
+            s_pendingImage = nullptr;
             s_pendingNew = !s_pending.empty();
         }
         if (s_betweenImage == image)
         {
-            s_betweenImage = VK_NULL_HANDLE;
+            s_betweenImage = nullptr;
             s_betweenNew = false;
         }
         if (s_lastImage == image)
         {
-            s_lastImage = VK_NULL_HANDLE;
+            s_lastImage = nullptr;
             s_lastWidth = s_lastHeight = 0;
         }
     }
@@ -2744,7 +2750,7 @@ namespace video
         std::unique_lock frontLock(s_frontUseMutex);
         std::vector<uint32_t> pixels;
         uint32_t w = 0, h = 0, aspectW = 0, aspectH = 0;
-        VkImage gpuImage = VK_NULL_HANDLE;
+        gpu::rhi::Image* gpuImage = nullptr;
         int64_t frameVblank = 0;
         float frameBetween = 0.0f;  // an in-between picture: its fraction of the step
         float frameShift = 0.0f;    // a real picture shown that much of a vblank early (a step's own picture drawn between)
@@ -2755,7 +2761,7 @@ namespace video
             if (s_betweenNew)
             {
                 gpuImage = s_betweenImage;
-                s_betweenImage = VK_NULL_HANDLE;
+                s_betweenImage = nullptr;
                 w = s_betweenWidth;
                 h = s_betweenHeight;
                 aspectW = s_betweenAspectW;
@@ -2769,7 +2775,7 @@ namespace video
             {
                 pixels.swap(s_pending);
                 gpuImage = s_pendingImage;
-                s_pendingImage = VK_NULL_HANDLE;
+                s_pendingImage = nullptr;
                 w = s_pendingWidth;
                 h = s_pendingHeight;
                 aspectW = s_pendingAspectW;
@@ -2781,7 +2787,7 @@ namespace video
             }
         }
         const bool upload = !pixels.empty();
-        s_lastFreshImage = gpuImage != VK_NULL_HANDLE;  // this frame is new (not a redraw)
+        s_lastFreshImage = gpuImage != nullptr;  // this frame is new (not a redraw)
         if (!upload && !s_lastFreshImage)
             frameVblank = 0;
         if (upload || gpuImage)
@@ -2886,7 +2892,6 @@ namespace video
             }
             f.timed = false;
         }
-        f.source.reset();  // the last use of this frame slot has finished
         const gpu::rhi::SurfaceStatus acquire = s_swapchain->Acquire(s_acquired);
         // Either is for the next frame's CheckSwapchain, which runs before
         // its acquire (one decision a frame: the policy counts in frames).
@@ -2922,10 +2927,8 @@ namespace video
         gpu::rhi::State sourceState = gpu::rhi::State::CopySrc;
         if (gpuImage)
         {
-            f.source = gpu::rhi::vulkan::WrapImage(*s_rhi, gpuImage, gpu::rhi::Format::RGBA8, w, h,
-                gpu::rhi::kImageSampled | gpu::rhi::kImageCopySrc);
-            source = f.source.get();
-            sourceState = gpu::rhi::State::ShaderWrite;
+            source = gpuImage;
+            sourceState = gpu::rhi::State::General;
         }
         else if (haveSource)
         {
@@ -3308,7 +3311,7 @@ namespace video
         return true;
     }
 
-    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth, uint32_t aspectHeight, float between,
+    void SubmitFrontImage(gpu::rhi::Image* image, uint32_t width, uint32_t height, uint32_t aspectWidth, uint32_t aspectHeight, float between,
         float shift, int64_t target)
     {
         if (between != 0.0f)
@@ -3472,6 +3475,11 @@ namespace video
     const VulkanContext* GetVulkan()
     {
         return s_contextReady ? &s_context : nullptr;
+    }
+
+    const RendererPolicy& GetRendererPolicy()
+    {
+        return s_policy;
     }
 
     gpu::rhi::Device* GetRhi()

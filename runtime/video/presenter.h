@@ -12,7 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
-namespace gpu::rhi { class Device; }
+namespace gpu::rhi { class Device; class Image; }
 
 namespace video
 {
@@ -40,7 +40,7 @@ namespace video
     // `target`: when to show it (steady ns; game/hfr.h on a display whose
     // rate isn't a whole multiple of 60 Hz: the refresh it was drawn for; 0:
     // the usual way).
-    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth = 0, uint32_t aspectHeight = 0,
+    void SubmitFrontImage(gpu::rhi::Image* image, uint32_t width, uint32_t height, uint32_t aspectWidth = 0, uint32_t aspectHeight = 0,
         float between = 0.0f, float shift = 0.0f, int64_t target = 0);
 
     // Any thread: a display at a rate that isn't a whole multiple of 60 Hz
@@ -104,7 +104,7 @@ namespace video
     // Any thread: `image` (given to SubmitFrontImage) is about to be
     // destroyed. Returns once the presenter holds no reference it could still
     // record; the caller then waits for the GPU (WaitGpuIdle) and destroys it.
-    void ReleaseFrontImage(VkImage image);
+    void ReleaseFrontImage(gpu::rhi::Image* image);
 
     // Main thread: handle window events and present the latest front buffer.
     // Returns false when the user closes the window.
@@ -142,6 +142,20 @@ namespace video
         bool integratedGpuDefaults = false;
 #endif
     };
+
+    // What the presenter decided for the renderer, whatever the backend.
+    struct RendererPolicy
+    {
+        // NFSMW_SHADING_RATE=<w>x<h> (an experiment): the game's draws shade once per w x h pixels. 0x0: off or unsupported.
+        uint32_t shadingRateW = 0, shadingRateH = 0;
+        // NFSMW_OCCLUSION=1 on a device with precise occlusion queries: the game's occlusion queries are counted on the GPU.
+        bool occlusionCounting = false;
+#ifdef _WIN32
+        // Windows on an Intel integrated GPU: the defaults measured on one (presenter.cpp, IntegratedGpuDefaults).
+        bool integratedGpuDefaults = false;
+#endif
+    };
+    const RendererPolicy& GetRendererPolicy();
 
     // nullptr when running headless.
     const VulkanContext* GetVulkan();

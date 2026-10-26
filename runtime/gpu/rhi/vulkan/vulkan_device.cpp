@@ -895,6 +895,7 @@ namespace gpu::rhi::vulkan
             void Transition(const ImageTransition* images, size_t imageCount, const BufferTransition* buffers, size_t bufferCount) override
             {
                 VkPipelineStageFlags srcStages = 0, dstStages = 0;
+                bool generalBarrier = false;
                 std::vector<VkBufferMemoryBarrier> bufferBarriers;
                 for (size_t i = 0; i < bufferCount; i++)
                 {
@@ -916,8 +917,15 @@ namespace gpu::rhi::vulkan
                 for (size_t i = 0; i < imageCount; i++)
                 {
                     auto* image = static_cast<VkImageObject*>(images[i].image);
-                    if (image->Desc().general && images[i].before == State::General)
-                        continue;  // (a general image only ever leaves Undefined)
+                    if (image->Desc().general && images[i].before != State::Undefined)
+                    {
+                        // A general image changes no layout; this is the dependency its
+                        // users ask for (another submission's writes -> this list's work).
+                        srcStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                        dstStages |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                        generalBarrier = true;
+                        continue;
+                    }
                     VkPipelineStageFlags s, d;
                     VkAccessFlags sa, da;
                     VkImageLayout from, to;
@@ -935,9 +943,11 @@ namespace gpu::rhi::vulkan
                     b.subresourceRange = { Aspect(image->Desc().format), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
                     imageBarriers.push_back(b);
                 }
-                if (!bufferBarriers.empty() || !imageBarriers.empty())
-                    vkCmdPipelineBarrier(m_cmd, srcStages, dstStages, 0, 0, nullptr, uint32_t(bufferBarriers.size()), bufferBarriers.data(),
-                        uint32_t(imageBarriers.size()), imageBarriers.data());
+                VkMemoryBarrier memory{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+                if (generalBarrier || !bufferBarriers.empty() || !imageBarriers.empty())
+                    vkCmdPipelineBarrier(m_cmd, srcStages, dstStages, 0, generalBarrier ? 1 : 0, &memory, uint32_t(bufferBarriers.size()),
+                        bufferBarriers.data(), uint32_t(imageBarriers.size()), imageBarriers.data());
             }
             void MemoryBarrier(Barrier kind) override
             {
