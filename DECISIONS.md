@@ -99,6 +99,21 @@ CP findings (2026-10-26):
 - Cheap first step: hash the ring bytes per frame, run a scene twice, see where the input
   diverges (same hook point).
 
+### D8-D10. RHI shape (2026-10-26, chosen by the user from three options each)
+Refines D3. D8, dispatch: abstract classes (`rhi::Device`, `CommandList`, `Buffer`, `Image`,
+`Pipeline`, ...) implemented by each backend and chosen at runtime, so Vulkan stays
+selectable and both can be compared in one binary; the cost is a virtual call per command
+(~7k draws a frame: well under 0.1 ms). Rejected: opaque handles with a function table,
+compile-time backend. D9, barriers: resource states (the renderer says what a resource is
+about to be used as: RenderTarget, ShaderRead, CopySrc, CopyDst, ...); the Vulkan backend
+maps a state to layout + stage + access, Metal needs little (it tracks hazards) and emits
+fences only where required. Rejected: Vulkan-style stage/access/layout barriers in the RHI,
+automatic barrier inference (maybe later). D10, bindings: a declared binding table (each
+pipeline declares its binding slots, the command list sets resources at slots); Vulkan
+implements it with push descriptors / descriptor sets, Metal with argument table slots.
+Rejected: descriptor sets and pools as RHI objects, bindless (needs shader translator
+changes, deferred by D4).
+
 ## Findings from the survey (2026-10-25)
 
 Vulkan footprint (approximate counts of `Vk*`/`vk*`/`VK_*` references):
@@ -345,3 +360,9 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   window size and settings (AA, scaling): re-record if they change. Two replays of `world`
   give byte-identical presented pictures; a flipped byte in the baseline fails the check.
   The whole check (both captures, 7 pictures each) takes ~2 s with warm pipeline caches.
+- 2026-10-26: D8-D10 chosen (see above). Presenter refactor order: (1) device layer
+  (`rhi::Device`, replacing `VulkanContext` leakage), (2) `Swapchain` + present timing,
+  (3) post passes against the RHI, (4) slim `RunFrame`. Gate for each: `scripts/replay/
+  replay_check.sh` (frames + presented picture) before every commit. Next: draft the RHI
+  headers (`gpu/rhi/`) from what `renderer.cpp` and `presenter.cpp` actually use, for review
+  before implementing.
