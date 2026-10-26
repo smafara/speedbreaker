@@ -273,45 +273,64 @@ namespace gpu::renderer
         constexpr VkDeviceSize kSharedPart = 128ull << 20;
         constexpr uint32_t kSharedPartBinding = 13;
         bool s_splitMemory = false;
-        VkDescriptorBufferInfo s_sharedInfo[4]{};  // the binding(s): [0] alone, or the four parts
 
-        void SetSharedInfo()
+        // The binding(s) of guest memory: [0] alone, or the four parts.
+        rhi::BufferBinding SharedBinding(uint32_t k)
         {
-            for (uint32_t k = 0; k < 4; k++)
-                s_sharedInfo[k] = s_splitMemory ? VkDescriptorBufferInfo{ s_shared, k * kSharedPart, kSharedPart }
-                                                : VkDescriptorBufferInfo{ s_shared, 0, kSharedSize };
+            return s_splitMemory ? rhi::BufferBinding{ s_sharedBuffer.get(), k * kSharedPart, kSharedPart }
+                                 : rhi::BufferBinding{ s_sharedBuffer.get(), 0, kSharedSize };
         }
 
-        // A layout's bindings, plus (split) guest memory's other three
-        // parts: copies of its binding `shared`.
-        std::vector<VkDescriptorSetLayoutBinding> WithSharedParts(const VkDescriptorSetLayoutBinding* b, uint32_t count,
-            uint32_t shared = 0)
+        // A layout's slots, plus (split) guest memory's other three parts:
+        // copies of its slot `shared` (by position).
+        std::vector<rhi::BindingSlot> WithSharedParts(std::vector<rhi::BindingSlot> slots, size_t shared = 0)
         {
-            std::vector<VkDescriptorSetLayoutBinding> out(b, b + count);
+            const rhi::BindingSlot guest = slots[shared];
             for (uint32_t k = 0; s_splitMemory && k < 3; k++)
             {
-                out.push_back(b[shared]);
-                out.back().binding = kSharedPartBinding + k;
+                slots.push_back(guest);
+                slots.back().index = kSharedPartBinding + k;
             }
-            return out;
+            return slots;
         }
 
-        // Appends the writes for guest memory's other three parts (split
-        // only) after `count` writes; returns the new count. `w` has room
-        // for 3 more.
-        uint32_t AddSharedParts(VkWriteDescriptorSet* w, uint32_t count, VkDescriptorSet set = VK_NULL_HANDLE)
+        rhi::BindingEntry BufferEntry(uint32_t slot, rhi::Buffer* buffer, uint64_t offset = 0, uint64_t size = ~0ull)
         {
+            rhi::BindingEntry e;
+            e.slot = slot;
+            e.buffer = { buffer, offset, size };
+            return e;
+        }
+
+        rhi::BindingEntry ImageEntry(uint32_t slot, rhi::Image* image, const rhi::ImageView* view = nullptr, rhi::Sampler* sampler = nullptr)
+        {
+            rhi::BindingEntry e;
+            e.slot = slot;
+            e.image = { image, sampler, view };
+            return e;
+        }
+
+        // Guest memory's entry at slot 0, then (split only) its other three
+        // parts, appended to `e`.
+        void AddShared(std::vector<rhi::BindingEntry>& e)
+        {
+            rhi::BindingEntry guest;
+            guest.slot = 0;
+            guest.buffer = SharedBinding(0);
+            e.push_back(guest);
             for (uint32_t k = 1; s_splitMemory && k < 4; k++)
-                w[count++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, kSharedPartBinding + k - 1, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[k], nullptr };
-            return count;
+            {
+                guest.slot = kSharedPartBinding + k - 1;
+                guest.buffer = SharedBinding(k);
+                e.push_back(guest);
+            }
         }
 
         // A stand-in storage buffer for a binding a shader won't read this
         // time (no scaled memory): guest memory, as much as one binding takes.
-        VkDescriptorBufferInfo DummyStorage(VkBuffer buffer)
+        rhi::BufferBinding DummyStorage(rhi::Buffer* buffer)
         {
-            return { buffer ? buffer : s_shared, 0, buffer || !s_splitMemory ? VK_WHOLE_SIZE : kSharedPart };
+            return { buffer ? buffer : s_sharedBuffer.get(), 0, buffer || !s_splitMemory ? ~0ull : kSharedPart };
         }
         // Discrete GPUs whose CPU-mapped VRAM holds it, and drivers that can't
         // import the guest's memory (amdgpu imports only anonymous memory, and
@@ -390,6 +409,13 @@ namespace gpu::renderer
             img.bytes = img.rhi->Bytes();
             return img;
         }
+
+        // A compute shader and the layout it runs against: one pushed table.
+        struct ComputeProgram
+        {
+            std::unique_ptr<rhi::BindingLayout> layout;
+            std::unique_ptr<rhi::Pipeline> pipeline;
+        };
 
         // The RHI's name for a format of the renderer's (the formats it makes images in).
         rhi::Format FromVk(VkFormat f)
@@ -827,9 +853,7 @@ namespace gpu::renderer
             std::unique_ptr<rhi::Buffer> bufferRhi;
             VkBuffer buffer = VK_NULL_HANDLE;
             const volatile uint32_t* host = nullptr;
-            VkPipeline pipeline = VK_NULL_HANDLE;
-            VkPipelineLayout layout = VK_NULL_HANDLE;
-            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            ComputeProgram program;
             std::chrono::steady_clock::time_point start;
             uint32_t next = 0;  // command processor
             uint64_t drawsAt = 0, resolvesAt = 0;  // command processor: at the last present
@@ -1091,33 +1115,17 @@ namespace gpu::renderer
         BarrierCounts s_barrierCounts{};
 
         // Everything before -> everything after. Outside rendering only.
+        // The list being recorded (after Begin).
+        rhi::CommandList& Cmd() { return *s_submissions[s_slot].list; }
+
         void FullBarrier()
         {
-            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 1, &mb, 0, nullptr, 0, nullptr);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::Full);
             s_vertexPending.clear();
             s_vertexPendingLo = UINT32_MAX;
             s_vertexPendingHi = 0;
             s_vertexPendingTextures.clear();
             s_narrowPassEnds = 0;
-        }
-
-        // `src` stages' work (and, in Vulkan, everything logically earlier)
-        // -> every stage after but the vertex ones: on MoltenVK nothing waits
-        // before a vertex stage. Outside rendering only.
-        void NarrowBarrier(VkPipelineStageFlags src, VkAccessFlags srcAccess)
-        {
-            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-            mb.srcAccessMask = srcAccess;
-            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            vkCmdPipelineBarrier(s_cmd, src,
-                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 1, &mb, 0, nullptr, 0, nullptr);
         }
 
         // At a pass's end. Its attachment writes go before what reads or
@@ -1138,9 +1146,7 @@ namespace gpu::renderer
             }
             s_narrowPassEnds++;
             s_barrierCounts.passEnds++;
-            NarrowBarrier(VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::NarrowAfterPass);
         }
 
         // After a 1x resolve's dispatch, which wrote guest memory [base, base
@@ -1153,7 +1159,7 @@ namespace gpu::renderer
             if (s_passBarrier < 2)
                 return FullBarrier();
             s_barrierCounts.resolves++;
-            NarrowBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::NarrowAfterCompute);
             if (texture && std::find(s_vertexPendingTextures.begin(), s_vertexPendingTextures.end(), texture) == s_vertexPendingTextures.end())
                 s_vertexPendingTextures.push_back(texture);
             if (!size)
@@ -1179,26 +1185,14 @@ namespace gpu::renderer
         // dispatch: its shader writes before everything after.
         void ComputeBarrier()
         {
-            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 1, &mb, 0, nullptr, 0, nullptr);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::Compute);
         }
 
-        void ToGeneral(VkImage image, VkImageAspectFlags aspect, uint32_t layers)
+        // A new image's first use: Undefined -> General (contents dropped).
+        void ToGeneral(Image& image)
         {
-            VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            b.srcAccessMask = 0;
-            b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = image;
-            b.subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, layers };
-            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &b);
+            rhi::ImageTransition t{ image.rhi.get(), rhi::State::Undefined, rhi::State::General };
+            Cmd().Transition(&t, 1);
         }
 
         // After a resolve or a texture upload, as every 128 draws: submit to a
@@ -1252,9 +1246,9 @@ namespace gpu::renderer
             TranslatedShader info;         // immutable once loaded
             std::mutex compileMutex;
             bool vertexCompiled = false;
-            VkShaderModule module = VK_NULL_HANDLE;  // VS
-            // PS variants by (colour outputs, interpolator inputs, alpha test).
-            std::unordered_map<uint32_t, VkShaderModule> variants;
+            std::vector<uint32_t> spirv;  // VS
+            // PS variants by (colour outputs, interpolator inputs, alpha test); empty: failed.
+            std::unordered_map<uint32_t, std::vector<uint32_t>> variants;
         };
         std::unordered_map<uint64_t, std::unique_ptr<Shader>> s_shaders;
         Shader* s_vs = nullptr;
@@ -1466,9 +1460,8 @@ namespace gpu::renderer
             return spirv;
         }
 
-        // Vulkan pipeline cache, persisted as GetCachePath()/pipelines.bin.
+        // The device's pipeline cache, persisted as GetCachePath()/pipelines.bin.
         // Saved every 600 frames when new pipelines appeared, and at exit.
-        VkPipelineCache s_pipelineCache = VK_NULL_HANDLE;
         uint32_t s_pipelinesAtSave = 0;
 
         void CreatePipelineCache()
@@ -1488,38 +1481,8 @@ namespace gpu::renderer
                     }
                     fclose(f);
                 }
-            // A cache another GPU, driver or OS version made is set aside by
-            // the driver without a word (MoltenVK's device ID carries the
-            // macOS version, so every macOS update does it), and the first
-            // drive afterwards stutters while the pipelines compile again.
-            // The header says so in advance (gpu/pipeline_cache_header.h): one
-            // line for the log, and the stale data isn't handed over. The
-            // next save writes this device's header, so it's said once. No
-            // toast: it isn't something to act on, it would come after every
-            // SteamOS and macOS update, and the stutter is a frame or two at
-            // the first world entry (a first run with no cache at all has
-            // more, and says nothing either).
-            {
-                VkPhysicalDeviceProperties props;
-                vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-                gpu::pipeline_cache::Maker device{ props.vendorID, props.deviceID, {} };
-                std::memcpy(device.uuid.data(), props.pipelineCacheUUID, device.uuid.size());
-                const auto check = gpu::pipeline_cache::CheckHeader(data.data(), data.size(), device);
-                if (const std::string line = gpu::pipeline_cache::LogLine(check, device); !line.empty())
-                {
-                    fprintf(stderr, "%s\n", line.c_str());
-                    data.clear();
-                }
-            }
-            VkPipelineCacheCreateInfo pcci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
-            pcci.initialDataSize = data.size();
-            pcci.pInitialData = data.empty() ? nullptr : data.data();
-            if (vkCreatePipelineCache(s_dev, &pcci, nullptr, &s_pipelineCache) != VK_SUCCESS)
-            {
-                pcci.initialDataSize = 0;
-                pcci.pInitialData = nullptr;
-                Check(vkCreatePipelineCache(s_dev, &pcci, nullptr, &s_pipelineCache), "vkCreatePipelineCache");
-            }
+            // (The device sets aside a cache another GPU, driver or OS made.)
+            s_rhi->LoadPipelineCache(data.data(), data.size());
             fprintf(stderr, "[renderer] pipeline cache: %zu KB loaded\n", data.size() / 1024);
         }
 
@@ -1528,30 +1491,20 @@ namespace gpu::renderer
 
         void SavePipelineCache()
         {
-            if (!s_pipelineCache || !s_shaderCacheEnabled)
+            if (!s_shaderCacheEnabled)
                 return;
             std::lock_guard saveLock(s_pipelineSaveMutex);
-            // Workers may add pipelines between the two calls (VK_INCOMPLETE).
-            size_t size = 0;
-            std::vector<uint8_t> data;
-            for (int attempt = 0;; attempt++)
-            {
-                if (vkGetPipelineCacheData(s_dev, s_pipelineCache, &size, nullptr) != VK_SUCCESS || size == 0)
-                    return;
-                data.resize(size);
-                VkResult r = vkGetPipelineCacheData(s_dev, s_pipelineCache, &size, data.data());
-                if (r == VK_SUCCESS)
-                    break;
-                if (r != VK_INCOMPLETE || attempt == 3)
-                    return;
-            }
+            // (Workers may add pipelines meanwhile; the device returns what it has.)
+            const std::vector<uint8_t> data = s_rhi->SavePipelineCache();
+            if (data.empty())
+                return;
             std::error_code ec;
             std::filesystem::create_directories(GetCachePath(), ec);
             std::filesystem::path file = GetCachePath() / "pipelines.bin", temp = file;
             temp += ".tmp";
             if (FILE* f = fopen(temp.string().c_str(), "wb"))
             {
-                bool ok = fwrite(data.data(), 1, size, f) == size;
+                bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
                 ok = fclose(f) == 0 && ok;
                 if (ok)
                     std::filesystem::rename(temp, file, ec);
@@ -1560,36 +1513,25 @@ namespace gpu::renderer
             }
         }
 
-        VkShaderModule CreateModule(const std::vector<uint32_t>& spirv)
-        {
-            VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-            smci.codeSize = spirv.size() * 4;
-            smci.pCode = spirv.data();
-            VkShaderModule module;
-            Check(vkCreateShaderModule(s_dev, &smci, nullptr, &module), "vkCreateShaderModule");
-            return module;
-        }
-
-        // A pixel shader variant: colour outputs only for bound attachments
-        // (Metal rejects others), inputs only for interpolators the vertex
-        // shader writes, and the alpha test compiled in only when enabled.
-        VkShaderModule VertexModule(Shader& vs)
+        // The vertex shader's SPIR-V, compiled when a pipeline first needs it.
+        const std::vector<uint32_t>& VertexSpirv(Shader& vs)
         {
             std::lock_guard lock(vs.compileMutex);
             if (!vs.vertexCompiled)
             {
                 vs.vertexCompiled = true;
                 std::string log;
-                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log);
-                if (spirv.empty())
+                vs.spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log);
+                if (vs.spirv.empty())
                     fprintf(stderr, "[renderer] vs_%016llx: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, log.c_str());
-                else
-                    vs.module = CreateModule(spirv);
             }
-            return vs.module;
+            return vs.spirv;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        // A pixel shader variant: colour outputs only for bound attachments
+        // (Metal rejects others), inputs only for interpolators the vertex
+        // shader writes, and the alpha test compiled in only when enabled.
+        const std::vector<uint32_t>& PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
         {
             uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
             std::lock_guard lock(ps.compileMutex);
@@ -1607,23 +1549,18 @@ namespace gpu::renderer
                 preamble += "#define ALPHA_TEST\n";
             std::string log;
             auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
-            VkShaderModule module = VK_NULL_HANDLE;
             if (spirv.empty())
                 fprintf(stderr, "[renderer] ps_%016llx (variant %x): GLSL compile failed:\n%s\n",
                     (unsigned long long)ps.hash, key, log.c_str());
-            else
-                module = CreateModule(spirv);
-            ps.variants[key] = module;
-            return module;
+            return ps.variants[key] = std::move(spirv);
         }
 
         // ---------------------------------------------------------------
         // Layouts: set 0 = shared memory + constants (one static set),
         // set 1 = the textures a shader pair uses (push descriptors).
 
-        VkDescriptorSetLayout s_set0Layout = VK_NULL_HANDLE;
-        VkDescriptorPool s_descriptorPool = VK_NULL_HANDLE;
-        VkDescriptorSet s_set0 = VK_NULL_HANDLE;
+        std::unique_ptr<rhi::BindingLayout> s_set0Layout;  // table 0 alone: what s_set0 is made against
+        std::unique_ptr<rhi::BindingSet> s_set0;
 #ifdef _WIN32
         // Intel's Windows driver (UHD 620, 101.2135) reads zeros through a
         // dynamic uniform or storage buffer descriptor wherever the dynamic
@@ -1639,11 +1576,10 @@ namespace gpu::renderer
         // MB). Elsewhere one set, as before. NFSMW_SLOT_SETS=0 binds the one
         // set instead (to see whether a newer driver still has the bug:
         // NFSMW_BLACK_CHECK=1 counts the black frames it brings back).
-        VkDescriptorPool s_slotDescriptorPool = VK_NULL_HANDLE;
-        VkDescriptorSet s_slotSet0[kSlots] = {};
+        std::unique_ptr<rhi::BindingSet> s_slotSet0[kSlots];
         bool s_slotSets = true;
 #endif
-        VkSampler s_sampler = VK_NULL_HANDLE;
+        std::unique_ptr<rhi::Sampler> s_sampler;
         Image s_dummy[3];  // 2D, 3D, cube: until the texture cache (M4)
         Image s_dummyStorage;  // R32_UINT 1x1: a resolve's texture binding when it stores into none
 
@@ -1657,10 +1593,76 @@ namespace gpu::renderer
         };
         static_assert(sizeof(DrawConstants) == 112);
 
+        // Set 0's table: guest memory (and, split, its other parts), the draw
+        // constants (a dynamic uniform buffer of the ring) and the ring.
+        rhi::BindingTableDesc Set0Table()
+        {
+            const uint8_t stages = rhi::ShaderStage::Vertex | rhi::ShaderStage::Fragment;
+            rhi::BindingTableDesc table;
+            table.slots = WithSharedParts({ { 0, rhi::BindingKind::StorageBuffer, stages }, { 1, rhi::BindingKind::UniformBufferDynamic, stages },
+                { 2, rhi::BindingKind::StorageBuffer, stages } });
+            return table;
+        }
+
+        ComputeProgram MakeCompute(const char* glsl, std::vector<rhi::BindingSlot> slots, uint32_t pushSize, const char* preamble = "")
+        {
+            std::string log;
+            auto spirv = CompileGlsl(glsl, GLSLANG_STAGE_COMPUTE, log, preamble);
+            if (spirv.empty())
+            {
+                fprintf(stderr, "[renderer] compute shader failed:\n%s\n", log.c_str());
+                abort();
+            }
+            ComputeProgram program;
+            rhi::BindingLayoutDesc desc;
+            for (rhi::BindingSlot& slot : slots)
+                slot.stages = uint8_t(rhi::ShaderStage::Compute);
+            desc.tables.push_back({ std::move(slots), true });
+            desc.pushConstantBytes = pushSize;
+            program.layout = s_rhi->CreateBindingLayout(desc);
+            rhi::ComputePipelineDesc pd;
+            pd.code = { spirv.data(), spirv.size() };
+            pd.layout = program.layout.get();
+            program.pipeline = s_rhi->CreateComputePipeline(pd);
+            if (!program.pipeline)
+            {
+                fprintf(stderr, "[renderer] compute pipeline failed\n");
+                abort();
+            }
+            return program;
+        }
+
+        // Binds `program` with `entries` pushed and its constants, and dispatches
+        // (`dispatch` false: the experiments that skip the work).
+        void RunCompute(const ComputeProgram& program, const std::vector<rhi::BindingEntry>& entries, const void* constants,
+            uint32_t constantBytes, uint32_t x, uint32_t y, bool dispatch = true)
+        {
+            rhi::CommandList& cmd = Cmd();
+            s_stateEpoch++;
+            cmd.SetPipeline(*program.pipeline);
+            cmd.PushBindings(*program.layout, 0, entries.data(), entries.size());
+            cmd.PushConstants(*program.layout, constants, constantBytes);
+            if (dispatch)
+                cmd.Dispatch(x, y, 1);
+        }
+
+        // The ring's bytes at `offset` into `image` (a texture upload): level, layer or z slice.
+        void CopyRingToImage(Image& image, VkDeviceSize offset, uint32_t rowTexels, uint32_t level, uint32_t layer, uint32_t z, uint32_t w, uint32_t h)
+        {
+            rhi::BufferImageCopy copy;
+            copy.bufferOffset = offset;
+            copy.bufferRowLength = rowTexels;
+            copy.level = level;
+            copy.layer = layer;
+            copy.region = { 0, 0, w, h };
+            copy.z = z;
+            Cmd().CopyBufferToImage(*s_ringBuffer, *image.rhi, &copy, 1);
+        }
+
+        // Table 0 is set 0, table 1 the textures a shader pair uses (pushed).
         struct TextureLayout
         {
-            VkDescriptorSetLayout set = VK_NULL_HANDLE;
-            VkPipelineLayout pipeline = VK_NULL_HANDLE;
+            std::unique_ptr<rhi::BindingLayout> layout;
             std::array<uint32_t, 3> vsMasks{}, psMasks{};
         };
         std::map<std::array<uint32_t, 6>, std::unique_ptr<TextureLayout>> s_textureLayouts;
@@ -1690,28 +1692,21 @@ namespace gpu::renderer
             slot = std::make_unique<TextureLayout>();
             slot->vsMasks = v;
             slot->psMasks = p;
-            std::vector<VkDescriptorSetLayoutBinding> bindings;
+            rhi::BindingLayoutDesc desc;
+            desc.tables.push_back(Set0Table());
+            rhi::BindingTableDesc textures;
+            textures.pushed = true;
             for (uint32_t d = 0; d < 3; d++)
                 for (uint32_t n = 0; n < 32; n++)
                 {
-                    VkShaderStageFlags stages = ((v[d] >> n) & 1 ? VK_SHADER_STAGE_VERTEX_BIT : 0) |
-                        ((p[d] >> n) & 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : 0);
+                    const uint8_t stages = uint8_t(((v[d] >> n) & 1 ? uint8_t(rhi::ShaderStage::Vertex) : 0) |
+                        ((p[d] >> n) & 1 ? uint8_t(rhi::ShaderStage::Fragment) : 0));
                     if (stages)
-                        bindings.push_back({ d * 32 + n, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stages, nullptr });
+                        textures.slots.push_back({ d * 32 + n, rhi::BindingKind::CombinedImageSampler, stages, nullptr });
                 }
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dslci.bindingCount = uint32_t(bindings.size());
-            dslci.pBindings = bindings.data();
-            Check(vkCreateDescriptorSetLayout(s_dev, &dslci, nullptr, &slot->set), "vkCreateDescriptorSetLayout(textures)");
-            VkDescriptorSetLayout sets[] = { s_set0Layout, slot->set };
-            VkPushConstantRange range{ VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(DrawConstants) };
-            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci.setLayoutCount = 2;
-            plci.pSetLayouts = sets;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges = &range;
-            Check(vkCreatePipelineLayout(s_dev, &plci, nullptr, &slot->pipeline), "vkCreatePipelineLayout");
+            desc.tables.push_back(std::move(textures));
+            desc.pushConstantBytes = sizeof(DrawConstants);
+            slot->layout = s_rhi->CreateBindingLayout(desc);
             return *slot;
         }
 
@@ -2080,8 +2075,7 @@ namespace gpu::renderer
             // New EDRAM contents: zero.
             EndPass();
             Begin();
-            ToGeneral(rt->image.image, aspect, 1);
-            VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
+            ToGeneral(rt->image);
             if (depth)
             {
                 VkClearDepthStencilValue v{ 0.0f, 0 };
@@ -2093,13 +2087,10 @@ namespace gpu::renderer
                         pitch, v.depth, v.stencil);
                 }
 #endif
-                vkCmdClearDepthStencilImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+                Cmd().ClearImage(*rt->image.rhi, rhi::ClearDepthStencil{ v.depth, uint8_t(v.stencil) });
             }
             else
-            {
-                VkClearColorValue v{};
-                vkCmdClearColorImage(s_cmd, rt->image.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
-            }
+                Cmd().ClearImage(*rt->image.rhi, rhi::ClearColor{});
             FullBarrier();
 
             fprintf(stderr, "[renderer] EDRAM target: base %u %s format %u pitch %u -> %ux%u%s\n",
@@ -2510,9 +2501,9 @@ namespace gpu::renderer
         struct PipelineKey
         {
             uint64_t vs, ps;
-            uint32_t topology, restart;
-            uint32_t colorFormats[4];
-            uint32_t depthFormat;
+            uint32_t topology, restart;  // rhi::Topology
+            uint32_t colorFormats[4];    // rhi::Format (0: not attached)
+            uint32_t depthFormat;        // rhi::Format
             uint32_t blend[4];       // RB_BLENDCONTROL, or ~0u when blending is off
             uint32_t colorMask;      // 4 bits per target
             uint32_t depthControl;   // RB_DEPTHCONTROL (0 without a depth target, or one attached for the pass only)
@@ -2535,171 +2526,117 @@ namespace gpu::renderer
                 return size_t(h);
             }
         };
-        std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> s_pipelines;
+        std::unordered_map<PipelineKey, std::unique_ptr<rhi::Pipeline>, PipelineKeyHash> s_pipelines;
 
-        VkBlendFactor BlendFactor(uint32_t f)
+        rhi::BlendFactor BlendFactor(uint32_t f)
         {
             switch (f)
             {
-            case 0: return VK_BLEND_FACTOR_ZERO;
-            case 1: return VK_BLEND_FACTOR_ONE;
-            case 4: return VK_BLEND_FACTOR_SRC_COLOR;
-            case 5: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-            case 6: return VK_BLEND_FACTOR_SRC_ALPHA;
-            case 7: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-            case 8: return VK_BLEND_FACTOR_DST_COLOR;
-            case 9: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-            case 10: return VK_BLEND_FACTOR_DST_ALPHA;
-            case 11: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
-            case 12: return VK_BLEND_FACTOR_CONSTANT_COLOR;
-            case 13: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
-            case 14: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
-            case 15: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
-            case 16: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
-            default: return VK_BLEND_FACTOR_ONE;
+            case 0: return rhi::BlendFactor::Zero;
+            case 1: return rhi::BlendFactor::One;
+            case 4: return rhi::BlendFactor::SrcColor;
+            case 5: return rhi::BlendFactor::OneMinusSrcColor;
+            case 6: return rhi::BlendFactor::SrcAlpha;
+            case 7: return rhi::BlendFactor::OneMinusSrcAlpha;
+            case 8: return rhi::BlendFactor::DstColor;
+            case 9: return rhi::BlendFactor::OneMinusDstColor;
+            case 10: return rhi::BlendFactor::DstAlpha;
+            case 11: return rhi::BlendFactor::OneMinusDstAlpha;
+            case 12: return rhi::BlendFactor::ConstantColor;
+            case 13: return rhi::BlendFactor::OneMinusConstantColor;
+            case 14: return rhi::BlendFactor::ConstantAlpha;
+            case 15: return rhi::BlendFactor::OneMinusConstantAlpha;
+            case 16: return rhi::BlendFactor::SrcAlphaSaturate;
+            default: return rhi::BlendFactor::One;
             }
         }
 
-        VkBlendOp BlendOp(uint32_t op)
+        rhi::BlendOp BlendOp(uint32_t op)
         {
             switch (op)
             {
-            case 1: return VK_BLEND_OP_SUBTRACT;
-            case 2: return VK_BLEND_OP_MIN;
-            case 3: return VK_BLEND_OP_MAX;
-            case 4: return VK_BLEND_OP_REVERSE_SUBTRACT;
-            default: return VK_BLEND_OP_ADD;
+            case 1: return rhi::BlendOp::Subtract;
+            case 2: return rhi::BlendOp::Min;
+            case 3: return rhi::BlendOp::Max;
+            case 4: return rhi::BlendOp::ReverseSubtract;
+            default: return rhi::BlendOp::Add;
             }
         }
 
         // Compiles the pipeline for `key` (and the SPIR-V it needs). Runs on a
         // pipeline worker: touches only its arguments, the shaders' own
         // locked modules and the (internally synchronized) pipeline cache.
-        VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout, Shader& vs, Shader& ps)
+        std::unique_ptr<rhi::Pipeline> BuildPipeline(const PipelineKey& key, const rhi::BindingLayout& layout, Shader& vs, Shader& ps)
         {
-            VkShaderModule vsModule = VertexModule(vs);
-            if (!vsModule)
-                return VK_NULL_HANDLE;
-            VkPipelineShaderStageCreateInfo stages[2]{};
-            stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
-                vsModule, "main", nullptr };
+            const std::vector<uint32_t>& vsSpirv = VertexSpirv(vs);
+            if (vsSpirv.empty())
+                return nullptr;
             uint32_t outputs = 0;
             for (int i = 0; i < 4; i++)
                 if (key.colorFormats[i] != 0)
                     outputs |= 1u << i;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
-            if (!psModule)
-                return VK_NULL_HANDLE;
-            stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
-                psModule, "main", nullptr };
+            const std::vector<uint32_t>& psSpirv = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+            if (psSpirv.empty())
+                return nullptr;
 
-            VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
-            VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
-            ia.topology = VkPrimitiveTopology(key.topology);
-            ia.primitiveRestartEnable = key.restart;
-            VkPipelineViewportStateCreateInfo vp{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
-            vp.viewportCount = 1;
-            vp.scissorCount = 1;
-
-            VkPipelineRasterizationStateCreateInfo rs{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
-            rs.depthClampEnable = (key.raster >> 3) & 1;
-            rs.polygonMode = VK_POLYGON_MODE_FILL;
-            rs.cullMode = key.raster & 3;
-            rs.frontFace = (key.raster >> 2) & 1 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-            rs.depthBiasEnable = (key.raster >> 4) & 1;
-            rs.lineWidth = 1.0f;
-
-            VkPipelineMultisampleStateCreateInfo ms{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-            VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+            rhi::GraphicsPipelineDesc d;
+            d.vertex = { vsSpirv.data(), vsSpirv.size() };
+            d.fragment = { psSpirv.data(), psSpirv.size() };
+            d.layout = &layout;
+            d.topology = rhi::Topology(key.topology);
+            d.primitiveRestart = key.restart;
+            d.depthClamp = (key.raster >> 3) & 1;
+            d.cull = (key.raster & 3) == 1 ? rhi::CullMode::Front : (key.raster & 3) == 2 ? rhi::CullMode::Back : rhi::CullMode::None;
+            d.frontCounterClockwise = !((key.raster >> 2) & 1);
+            d.depthBias = (key.raster >> 4) & 1;
+            d.depthFormat = rhi::Format(key.depthFormat);
             if (key.depthFormat != 0)
             {
                 reg::RB_DEPTHCONTROL dc{};
                 dc.value = key.depthControl;
-                dss.depthTestEnable = dc.z_enable;
-                dss.depthWriteEnable = dc.z_enable && dc.z_write_enable;
-                dss.depthCompareOp = VkCompareOp(dc.zfunc);
-                dss.stencilTestEnable = dc.stencil_enable;
-                dss.front = { VkStencilOp(dc.stencilfail), VkStencilOp(dc.stencilzpass), VkStencilOp(dc.stencilzfail),
-                    VkCompareOp(dc.stencilfunc), 0xFF, 0xFF, 0 };
+                d.depthTest = dc.z_enable;
+                d.depthWrite = dc.z_enable && dc.z_write_enable;
+                d.depthCompare = rhi::CompareOp(dc.zfunc);  // (the Xenos functions are numbered as the RHI's)
+                d.stencilTest = dc.stencil_enable;
+                d.stencilFront = { rhi::StencilOp(dc.stencilfail), rhi::StencilOp(dc.stencilzpass), rhi::StencilOp(dc.stencilzfail),
+                    rhi::CompareOp(dc.stencilfunc) };
                 if (dc.backface_enable)
-                    dss.back = { VkStencilOp(dc.stencilfail_bf), VkStencilOp(dc.stencilzpass_bf), VkStencilOp(dc.stencilzfail_bf),
-                        VkCompareOp(dc.stencilfunc_bf), 0xFF, 0xFF, 0 };
+                    d.stencilBack = { rhi::StencilOp(dc.stencilfail_bf), rhi::StencilOp(dc.stencilzpass_bf), rhi::StencilOp(dc.stencilzfail_bf),
+                        rhi::CompareOp(dc.stencilfunc_bf) };
                 else
-                    dss.back = dss.front;
+                    d.stencilBack = d.stencilFront;
             }
-
-            VkPipelineColorBlendAttachmentState att[4]{};
-            VkFormat formats[4];
             for (int i = 0; i < 4; i++)
             {
-                formats[i] = VkFormat(key.colorFormats[i]);
+                d.colorFormats[i] = rhi::Format(key.colorFormats[i]);
                 if (key.colorFormats[i] == 0)
+                {
+                    d.blend[i].writeMask = 0;
                     continue;
-                att[i].colorWriteMask = (key.colorMask >> (4 * i)) & 0xF;
+                }
+                d.blend[i].writeMask = uint8_t((key.colorMask >> (4 * i)) & 0xF);
                 if (key.blend[i] != ~0u)
                 {
                     reg::RB_BLENDCONTROL bc{};
                     bc.value = key.blend[i];
-                    att[i].blendEnable = VK_TRUE;
-                    att[i].srcColorBlendFactor = BlendFactor(uint32_t(bc.color_srcblend));
-                    att[i].dstColorBlendFactor = BlendFactor(uint32_t(bc.color_destblend));
-                    att[i].colorBlendOp = BlendOp(uint32_t(bc.color_comb_fcn));
-                    att[i].srcAlphaBlendFactor = BlendFactor(uint32_t(bc.alpha_srcblend));
-                    att[i].dstAlphaBlendFactor = BlendFactor(uint32_t(bc.alpha_destblend));
-                    att[i].alphaBlendOp = BlendOp(uint32_t(bc.alpha_comb_fcn));
+                    d.blend[i].enable = true;
+                    d.blend[i].srcColor = BlendFactor(uint32_t(bc.color_srcblend));
+                    d.blend[i].dstColor = BlendFactor(uint32_t(bc.color_destblend));
+                    d.blend[i].colorOp = BlendOp(uint32_t(bc.color_comb_fcn));
+                    d.blend[i].srcAlpha = BlendFactor(uint32_t(bc.alpha_srcblend));
+                    d.blend[i].dstAlpha = BlendFactor(uint32_t(bc.alpha_destblend));
+                    d.blend[i].alphaOp = BlendOp(uint32_t(bc.alpha_comb_fcn));
                 }
             }
-            VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-            cb.attachmentCount = 4;
-            cb.pAttachments = att;
-
-            VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-                VK_DYNAMIC_STATE_DEPTH_BIAS };
-            VkPipelineDynamicStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            ds.dynamicStateCount = uint32_t(std::size(dyn));
-            ds.pDynamicStates = dyn;
-
-            VkPipelineRenderingCreateInfoKHR rci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR };
-            rci.colorAttachmentCount = 4;
-            rci.pColorAttachmentFormats = formats;
-            rci.depthAttachmentFormat = VkFormat(key.depthFormat);
-            rci.stencilAttachmentFormat = VkFormat(key.depthFormat);
             // NFSMW_SHADING_RATE (an experiment, video/presenter.h): every draw
             // shades once per w x h pixels.
-            VkPipelineFragmentShadingRateStateCreateInfoKHR rate{ VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR };
-            if (s_vk->shadingRateW)
-            {
-                rate.fragmentSize = { s_vk->shadingRateW, s_vk->shadingRateH };
-                rate.combinerOps[0] = rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
-                rci.pNext = &rate;
-            }
-
-            VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-            gpci.pNext = &rci;
-            gpci.stageCount = 2;
-            gpci.pStages = stages;
-            gpci.pVertexInputState = &vi;
-            gpci.pInputAssemblyState = &ia;
-            gpci.pViewportState = &vp;
-            gpci.pRasterizationState = &rs;
-            gpci.pMultisampleState = &ms;
-            gpci.pDepthStencilState = &dss;
-            gpci.pColorBlendState = &cb;
-            gpci.pDynamicState = &ds;
-            gpci.layout = layout;
-            VkPipeline pipeline = VK_NULL_HANDLE;
-            VkResult r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
-            if (r != VK_SUCCESS)
-            {
-                fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx failed: %d\n",
-                    (unsigned long long)key.vs, (unsigned long long)key.ps, int(r));
-                pipeline = VK_NULL_HANDLE;
-            }
+            d.shadingRateW = s_vk->shadingRateW;
+            d.shadingRateH = s_vk->shadingRateH;
+            std::unique_ptr<rhi::Pipeline> pipeline = s_rhi->CreateGraphicsPipeline(d);
+            if (!pipeline)
+                fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx failed\n", (unsigned long long)key.vs, (unsigned long long)key.ps);
             return pipeline;
         }
 
@@ -2722,7 +2659,7 @@ namespace gpu::renderer
             std::mutex mutex;
             std::condition_variable cv;
             bool done = false;
-            VkPipeline pipeline = VK_NULL_HANDLE;
+            std::unique_ptr<rhi::Pipeline> pipeline;
             std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
             double createMs = 0;
             uint64_t queuedFrame = 0;
@@ -2771,21 +2708,21 @@ namespace gpu::renderer
             }
         }
 
-        // The pipeline for `key`; VK_NULL_HANDLE with `pending` set while a
-        // worker still compiles it (the caller skips the draw).
-        VkPipeline GetPipeline(const PipelineKey& key, VkPipelineLayout layout, bool& pending)
+        // The pipeline for `key`; nullptr with `pending` set while a worker
+        // still compiles it (the caller skips the draw).
+        const rhi::Pipeline* GetPipeline(const PipelineKey& key, const rhi::BindingLayout& layout, bool& pending)
         {
             pending = false;
             static PipelineKey lastKey{};
-            static VkPipeline lastPipeline = VK_NULL_HANDLE;
-            if (lastPipeline != VK_NULL_HANDLE && key == lastKey)
+            static const rhi::Pipeline* lastPipeline = nullptr;
+            if (lastPipeline && key == lastKey)
                 return lastPipeline;
             auto it = s_pipelines.find(key);
             if (it != s_pipelines.end())
             {
                 lastKey = key;
-                lastPipeline = it->second;
-                return it->second;
+                lastPipeline = it->second.get();
+                return lastPipeline;
             }
             std::shared_ptr<PendingPipeline> job;
             if (auto p = s_pendingPipelines.find(key); p != s_pendingPipelines.end())
@@ -2798,15 +2735,15 @@ namespace gpu::renderer
                 s_pendingPipelines[key] = job;
                 Shader* vs = s_shaders[key.vs].get();
                 Shader* ps = s_shaders[key.ps].get();
-                auto build = [job, key, layout, vs, ps] {
+                auto build = [job, key, layout = &layout, vs, ps] {
                     auto start = std::chrono::steady_clock::now();
-                    VkPipeline pipeline = BuildPipeline(key, layout, *vs, *ps);
+                    std::unique_ptr<rhi::Pipeline> pipeline = BuildPipeline(key, *layout, *vs, *ps);
                     // Progress for the hang watchdog: a cold cache's compiles
                     // can hold a frame for 20 s on a slow driver (Windows).
                     report::g_pipelinesBuilt.fetch_add(1, std::memory_order_relaxed);
                     {
                         std::lock_guard lock(job->mutex);
-                        job->pipeline = pipeline;
+                        job->pipeline = std::move(pipeline);
                         job->createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
                         job->done = true;
                     }
@@ -2856,7 +2793,7 @@ namespace gpu::renderer
                     {
                         pending = true;
                         s_pipelineSkips++;
-                        return VK_NULL_HANDLE;
+                        return nullptr;
                     }
                 }
             }
@@ -2866,9 +2803,10 @@ namespace gpu::renderer
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->queued).count(),
                     (unsigned long long)(s_frame - job->queuedFrame));
             s_stats.pipelines++;
-            s_pipelines[key] = job->pipeline;
+            const rhi::Pipeline* pipeline = job->pipeline.get();
+            s_pipelines[key] = std::move(job->pipeline);
             s_pendingPipelines.erase(key);
-            return job->pipeline;
+            return pipeline;
         }
 
         // ---------------------------------------------------------------
@@ -3609,18 +3547,14 @@ void main()
 }
 )";
 
-        VkPipeline s_untilePipeline = VK_NULL_HANDLE;
-        VkPipelineLayout s_untileLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_untileSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_untile;
         // 1x textures stored directly (TO_IMAGE): 2D (or, NFSMW_DIRECT_CUBE, a
         // cube, a face at a time), one level, uncompressed, 32-bit texels; the
         // untile writes the image, with no staging slice and no copy after it
         // (on the Steam Frame a 1600x1600 shadow map's upload was ~0.7 ms,
         // about half of it the copy). NFSMW_UNTILE_DIRECT=0 keeps the staging
         // path.
-        VkPipeline s_untileStorePipeline = VK_NULL_HANDLE;
-        VkPipelineLayout s_untileStoreLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_untileStoreSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_untileStore;
         const bool s_untileDirect = [] { const char* v = std::getenv("NFSMW_UNTILE_DIRECT"); return !v || v[0] != '0'; }();
         // NFSMW_DIRECT_CUBE=1 (default kFewerPasses; 0: cubes take the staging path): an
         // un-mipped cube is a direct texture too, each face stored through an
@@ -3681,8 +3615,7 @@ void main()
             // direct cube (NFSMW_DIRECT_CUBE) has one per face.
             VkImageView storeViews[6] = {};
             std::unique_ptr<rhi::ImageView> storeViewsRhi[6];
-            std::unordered_map<uint32_t, VkImageView> views;  // by swizzle
-            std::unordered_map<uint32_t, std::unique_ptr<rhi::ImageView>> viewsRhi;
+            std::unordered_map<uint32_t, std::unique_ptr<rhi::ImageView>> viewsRhi;  // by swizzle
             // How the untile reads a direct 1x texture (a resolve can store
             // into it the same way, see Resolve); sliceStride: a cube's guest
             // bytes from one face to the next.
@@ -3978,7 +3911,7 @@ void main()
             t.verifyHashes = std::move(now);  // (each change reported once)
         }
 
-        std::unordered_map<uint64_t, VkSampler> s_samplers;
+        std::unordered_map<uint64_t, std::unique_ptr<rhi::Sampler>> s_samplers;
         bool s_loadMips = true;  // Settings > Video > Mipmaps, as applied (ApplyLiveSettings)
 
         // Anisotropic filtering on linearly filtered textures: 16x on a
@@ -3989,7 +3922,7 @@ void main()
         int s_autoAnisotropy = 16;      // "Auto": set in CreateSharedMemory
 
         // `maxLevel`: the texture's last mip level (0: base only).
-        VkSampler GetSampler(const xenos::xe_gpu_texture_fetch_t& f, uint32_t maxLevel)
+        rhi::Sampler* GetSampler(const xenos::xe_gpu_texture_fetch_t& f, uint32_t maxLevel)
         {
             // The setting is part of the key: a change makes new samplers,
             // while command buffers in flight keep theirs (never destroyed).
@@ -4002,29 +3935,29 @@ void main()
                 (uint64_t(maxLevel) << 24) | (uint64_t(uint8_t(anisotropy)) << 32);
             auto& slot = s_samplers[key];
             if (slot)
-                return slot;
+                return slot.get();
             auto address = [](xenos::ClampMode m) {
                 switch (m)
                 {
-                case xenos::ClampMode::kRepeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-                case xenos::ClampMode::kMirroredRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+                case xenos::ClampMode::kRepeat: return rhi::AddressMode::Repeat;
+                case xenos::ClampMode::kMirroredRepeat: return rhi::AddressMode::MirrorRepeat;
                 case xenos::ClampMode::kClampToBorder:
-                case xenos::ClampMode::kMirrorClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-                default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                case xenos::ClampMode::kMirrorClampToBorder: return rhi::AddressMode::ClampToBorder;
+                default: return rhi::AddressMode::ClampToEdge;
                 }
             };
-            VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-            sci.magFilter = f.mag_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-            sci.minFilter = f.min_filter == xenos::TextureFilter::kPoint ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-            sci.addressModeU = address(f.clamp_x);
-            sci.addressModeV = address(f.clamp_y);
-            sci.addressModeW = address(f.clamp_z);
+            rhi::SamplerDesc sd;
+            sd.mag = f.mag_filter == xenos::TextureFilter::kPoint ? rhi::Filter::Nearest : rhi::Filter::Linear;
+            sd.min = f.min_filter == xenos::TextureFilter::kPoint ? rhi::Filter::Nearest : rhi::Filter::Linear;
+            sd.u = address(f.clamp_x);
+            sd.v = address(f.clamp_y);
+            sd.w = address(f.clamp_z);
             // Mips as the fetch constant says: point or linear between
             // levels, or the base level only; its level range and bias.
-            sci.mipmapMode = f.mip_filter == xenos::TextureFilter::kLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            sd.mip = f.mip_filter == xenos::TextureFilter::kLinear ? rhi::Filter::Linear : rhi::Filter::Nearest;
             bool baseOnly = maxLevel == 0 || f.mip_filter == xenos::TextureFilter::kBaseMap;
-            sci.minLod = baseOnly ? 0.0f : float(std::min<uint32_t>(f.mip_min_level, maxLevel));
-            sci.maxLod = baseOnly ? 0.0f : float(maxLevel);
+            sd.minLod = baseOnly ? 0.0f : float(std::min<uint32_t>(f.mip_min_level, maxLevel));
+            sd.maxLod = baseOnly ? 0.0f : float(maxLevel);
             // (The fetch constant's LOD bias is applied in the shader, as
             // Xenia does: MoltenVK has no sampler LOD bias.)
             // Anisotropy (the game's: 1, 2, 4, 8 or 16:1, unless overridden)
@@ -4032,22 +3965,18 @@ void main()
             static const float gameAniso[8] = { 1, 1, 2, 4, 8, 16, 1, 1 };
             float aniso = anisotropy > 0 ? float(anisotropy) : gameAniso[uint32_t(f.aniso_filter) & 7];
             aniso = std::min(aniso, s_maxAnisotropy);
-            if (aniso > 1.0f && sci.minFilter == VK_FILTER_LINEAR)
-            {
-                sci.anisotropyEnable = VK_TRUE;
-                sci.maxAnisotropy = aniso;
-            }
-            sci.borderColor = f.border_color == xenos::BorderColor::k_ABGR_White
-                ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-            Check(vkCreateSampler(s_dev, &sci, nullptr, &slot), "vkCreateSampler");
-            return slot;
+            if (aniso > 1.0f && sd.min == rhi::Filter::Linear)
+                sd.maxAnisotropy = aniso;
+            sd.whiteBorder = f.border_color == xenos::BorderColor::k_ABGR_White;
+            slot = s_rhi->CreateSampler(sd);
+            return slot.get();
         }
 
-        VkImageView TextureView(Texture& t, uint32_t swizzle)
+        const rhi::ImageView* TextureView(Texture& t, uint32_t swizzle)
         {
-            auto& view = t.views[swizzle];
-            if (view)
-                return view;
+            auto& owned = t.viewsRhi[swizzle];
+            if (owned)
+                return owned.get();
             auto comp = [](uint32_t c) {
                 switch (c & 7)
                 {
@@ -4067,15 +3996,13 @@ void main()
             vd.swizzle[1] = comp(swizzle >> 3);
             vd.swizzle[2] = comp(swizzle >> 6);
             vd.swizzle[3] = comp(swizzle >> 9);
-            auto& owned = t.viewsRhi[swizzle];
             owned = s_rhi->CreateImageView(*t.image.rhi, vd);
             if (!owned)
             {
                 fprintf(stderr, "[renderer] a texture view couldn't be made\n");
                 abort();
             }
-            view = rhi::vulkan::NativeImageView(*owned);
-            return view;
+            return owned.get();
         }
 
         // The view for texture fetch constant `slot` sampled as 2D or as a
@@ -4094,16 +4021,26 @@ void main()
             uint64_t sig = 0;              // ScaledSignature
         };
 
+        // What a texture fetch binds: the image, its view for this fetch's
+        // swizzle (nullptr: the image's own) and a sampler.
+        struct TexBinding
+        {
+            rhi::Image* image = nullptr;
+            const rhi::ImageView* view = nullptr;
+            rhi::Sampler* sampler = nullptr;
+        };
+
         // The full lookup (GetTexture below keeps its results).
-        VkImageView LookupTexture(uint32_t slot, TexDim dim, VkSampler& sampler, TextureLookup* out)
+        TexBinding LookupTexture(uint32_t slot, TexDim dim, TextureLookup* out)
         {
             const bool cube = dim == TexDim::kCube, volume = dim == TexDim::k3D;
             xenos::xe_gpu_texture_fetch_t f;
             memcpy(&f, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6], sizeof(f));
-            sampler = s_sampler;
-            const VkImageView dummy = s_dummy[cube ? 2 : volume ? 1 : 0].view;
+            rhi::Sampler* sampler = s_sampler.get();
+            rhi::Image* const dummyImage = s_dummy[cube ? 2 : volume ? 1 : 0].rhi.get();
+            auto dummy = [&] { return TexBinding{ dummyImage, nullptr, sampler }; };
             if (f.type != xenos::FetchConstantType::kTexture)
-                return dummy;
+                return dummy();
             bool dimensionOk = cube ? f.dimension == xenos::DataDimension::kCube
                 : volume ? f.dimension == xenos::DataDimension::k3D
                 : (f.dimension == xenos::DataDimension::k2DOrStacked || f.dimension == xenos::DataDimension::k1D);
@@ -4111,7 +4048,7 @@ void main()
             {
                 LogOnce(0x2000 + uint32_t(f.dimension) + uint32_t(dim) * 8, "texture dimension %u sampled as dimension %u",
                     uint32_t(f.dimension), uint32_t(dim));
-                return dummy;
+                return dummy();
             }
             uint32_t layers = cube ? 6 : 1;
             TextureFormatInfo fi;
@@ -4119,12 +4056,12 @@ void main()
             if (!GetTextureFormat(format, fi))
             {
                 LogOnce(0x3000 + format, "texture format %u not implemented", format);
-                return dummy;
+                return dummy();
             }
             if (f.base_address == 0)
             {
                 LogOnce(0x2100, "texture without a base level (mips only)");
-                return dummy;
+                return dummy();
             }
             uint32_t width = (f.dimension == xenos::DataDimension::k1D ? f.size_1d.width
                 : volume ? f.size_3d.width : f.size_2d.width) + 1;
@@ -4361,7 +4298,7 @@ void main()
                         LoadScaledTexture(t, base, pitchAligned, uint32_t(f.endianness));
                         t.uploaded = true;
                         writewatch::Watch(base, size);  // as the 1x path: a CPU write faults and retires it
-                        return TextureView(t, f.swizzle);
+                        return TexBinding{ t.image.rhi.get(), TextureView(t, f.swizzle), sampler };
                     }
                     s_hitch.textureBytes += size + mipSize;
                     EnsureShadow(base, size);
@@ -4388,19 +4325,12 @@ void main()
                             Begin();
                             UntileConstants uc{ base + slice * sliceStride, f.tiled ? 1u : 0u, f.tiled ? pitchAligned : rowBytes, fi.bpbLog2,
                                 offX, offY, bw, bh, uint32_t(f.endianness), fi.convert, 0, 0, 0, 0 };
-                            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.storeViews[slice], VK_IMAGE_LAYOUT_GENERAL };
-                            VkWriteDescriptorSet w[5] = {
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, nullptr, nullptr },
-                            };
+                            std::vector<rhi::BindingEntry> w;
+                            AddShared(w);
+                            w.push_back(ImageEntry(1, t.image.rhi.get(), t.storeViewsRhi[slice].get()));
                             if (!t.uploaded && slice == 0)
-                                ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
-                            s_stateEpoch++;
-                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStorePipeline);
-                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
-                            vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
-                            if (!(s_exp & 4))
-                                vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
+                                ToGeneral(t.image);
+                            RunCompute(s_untileStore, w, &uc, sizeof(uc), (bw + 7) / 8, (bh + 7) / 8, !(s_exp & 4));
                             FullBarrier();
                             SubmitIfStarving();
                             continue;
@@ -4409,7 +4339,7 @@ void main()
                         if (staging == ~VkDeviceSize(0))
                         {
                             LogOnce(0x2200, "texture %ux%u format %u is too large for a staging slot", width, height, format);
-                            return dummy;
+                            return dummy();
                         }
                         EndPass();
                         Begin();
@@ -4420,29 +4350,16 @@ void main()
                             zSlice, heightAligned3D };
                         if (volume && f.tiled)
                             uc.tiled = 2;
-                        VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
-                        VkWriteDescriptorSet w[5] = {
-                            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-                        };
-                        s_stateEpoch++;
-                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                        vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                        std::vector<rhi::BindingEntry> w;
+                        AddShared(w);
+                        w.push_back(BufferEntry(1, s_ringBuffer.get(), 0, kRingSize));
                         uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? bw : rowWords;
-                        if (!(s_exp & 4))
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (bh + 7) / 8, 1);
+                        RunCompute(s_untile, w, &uc, sizeof(uc), (groupsX + 7) / 8, (bh + 7) / 8, !(s_exp & 4));
                         FullBarrier();
                         if (!t.uploaded && slice == 0)
-                            ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
-                        VkBufferImageCopy region{};
-                        region.bufferOffset = staging;
-                        region.bufferRowLength = rowTexels;
-                        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 };
-                        region.imageOffset = { 0, 0, int32_t(zSlice) };
-                        region.imageExtent = { width, height, 1 };
+                            ToGeneral(t.image);
                         if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                            vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                            CopyRingToImage(t.image, staging, rowTexels, 0, layer, zSlice, width, height);
                         FullBarrier();
                         SubmitIfStarving();
                     }
@@ -4478,25 +4395,14 @@ void main()
                                 f.tiled ? mips.PitchBlocks(storage) : mips.RowBytes(storage), fi.bpbLog2,
                                 levelOffX, levelOffY, lbw, lbh, uint32_t(f.endianness), fi.convert, uint32_t(staging / 4), levelRowWords,
                                 0, 0 };
-                            VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
-                            VkWriteDescriptorSet w[5] = {
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-                            };
-                            s_stateEpoch++;
-                            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
-                            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
-                            vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
+                            std::vector<rhi::BindingEntry> w;
+                            AddShared(w);
+                            w.push_back(BufferEntry(1, s_ringBuffer.get(), 0, kRingSize));
                             uint32_t groupsX = fi.convert != 0 || fi.bpbLog2 >= 2 ? lbw : levelRowWords;
-                            vkCmdDispatch(s_cmd, (groupsX + 7) / 8, (lbh + 7) / 8, 1);
+                            RunCompute(s_untile, w, &uc, sizeof(uc), (groupsX + 7) / 8, (lbh + 7) / 8);
                             FullBarrier();
-                            VkBufferImageCopy region{};
-                            region.bufferOffset = staging;
-                            region.bufferRowLength = levelRowTexels;
-                            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 };
-                            region.imageExtent = { lw, lh, 1 };
                             if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
-                                vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                                CopyRingToImage(t.image, staging, levelRowTexels, level, layer, 0, lw, lh);
                             FullBarrier();
                         }
                     }
@@ -4519,7 +4425,7 @@ void main()
             }
             if (out && !t.scaled)
                 out->texture = &t;
-            return TextureView(t, f.swizzle);
+            return TexBinding{ t.image.rhi.get(), TextureView(t, f.swizzle), sampler };
         }
 
         // Texture lookups kept per fetch slot and dimension. Dense scenes
@@ -4550,8 +4456,7 @@ void main()
             bool scaledCandidate = false, drawScaled = false;
             uint64_t epoch = 0;  // WriteEpoch() it was last valid at
             Texture* texture = nullptr;
-            VkImageView view = VK_NULL_HANDLE;
-            VkSampler sampler = VK_NULL_HANDLE;
+            TexBinding binding;
             uint32_t base = 0, size = 0, mipBase = 0, mipSize = 0;
             uint64_t sig = 0;
         };
@@ -4615,11 +4520,11 @@ void main()
             return s_textureCache->recent[(h * 0x9E3779B97F4A7C15ull) >> 54];
         }
 
-        VkImageView GetTexture(uint32_t slot, TexDim dim, VkSampler& sampler)
+        TexBinding GetTexture(uint32_t slot, TexDim dim)
         {
             TextureCache& c = *s_textureCache;
             if (!c.on)
-                return LookupTexture(slot, dim, sampler, nullptr);
+                return LookupTexture(slot, dim, nullptr);
             const uint32_t* fetch = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
             TextureCacheEntry& e = c.slots[uint32_t(dim)][slot & 31];
             const bool drawScaled = s_drawScaled && s_scaled.enabled;
@@ -4642,10 +4547,7 @@ void main()
                 if (s_textureVerify)
                     VerifyTexture(*e.texture, epoch);
                 if (!c.verify)
-                {
-                    sampler = e.sampler;
-                    return e.view;
-                }
+                    return e.binding;
                 // The full lookup as if this hit hadn't happened: a reload
                 // it does is one the hit would have missed, unless a page
                 // was written during the check (another thread): the full
@@ -4653,34 +4555,35 @@ void main()
                 e.texture->checkedEpoch = checked;
                 uint32_t loads = s_hitch.textures;
                 TextureLookup lookup;
-                VkImageView view = LookupTexture(slot, dim, sampler, &lookup);
+                TexBinding binding = LookupTexture(slot, dim, &lookup);
                 bool reloaded = s_hitch.textures != loads;
                 if (reloaded && writewatch::WriteEpoch() != epoch)
                 {
                     c.raced++;
                     reloaded = false;
                 }
-                if (view != e.view || sampler != e.sampler || lookup.texture != e.texture || reloaded)
+                if (binding.view != e.binding.view || binding.image != e.binding.image || binding.sampler != e.binding.sampler ||
+                    lookup.texture != e.texture || reloaded)
                 {
                     if (c.mismatches++ < 50)
                         fprintf(stderr, "[cpverify] texture slot %u dim %u: cached view %p sampler %p texture %p, full lookup %p %p %p%s "
                             "(fetch %08X %08X %08X %08X %08X %08X, epoch %llu, entry epoch %llu, scaled %d/%d)\n",
-                            slot, uint32_t(dim), (void*)e.view, (void*)e.sampler, (void*)e.texture, (void*)view, (void*)sampler,
+                            slot, uint32_t(dim), (void*)e.binding.view, (void*)e.binding.sampler, (void*)e.texture, (void*)binding.view, (void*)binding.sampler,
                             (void*)lookup.texture, reloaded ? ", reloaded" : "", fetch[0], fetch[1], fetch[2], fetch[3],
                             fetch[4], fetch[5], (unsigned long long)epoch, (unsigned long long)e.epoch, int(e.scaledCandidate), int(drawScaled));
                     e.generation = 0;
                     RecentTextureEntry(fetch, dim).generation = 0;
                 }
-                return view;
+                return binding;
             }
             c.misses++;
             TextureLookup lookup;
-            VkImageView view = LookupTexture(slot, dim, sampler, &lookup);
+            TexBinding binding = LookupTexture(slot, dim, &lookup);
             if (!lookup.texture)
             {
                 c.uncached++;
                 e.generation = 0;
-                return view;
+                return binding;
             }
             memcpy(e.fetch, fetch, sizeof(e.fetch));
             e.generation = c.generation;
@@ -4689,30 +4592,27 @@ void main()
             e.drawScaled = drawScaled;
             e.epoch = epoch;  // read before the lookup: a write meanwhile is checked next time
             e.texture = lookup.texture;
-            e.view = view;
-            e.sampler = sampler;
+            e.binding = binding;
             e.base = lookup.base;
             e.size = lookup.size;
             e.mipBase = lookup.mipBase;
             e.mipSize = lookup.mipSize;
             e.sig = lookup.sig;
             RecentTextureEntry(fetch, dim) = e;
-            return view;
+            return binding;
         }
 
         // ---------------------------------------------------------------
         // Resolves
 
-        VkPipeline s_resolvePipeline = VK_NULL_HANDLE;
-        VkPipeline s_resolveCoalescedPipeline = VK_NULL_HANDLE;  // scaled resolves (see COALESCED in the shader)
         // The same for a source of another scale denominator ([coalesced][x][y], each den - 1, or 2 for a texel
         // axis, a den above 2: 1.5x is 3/2, a Steam Deck's native rows 10/9), made at the first resolve that needs
         // it (ResolvePipeline); [..][0][0] are the two above.
-        VkPipeline s_resolveDenPipelines[2][3][3] = {};
+        std::unique_ptr<rhi::Pipeline> s_resolveDenPipelines[2][3][3];  // [0][..][0][0]: 1x; [1]: coalesced (scaled resolves, COALESCED in the shader)
         // Sources above 1x: the same, built with SCALED_FUSE (and TEX_OFFSET),
         // whole scales too; [coalesced][x][y] as above.
-        VkPipeline s_resolveScaledPipelines[2][3][3] = {};
-        VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
+        std::unique_ptr<rhi::Pipeline> s_resolveScaledPipelines[2][3][3];
+        const rhi::Pipeline* ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
         // A coalesced group's samples fit its shared memory (64 x 16 words):
         // every scale but a texel axis's beside 4x (1x10/9 has 2 a texel,
         // 3x10/3 12).
@@ -4743,8 +4643,7 @@ void main()
             if (ScaledCoalesce(s_rhi->GetCapabilities()) && CoalescedFits(scale))
                 ResolvePipeline(true, scale);
         }
-        VkPipelineLayout s_resolveLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_resolveSetLayout = VK_NULL_HANDLE;
+        std::unique_ptr<rhi::BindingLayout> s_resolveLayout;
 
         struct ResolveConstants
         {
@@ -5948,34 +5847,30 @@ void main()
                                 fused->width, fused->height, fused->cube ? " cube" : "", rc.destBase, texX, texY);
                     }
 
-                    VkDescriptorImageInfo ii{ VK_NULL_HANDLE, source->sampleView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorImageInfo ti{ VK_NULL_HANDLE, fused ? fused->storeViews[layer] : s_dummyStorage.view, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorImageInfo hi{ VK_NULL_HANDLE, hosted ? hosted->storeView : s_dummyStorage.view, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
-                    VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
-                    VkWriteDescriptorSet w[9]{};
-                    w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
-                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr };
-                    w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1,
-                        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, nullptr, nullptr };
-                    w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1,
-                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr };
-                    w[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1,
-                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr };
-                    w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
-                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
-                    w[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 5, 0, 1,
-                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &hi, nullptr, nullptr };
-                    s_stateEpoch++;
+                    std::vector<rhi::BindingEntry> w;
+                    AddShared(w);
+                    w.push_back(ImageEntry(1, source->image.rhi.get(), source->sampleViewRhi.get()));
+                    {
+                        rhi::BufferBinding pool = DummyStorage(s_scaled.poolBuffer.get()), table = DummyStorage(s_scaled.tableBuffer.get());
+                        w.push_back(BufferEntry(2, pool.buffer, pool.offset, pool.size));
+                        w.push_back(BufferEntry(3, table.buffer, table.offset, table.size));
+                    }
+                    w.push_back(fused ? ImageEntry(4, fused->image.rhi.get(), fused->storeViewsRhi[layer].get())
+                                      : ImageEntry(4, s_dummyStorage.rhi.get()));
+                    w.push_back(hosted ? ImageEntry(5, hosted->image.rhi.get(), hosted->storeViewsRhi[0].get())
+                                       : ImageEntry(5, s_dummyStorage.rhi.get()));
                     bool coalesced = scaledWrite && s_scaled.coalesce && CoalescedFits(source->scale);  // 32x2 pixels a group
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ResolvePipeline(coalesced, source->scale));
-                    s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 6), w);
-                    vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                        source->scale.IsOne() ? s_resolvePush : uint32_t(sizeof(ResolveConstants)), &rc);
-                    uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
-                    if (!(s_exp & 2))
-                        vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
-                            coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
+                    {
+                        rhi::CommandList& cmd = Cmd();
+                        s_stateEpoch++;
+                        cmd.SetPipeline(*ResolvePipeline(coalesced, source->scale));
+                        cmd.PushBindings(*s_resolveLayout, 0, w.data(), w.size());
+                        cmd.PushConstants(*s_resolveLayout, &rc, source->scale.IsOne() ? s_resolvePush : uint32_t(sizeof(ResolveConstants)));
+                        uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
+                        if (!(s_exp & 2))
+                            cmd.Dispatch(coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
+                                coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
+                    }
                     if (scaledWrite)
                         FullBarrier();  // (above 1x: as before)
                     else
@@ -6085,37 +5980,6 @@ void main()
                 LogOnce(0x400, "color clear requested with a depth resolve source");
         }
 
-        void CreateComputePipeline(const char* glsl, const VkDescriptorSetLayoutBinding* bindings, uint32_t bindingCount,
-            uint32_t pushSize, VkDescriptorSetLayout& setLayout, VkPipelineLayout& layout, VkPipeline& pipeline,
-            const char* preamble = "")
-        {
-            std::string log;
-            auto spirv = CompileGlsl(glsl, GLSLANG_STAGE_COMPUTE, log, preamble);
-            if (spirv.empty())
-            {
-                fprintf(stderr, "[renderer] compute shader failed:\n%s\n", log.c_str());
-                abort();
-            }
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dslci.bindingCount = bindingCount;
-            dslci.pBindings = bindings;
-            Check(vkCreateDescriptorSetLayout(s_dev, &dslci, nullptr, &setLayout), "compute set layout");
-            VkPushConstantRange range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize };
-            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci.setLayoutCount = 1;
-            plci.pSetLayouts = &setLayout;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges = &range;
-            Check(vkCreatePipelineLayout(s_dev, &plci, nullptr, &layout), "compute pipeline layout");
-            VkShaderModule module = CreateModule(spirv);
-            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
-                module, "main", nullptr };
-            cpci.layout = layout;
-            Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, &pipeline), "compute pipeline");
-        }
-
         // Scaled memory's GPU side (see ScaledMemory): made on the first
         // scaled resolve.
         const char* kScaledFillGlsl = R"(#version 460
@@ -6145,9 +6009,7 @@ void main()
             s_pool[o + j * sX + i] = v;
 }
 )";
-        VkPipeline s_scaledFillPipeline = VK_NULL_HANDLE;
-        VkPipelineLayout s_scaledFillLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_scaledFillSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_scaledFill;
 
         // A scaled texture's texels from the scaled memory (the 32-bit tiled
         // layout of the guest texture, each texel's samples): stored into the
@@ -6201,12 +6063,8 @@ void main()
 #endif
 }
 )";
-        VkPipeline s_scaledUntilePipeline = VK_NULL_HANDLE;  // TO_BUFFER
-        VkPipelineLayout s_scaledUntileLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_scaledUntileSetLayout = VK_NULL_HANDLE;
-        VkPipeline s_scaledStorePipeline = VK_NULL_HANDLE;  // into the image
-        VkPipelineLayout s_scaledStoreLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_scaledStoreSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_scaledUntile;  // TO_BUFFER
+        ComputeProgram s_scaledStore;   // into the image
 
         bool CreateDeviceBuffer(VkDeviceSize size, uint32_t usage, std::unique_ptr<rhi::Buffer>& buffer, VkBuffer& handle, const char* what,
             VkDeviceSize* allocated = nullptr)
@@ -6225,6 +6083,15 @@ void main()
             if (allocated)
                 *allocated = size;
             return true;
+        }
+
+        // The scaled load's scratch buffer into the (staged) texture.
+        void CopyScratchToImage(Texture& t)
+        {
+            rhi::BufferImageCopy copy;
+            copy.bufferRowLength = t.width;
+            copy.region = { 0, 0, t.width, t.height };
+            Cmd().CopyBufferToImage(*s_scaled.scratchBuffer, *t.image.rhi, &copy, 1);
         }
 
         // Scaled-texture checks by range, redone only when something was
@@ -6397,30 +6264,21 @@ void main()
             s_scaled.hostPageGuestPages = hostPage > 4096 ? uint32_t(hostPage / 4096) : 1;
             // The pipelines take the scale in their push constants: made
             // once, kept when the memory is made again at another scale.
-            VkDescriptorSetLayoutBinding b[3] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            if (!s_scaledFillPipeline)
-            {
-                auto bindings = WithSharedParts(b, 3);
-                CreateComputePipeline(kScaledFillGlsl, bindings.data(), uint32_t(bindings.size()), 8 * sizeof(uint32_t),
-                    s_scaledFillSetLayout, s_scaledFillLayout, s_scaledFillPipeline);
-            }
+            std::vector<rhi::BindingSlot> b = { { 0, rhi::BindingKind::StorageBuffer }, { 1, rhi::BindingKind::StorageBuffer },
+                { 2, rhi::BindingKind::StorageBuffer } };
+            if (!s_scaledFill.pipeline)
+                s_scaledFill = MakeCompute(kScaledFillGlsl, WithSharedParts(b), 8 * sizeof(uint32_t));
             if (s_scaled.direct)
             {
-                b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                if (!s_scaledStorePipeline)
-                    CreateComputePipeline(kScaledUntileGlsl, b, 3, 10 * sizeof(uint32_t), s_scaledStoreSetLayout, s_scaledStoreLayout,
-                        s_scaledStorePipeline);
+                b[2].kind = rhi::BindingKind::StorageImage;
+                if (!s_scaledStore.pipeline)
+                    s_scaledStore = MakeCompute(kScaledUntileGlsl, b, 10 * sizeof(uint32_t));
             }
-            else if (!s_scaledUntilePipeline)
-                CreateComputePipeline(kScaledUntileGlsl, b, 3, 10 * sizeof(uint32_t), s_scaledUntileSetLayout, s_scaledUntileLayout,
-                    s_scaledUntilePipeline, "#define TO_BUFFER\n");
+            else if (!s_scaledUntile.pipeline)
+                s_scaledUntile = MakeCompute(kScaledUntileGlsl, b, 10 * sizeof(uint32_t), "#define TO_BUFFER\n");
             EndPass();
             Begin();
-            vkCmdFillBuffer(s_cmd, s_scaled.table, 0, VK_WHOLE_SIZE, 0);
+            Cmd().FillBuffer(*s_scaled.tableBuffer, 0, s_scaled.tableBuffer->Size(), 0);
             FullBarrier();
             s_scaled.enabled = true;
             s_textureCache->generation++;  // lookups decided without the scaled path
@@ -6461,16 +6319,11 @@ void main()
             Begin();
             s_scaled.loads++;
             s_scaled.untiledBytes += bytes;
-            VkDescriptorBufferInfo bi[3] = { { s_scaled.pool, 0, VK_WHOLE_SIZE }, { s_scaled.table, 0, VK_WHOLE_SIZE },
-                { s_scaled.scratch, 0, VK_WHOLE_SIZE } };
-            VkWriteDescriptorSet w[3];
-            for (uint32_t k = 0; k < 3; k++)
-                w[k] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    nullptr, &bi[k], nullptr };
+            std::vector<rhi::BindingEntry> w = { BufferEntry(0, s_scaled.poolBuffer.get()), BufferEntry(1, s_scaled.tableBuffer.get()),
+                BufferEntry(2, s_scaled.scratchBuffer.get()) };
             const gpu::RenderScale& sc = s_scaled.scale;
             struct { uint32_t base, pitch, width, height, endian, slotWords, scaleX, scaleY, denX, denY; } pc = { base, pitchBlocks,
                 t.width, t.height, endian, s_scaled.slotWords, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
-            s_stateEpoch++;
             if (t.storeView)
             {
                 // Straight into the image. Everything before is behind a full
@@ -6480,29 +6333,17 @@ void main()
                 // the resolves that wrote the pool, so only the stores need
                 // ordering after.
                 if (!t.uploaded)
-                    ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-                VkDescriptorImageInfo ii{ VK_NULL_HANDLE, t.storeView, VK_IMAGE_LAYOUT_GENERAL };
-                w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                    &ii, nullptr, nullptr };
-                vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStorePipeline);
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledStoreLayout, 0, 3, w);
-                vkCmdPushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+                    ToGeneral(t.image);
+                w[2] = ImageEntry(2, t.image.rhi.get(), t.storeViewsRhi[0].get());
+                RunCompute(s_scaledStore, w, &pc, sizeof(pc), (t.width + 7) / 8, (t.height + 7) / 8);
                 ComputeBarrier();
                 return;
             }
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
-            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntileLayout, 0, 3, w);
-            vkCmdPushConstants(s_cmd, s_scaledUntileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
+            RunCompute(s_scaledUntile, w, &pc, sizeof(pc), (t.width + 7) / 8, (t.height + 7) / 8);
             FullBarrier();
             if (!t.uploaded)
-                ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            VkBufferImageCopy region{};
-            region.bufferRowLength = t.width;
-            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.imageExtent = { t.width, t.height, 1 };
-            vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                ToGeneral(t.image);
+            CopyScratchToImage(t);
             FullBarrier();
         }
 
@@ -6523,19 +6364,14 @@ void main()
                 }
                 EndPass();
                 Begin();
-                VkDescriptorBufferInfo bi[3] = { s_sharedInfo[0], { s_scaled.pool, 0, VK_WHOLE_SIZE }, { s_ring, 0, kRingSize } };
-                VkWriteDescriptorSet w[6];
-                for (uint32_t k = 0; k < 3; k++)
-                    w[k] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, k, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                        nullptr, &bi[k], nullptr };
+                std::vector<rhi::BindingEntry> w;
+                AddShared(w);
+                w.push_back(BufferEntry(1, s_scaled.poolBuffer.get()));
+                w.push_back(BufferEntry(2, s_ringBuffer.get(), 0, kRingSize));
                 const gpu::RenderScale& sc = s_scaled.scale;
                 struct { uint32_t count, slotWords, listWord, pad, scaleX, scaleY, denX, denY; } pc = { count, s_scaled.slotWords,
                     uint32_t(list / 4), 0, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
-                s_stateEpoch++;
-                vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
-                vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
+                RunCompute(s_scaledFill, w, &pc, sizeof(pc), (count * 1024 + 63) / 64, 1);
                 FullBarrier();
             }
         }
@@ -6608,15 +6444,11 @@ void main()
 }
 )";
 
-        VkPipeline s_frontPipeline = VK_NULL_HANDLE;
-        VkPipelineLayout s_frontLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_frontSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_frontProgram;
         // The same for a texel axis's scale, made for that exact scale
         // (SB_FIXED_*) at its first scaled present (Steam Deck 1x10/9: the
         // divisions by the push constants were most of the front's cost).
-        VkPipeline s_frontFixedPipeline = VK_NULL_HANDLE;
-        VkPipelineLayout s_frontFixedLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout s_frontFixedSetLayout = VK_NULL_HANDLE;
+        ComputeProgram s_frontFixedProgram;
         gpu::RenderScale s_frontFixedScale;
         // The front buffer as presented: 1x, and at host resolution when the
         // scaled resolve memory has it (two images: no stall when the game
@@ -6680,11 +6512,8 @@ void main()
             }
             s_black.buffer = rhi::vulkan::NativeBuffer(*s_black.bufferRhi);
             s_black.host = static_cast<const volatile uint32_t*>(s_black.bufferRhi->Map());
-            VkDescriptorSetLayoutBinding b[2] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            CreateComputePipeline(kBlackProbeGlsl, b, 2, 3 * sizeof(uint32_t), s_black.setLayout, s_black.layout, s_black.pipeline);
+            s_black.program = MakeCompute(kBlackProbeGlsl, { { 0, rhi::BindingKind::StorageImage }, { 1, rhi::BindingKind::StorageBuffer } },
+                3 * sizeof(uint32_t));
             s_black.start = std::chrono::steady_clock::now();
             s_black.on = true;
             fprintf(stderr, "[black] NFSMW_BLACK_CHECK: every present's front image is checked; an all-zero one is logged as [black]\n");
@@ -6695,25 +6524,12 @@ void main()
         void RecordBlackProbe(const Image& front, uint32_t width, uint32_t height)
         {
             uint32_t entry = s_black.next++ % kBlackEntries;
-            vkCmdFillBuffer(s_cmd, s_black.buffer, VkDeviceSize(entry) * sizeof(uint32_t), sizeof(uint32_t), 0);
-            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
-            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorBufferInfo bi{ s_black.buffer, 0, VK_WHOLE_SIZE };
-            VkWriteDescriptorSet w[2] = {
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr },
-            };
+            Cmd().FillBuffer(*s_black.bufferRhi, VkDeviceSize(entry) * sizeof(uint32_t), sizeof(uint32_t), 0);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::Full);
+            std::vector<rhi::BindingEntry> w = { ImageEntry(0, front.rhi.get()), BufferEntry(1, s_black.bufferRhi.get()) };
             uint32_t pc[3] = { width, height, entry };
-            s_stateEpoch++;
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_black.pipeline);
-            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_black.layout, 0, 2, w);
-            vkCmdPushConstants(s_cmd, s_black.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-            vkCmdDispatch(s_cmd, (width + 7) / 8, (height + 7) / 8, 1);
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            RunCompute(s_black.program, w, pc, sizeof(pc), (width + 7) / 8, (height + 7) / 8);
+            Cmd().MemoryBarrier(rhi::CommandList::Barrier::Full);  // (the host reads the count after the fence)
             Submission& sub = s_submissions[s_slot];
             sub.blackEntry = int32_t(entry);
             sub.blackFrame = s_frame;
@@ -6728,24 +6544,17 @@ void main()
 
         void CreateUntilePipeline()
         {
-            VkDescriptorSetLayoutBinding b[2] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            auto bindings = WithSharedParts(b, 2);
-            CreateComputePipeline(kUntileGlsl, bindings.data(), uint32_t(bindings.size()), sizeof(UntileConstants), s_untileSetLayout,
-                s_untileLayout, s_untilePipeline);
-            b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings = WithSharedParts(b, 2);
-            CreateComputePipeline(kUntileGlsl, bindings.data(), uint32_t(bindings.size()), sizeof(UntileConstants), s_untileStoreSetLayout,
-                s_untileStoreLayout, s_untileStorePipeline, "#define TO_IMAGE\n");
+            const std::vector<rhi::BindingSlot> slots = WithSharedParts({ { 0, rhi::BindingKind::StorageBuffer }, { 1, rhi::BindingKind::StorageBuffer } });
+            s_untile = MakeCompute(kUntileGlsl, slots, sizeof(UntileConstants));
+            std::vector<rhi::BindingSlot> store = WithSharedParts({ { 0, rhi::BindingKind::StorageBuffer }, { 1, rhi::BindingKind::StorageImage } });
+            s_untileStore = MakeCompute(kUntileGlsl, store, sizeof(UntileConstants), "#define TO_IMAGE\n");
         }
 
         // The resolve shader for sources whose scale has these denominators
         // (1 or 2 each; the shader's SB_DEN_X, SB_DEN_Y; 0 for a texel axis,
         // SB_TEXEL_X, SB_TEXEL_Y: any den above 2, from the constants), into
         // `out`.
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool scaled = false,
+        std::unique_ptr<rhi::Pipeline> MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, bool scaled = false,
             const gpu::RenderScale* fixed = nullptr)
         {
             std::string log;
@@ -6771,16 +6580,20 @@ void main()
                 fprintf(stderr, "[renderer] resolve shader failed:\n%s\n", log.c_str());
                 abort();
             }
-            VkShaderModule module = CreateModule(spirv);
-            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
-                module, "main", nullptr };
-            cpci.layout = s_resolveLayout;
-            Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, out), "resolve pipeline");
+            rhi::ComputePipelineDesc pd;
+            pd.code = { spirv.data(), spirv.size() };
+            pd.layout = s_resolveLayout.get();
+            std::unique_ptr<rhi::Pipeline> pipeline = s_rhi->CreateComputePipeline(pd);
+            if (!pipeline)
+            {
+                fprintf(stderr, "[renderer] resolve pipeline failed\n");
+                abort();
+            }
+            return pipeline;
         }
 
         // The resolve pipeline for a source at `scale` (see s_resolveDenPipelines).
-        VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale)
+        const rhi::Pipeline* ResolvePipeline(bool coalesced, const gpu::RenderScale& scale)
         {
             // (0: a texel axis, any den above 2.)
             const uint32_t dx = scale.x.Texel() ? 0 : std::clamp(scale.x.den, 1u, 2u), dy = scale.y.Texel() ? 0 : std::clamp(scale.y.den, 1u, 2u);
@@ -6788,48 +6601,39 @@ void main()
             // A texel axis's: one for its exact scale (SB_FIXED_*), kept per
             // scale (a live change to another makes its own).
             const bool fixed = scaled && (dx == 0 || dy == 0);
-            static std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, VkPipeline> s_fixedPipelines;
-            VkPipeline& slot = fixed ? s_fixedPipelines[{ coalesced, scale.x.num, scale.x.den, scale.y.num, scale.y.den }]
+            static std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<rhi::Pipeline>> s_fixedPipelines;
+            std::unique_ptr<rhi::Pipeline>& slot = fixed ? s_fixedPipelines[{ coalesced, scale.x.num, scale.x.den, scale.y.num, scale.y.den }]
                 : (scaled ? s_resolveScaledPipelines : s_resolveDenPipelines)[coalesced][dx == 0 ? 2 : dx - 1][dy == 0 ? 2 : dy - 1];
             if (!slot)
             {
                 auto start = std::chrono::steady_clock::now();
-                MakeResolvePipeline(coalesced, dx, dy, &slot, scaled, fixed ? &scale : nullptr);
+                slot = MakeResolvePipeline(coalesced, dx, dy, scaled, fixed ? &scale : nullptr);
                 fprintf(stderr, "[renderer] resolve pipeline for scale denominators %sx%s%s%s made (%.1f ms)\n",
                     dx ? std::to_string(dx).c_str() : "texel", dy ? std::to_string(dy).c_str() : "texel", coalesced ? ", coalesced" : "",
                     scaled ? ", scaled source" : "",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
             }
-            return slot;
+            return slot.get();
         }
 
         void CreateResolvePipeline()
         {
-            VkDescriptorSetLayoutBinding b[6] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },  // scaled pool
-                { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },  // scaled page table
-                { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // a cached texture (or a dummy)
-                { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },   // a cached scaled texture (or a dummy)
-            };
-            auto bindings = WithSharedParts(b, 6);
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dslci.bindingCount = uint32_t(bindings.size());
-            dslci.pBindings = bindings.data();
-            Check(vkCreateDescriptorSetLayout(s_dev, &dslci, nullptr, &s_resolveSetLayout), "resolve set layout");
-            VkPushConstantRange range{ VK_SHADER_STAGE_COMPUTE_BIT, 0, uint32_t(sizeof(ResolveConstants)) };
-            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-            plci.setLayoutCount = 1;
-            plci.pSetLayouts = &s_resolveSetLayout;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges = &range;
-            Check(vkCreatePipelineLayout(s_dev, &plci, nullptr, &s_resolveLayout), "resolve pipeline layout");
+            using rhi::BindingKind;
+            rhi::BindingLayoutDesc desc;
+            desc.tables.push_back({ WithSharedParts({
+                { 0, BindingKind::StorageBuffer },
+                { 1, BindingKind::SampledImage },
+                { 2, BindingKind::StorageBuffer },  // scaled pool
+                { 3, BindingKind::StorageBuffer },  // scaled page table
+                { 4, BindingKind::StorageImage },   // a cached texture (or a dummy)
+                { 5, BindingKind::StorageImage },   // a cached scaled texture (or a dummy)
+            }), true });
+            for (rhi::BindingSlot& slot : desc.tables[0].slots)
+                slot.stages = uint8_t(rhi::ShaderStage::Compute);
+            desc.pushConstantBytes = uint32_t(sizeof(ResolveConstants));
+            s_resolveLayout = s_rhi->CreateBindingLayout(desc);
             for (bool coalesced : { false, true })
-                MakeResolvePipeline(coalesced, 1, 1, coalesced ? &s_resolveCoalescedPipeline : &s_resolvePipeline);
-            s_resolveDenPipelines[0][0][0] = s_resolvePipeline;
-            s_resolveDenPipelines[1][0][0] = s_resolveCoalescedPipeline;
+                s_resolveDenPipelines[coalesced][0][0] = MakeResolvePipeline(coalesced, 1, 1);
             PrewarmResolvePipelines(s_renderScale);
         }
 
@@ -6949,56 +6753,31 @@ void main()
             s_ringHost = static_cast<uint8_t*>(s_ringBuffer->Map());
         }
 
+        // Set 0's entries with the constants at `constantsOffset` of the ring.
+        std::vector<rhi::BindingEntry> Set0Entries(uint64_t constantsOffset)
+        {
+            std::vector<rhi::BindingEntry> e;
+            AddShared(e);
+            e.push_back(BufferEntry(1, s_ringBuffer.get(), constantsOffset, kConstantsSize));
+            e.push_back(BufferEntry(2, s_ringBuffer.get(), 0, kRingSize));
+            return e;
+        }
+
         void CreateSet0()
         {
-            VkDescriptorSetLayoutBinding b[3] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-                { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
-            };
-            auto bindings = WithSharedParts(b, 3);
-            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-            dslci.bindingCount = uint32_t(bindings.size());
-            dslci.pBindings = bindings.data();
-            Check(vkCreateDescriptorSetLayout(s_dev, &dslci, nullptr, &s_set0Layout), "set 0 layout");
-            VkDescriptorPoolSize sizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, s_splitMemory ? 5u : 2u },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 } };
-            VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-            dpci.maxSets = 1;
-            dpci.poolSizeCount = 2;
-            dpci.pPoolSizes = sizes;
-            Check(vkCreateDescriptorPool(s_dev, &dpci, nullptr, &s_descriptorPool), "descriptor pool");
-            VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            dsai.descriptorPool = s_descriptorPool;
-            dsai.descriptorSetCount = 1;
-            dsai.pSetLayouts = &s_set0Layout;
-            Check(vkAllocateDescriptorSets(s_dev, &dsai, &s_set0), "set 0");
-            VkDescriptorBufferInfo constants{ s_ring, 0, kConstantsSize };
-            VkDescriptorBufferInfo ring{ s_ring, 0, kRingSize };
-            VkWriteDescriptorSet w[6] = {
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_set0, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_set0, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nullptr, &constants, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_set0, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-            };
-            vkUpdateDescriptorSets(s_dev, AddSharedParts(w, 3, s_set0), w, 0, nullptr);
+            rhi::BindingLayoutDesc desc;
+            desc.tables.push_back(Set0Table());
+            s_set0Layout = s_rhi->CreateBindingLayout(desc);
+            s_set0 = s_rhi->CreateBindingSet(*s_set0Layout, 0);
+            const std::vector<rhi::BindingEntry> entries = Set0Entries(0);
+            s_set0->Update(entries.data(), entries.size());
 #ifdef _WIN32
             // (See s_slotSet0.) The same bindings, the constants at each slot.
-            VkDescriptorPoolSize slotSizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (s_splitMemory ? 5u : 2u) * kSlots },
-                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kSlots } };
-            dpci.maxSets = kSlots;
-            dpci.pPoolSizes = slotSizes;
-            Check(vkCreateDescriptorPool(s_dev, &dpci, nullptr, &s_slotDescriptorPool), "slot descriptor pool");
             for (uint32_t k = 0; k < kSlots; k++)
             {
-                dsai.descriptorPool = s_slotDescriptorPool;
-                Check(vkAllocateDescriptorSets(s_dev, &dsai, &s_slotSet0[k]), "slot set 0");
-                VkDescriptorBufferInfo slotConstants{ s_ring, VkDeviceSize(k) * kSlotSize, kConstantsSize };
-                VkWriteDescriptorSet sw[6] = {
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_slotSet0[k], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_slotSet0[k], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nullptr, &slotConstants, nullptr },
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_slotSet0[k], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
-                };
-                vkUpdateDescriptorSets(s_dev, AddSharedParts(sw, 3, s_slotSet0[k]), sw, 0, nullptr);
+                s_slotSet0[k] = s_rhi->CreateBindingSet(*s_set0Layout, 0);
+                const std::vector<rhi::BindingEntry> slot = Set0Entries(uint64_t(k) * kSlotSize);
+                s_slotSet0[k]->Update(slot.data(), slot.size());
             }
             const char* slotSets = std::getenv("NFSMW_SLOT_SETS");
             s_slotSets = !slotSets || slotSets[0] != '0';
@@ -7009,13 +6788,7 @@ void main()
 
         void CreateSamplerAndDummies()
         {
-            VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-            sci.magFilter = VK_FILTER_LINEAR;
-            sci.minFilter = VK_FILTER_LINEAR;
-            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-            sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-            sci.maxLod = VK_LOD_CLAMP_NONE;
-            Check(vkCreateSampler(s_dev, &sci, nullptr, &s_sampler), "vkCreateSampler");
+            s_sampler = s_rhi->CreateSampler({});  // (linear, repeating, all levels)
 
             const uint32_t usage = rhi::kImageSampled | rhi::kImageCopyDst;
             s_dummy[0] = CreateImage(rhi::ImageKind::Image2D, rhi::Format::RGBA8, { 1, 1, 1 }, 1, usage);
@@ -7023,14 +6796,11 @@ void main()
             s_dummy[2] = CreateImage(rhi::ImageKind::Cube, rhi::Format::RGBA8, { 1, 1, 1 }, 6, usage);
             s_dummyStorage = CreateImage(rhi::ImageKind::Image2D, rhi::Format::R32_UINT, { 1, 1, 1 }, 1, rhi::kImageStorage);
             Begin();
-            ToGeneral(s_dummyStorage.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            VkClearColorValue white{ { 1.0f, 1.0f, 1.0f, 1.0f } };
+            ToGeneral(s_dummyStorage);
             for (int i = 0; i < 3; i++)
             {
-                uint32_t layers = i == 2 ? 6 : 1;
-                ToGeneral(s_dummy[i].image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
-                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
-                vkCmdClearColorImage(s_cmd, s_dummy[i].image, VK_IMAGE_LAYOUT_GENERAL, &white, 1, &range);
+                ToGeneral(s_dummy[i]);
+                Cmd().ClearImage(*s_dummy[i].rhi, rhi::ClearColor{ { 1.0f, 1.0f, 1.0f, 1.0f } });
             }
             FullBarrier();
         }
@@ -7075,7 +6845,6 @@ void main()
                 s_scaledByStart.erase(it);
             if (t.scaled)
                 ReleaseHeldPages(&t, t.guestStart, t.guestSize);
-            t.views.clear();
             t.viewsRhi.clear();
             for (auto& view : t.storeViewsRhi)
                 view.reset();
@@ -7390,23 +7159,13 @@ void main()
         std::thread(CompletionThread).detach();
 
         CreateSharedMemory();
-        SetSharedInfo();
         CreateRing();
         CreateSet0();
         CreateSamplerAndDummies();
         CreateResolvePipeline();
         CreateUntilePipeline();
-        {
-            VkDescriptorSetLayoutBinding b[4] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            auto bindings = WithSharedParts(b, 4);
-            CreateComputePipeline(kFrontGlsl, bindings.data(), uint32_t(bindings.size()), 14 * sizeof(uint32_t), s_frontSetLayout,
-                s_frontLayout, s_frontPipeline);
-        }
+        s_frontProgram = MakeCompute(kFrontGlsl, WithSharedParts({ { 0, rhi::BindingKind::StorageBuffer }, { 1, rhi::BindingKind::StorageImage },
+            { 2, rhi::BindingKind::StorageBuffer }, { 3, rhi::BindingKind::StorageBuffer } }), 14 * sizeof(uint32_t));
 #ifdef _WIN32
         CreateBlackCheck();
 #endif
@@ -8065,7 +7824,7 @@ void main()
             key.blend[i] = ~0u;
             if (!color[i])
                 continue;
-            key.colorFormats[i] = color[i]->vkFormat;
+            key.colorFormats[i] = uint32_t(FromVk(color[i]->vkFormat));
             uint32_t bc = s_regs[blendRegs[i]] & 0x1FFF1FFF;
             // (One, Zero, Add) for both colour and alpha is "blending off".
             if (bc != 0x00010001 && color[i]->blendable && !(adoptedColor & (1u << i)))
@@ -8074,7 +7833,7 @@ void main()
         key.colorMask = writeMask;  // (none for adopted targets)
         if (depth)
         {
-            key.depthFormat = depth->vkFormat;
+            key.depthFormat = uint32_t(FromVk(depth->vkFormat));
             key.depthControl = adoptedDepth ? 0u : depthControl.value;  // adopted: no depth or stencil test or write
         }
         auto clipCntl = Reg<reg::PA_CL_CLIP_CNTL>();
@@ -8089,11 +7848,13 @@ void main()
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
 
+        if ((key.raster & 3) == 3)
+            return;  // both faces culled: nothing is drawn
         bool pipelinePending;
-        VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
+        const rhi::Pipeline* pipeline = GetPipeline(key, *layout.layout, pipelinePending);
         if (pipelinePending)
             return;  // still compiling (counted in OnSwap's log)
-        if (pipeline == VK_NULL_HANDLE)
+        if (!pipeline)
             return skip(5, "pipeline creation failed");
 
         // Textures (may upload through the ring and so flush: before the
@@ -8103,16 +7864,16 @@ void main()
             s_textureCache->settingsGeneration = settings::Generation();  // the anisotropy setting, in the samplers
             s_textureCache->generation++;
         }
-        VkDescriptorImageInfo textureInfos[96];
+        TexBinding textureInfos[96];
         for (uint32_t d = 0; d < 3; d++)
             for (uint32_t n = 0; n < 32; n++)
             {
                 if (!(((layout.vsMasks[d] | layout.psMasks[d]) >> n) & 1))
                     continue;
-                VkDescriptorImageInfo& ii = textureInfos[d * 32 + n];
-                ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
+                TexBinding& ii = textureInfos[d * 32 + n];
+                ii = { s_dummy[d].rhi.get(), nullptr, s_sampler.get() };
                 if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
-                    ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
+                    ii = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube);
             }
 
         // Vertex data the guest may reuse before the GPU runs this draw (its
@@ -9321,15 +9082,15 @@ void main()
         struct BoundState
         {
             uint64_t epoch = 0;
-            VkPipeline pipeline = VK_NULL_HANDLE;
+            const rhi::Pipeline* pipeline = nullptr;
             VkViewport viewport{};
             VkRect2D scissor{};
             uint32_t stencil[6] = {};
             float blend[4] = {}, bias[3] = {};
             uint32_t setOffset = ~0u;
-            VkPipelineLayout textureLayout = VK_NULL_HANDLE;
+            const rhi::BindingLayout* textureLayout = nullptr;
             uint32_t textureCount = ~0u;
-            VkDescriptorImageInfo textures[96];
+            TexBinding textures[96];
             DrawConstants pc{};
         };
         static BoundState bound;
@@ -9343,12 +9104,12 @@ void main()
         }
         if (fresh || bound.pipeline != pipeline)
         {
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            Cmd().SetPipeline(*pipeline);
             bound.pipeline = pipeline;
         }
         if (fresh || memcmp(&bound.viewport, &viewport, sizeof(viewport)) != 0)
         {
-            vkCmdSetViewport(s_cmd, 0, 1, &viewport);
+            Cmd().SetViewport(viewport.x, viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth);
             bound.viewport = viewport;
         }
         // The scissor and the push constants are recorded through these, so
@@ -9356,11 +9117,11 @@ void main()
         // copies (below) change both, and a stale cache would skip the next
         // draw's own scissor and clip it to a fill rectangle.
         auto setScissor = [&](const VkRect2D& r) {
-            vkCmdSetScissor(s_cmd, 0, 1, &r);
+            Cmd().SetScissor({ r.offset.x, r.offset.y, r.extent.width, r.extent.height });
             bound.scissor = r;
         };
         auto pushConstants = [&](const DrawConstants& c) {
-            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
+            Cmd().PushConstants(*layout.layout, &c, sizeof(c));
             bound.pc = c;
         };
         if (fresh || memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0)
@@ -9371,19 +9132,15 @@ void main()
             front.stencilref, back.stencilref };
         if (fresh || memcmp(bound.stencil, stencil, sizeof(stencil)) != 0)
         {
-            vkCmdSetStencilCompareMask(s_cmd, VK_STENCIL_FACE_FRONT_BIT, front.stencilmask);
-            vkCmdSetStencilCompareMask(s_cmd, VK_STENCIL_FACE_BACK_BIT, back.stencilmask);
-            vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_FRONT_BIT, front.stencilwritemask);
-            vkCmdSetStencilWriteMask(s_cmd, VK_STENCIL_FACE_BACK_BIT, back.stencilwritemask);
-            vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_FRONT_BIT, front.stencilref);
-            vkCmdSetStencilReference(s_cmd, VK_STENCIL_FACE_BACK_BIT, back.stencilref);
+            Cmd().SetStencil({ uint8_t(front.stencilref), uint8_t(front.stencilmask), uint8_t(front.stencilwritemask) },
+                { uint8_t(back.stencilref), uint8_t(back.stencilmask), uint8_t(back.stencilwritemask) });
             memcpy(bound.stencil, stencil, sizeof(stencil));
         }
         float blendConstants[4] = { RegF(XE_GPU_REG_RB_BLEND_RED), RegF(XE_GPU_REG_RB_BLEND_GREEN),
             RegF(XE_GPU_REG_RB_BLEND_BLUE), RegF(XE_GPU_REG_RB_BLEND_ALPHA) };
         if (fresh || memcmp(bound.blend, blendConstants, sizeof(blendConstants)) != 0)
         {
-            vkCmdSetBlendConstants(s_cmd, blendConstants);
+            Cmd().SetBlendConstants(blendConstants);
             memcpy(bound.blend, blendConstants, sizeof(blendConstants));
         }
         float bias[3] = { 0.0f, 0.0f, 0.0f };
@@ -9395,7 +9152,7 @@ void main()
         }
         if (fresh || memcmp(bound.bias, bias, sizeof(bias)) != 0)
         {
-            vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
+            Cmd().SetDepthBias(bias[0], bias[1], bias[2]);
             memcpy(bound.bias, bias, sizeof(bias));
         }
 
@@ -9403,50 +9160,45 @@ void main()
         // The constants' slot's set and their offset in it (see s_slotSet0).
         // `bound` keeps the whole ring offset, which names both, so a skip
         // never leaves another slot's set bound.
-        VkDescriptorSet set0 = s_slotSets ? s_slotSet0[constantsOffset / kSlotSize] : s_set0;
+        rhi::BindingSet& set0 = s_slotSets ? *s_slotSet0[constantsOffset / kSlotSize] : *s_set0;
         uint32_t dynamicOffset = uint32_t(s_slotSets ? constantsOffset % kSlotSize : constantsOffset);
         if (fresh || bound.setOffset != uint32_t(constantsOffset))
         {
-            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 0, 1, &set0, 1, &dynamicOffset);
+            Cmd().BindSet(*layout.layout, 0, set0, &dynamicOffset, 1);
             bound.setOffset = uint32_t(constantsOffset);
         }
 #else
         uint32_t dynamicOffset = uint32_t(constantsOffset);
         if (fresh || bound.setOffset != dynamicOffset)
         {
-            vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 0, 1, &s_set0, 1, &dynamicOffset);
+            Cmd().BindSet(*layout.layout, 0, *s_set0, &dynamicOffset, 1);
             bound.setOffset = dynamicOffset;
         }
 #endif
 
-        VkWriteDescriptorSet writes[96];
+        rhi::BindingEntry writes[96];
         uint32_t writeCount = 0;
         for (uint32_t d = 0; d < 3; d++)
             for (uint32_t n = 0; n < 32; n++)
             {
                 if (!(((layout.vsMasks[d] | layout.psMasks[d]) >> n) & 1))
                     continue;
-                VkWriteDescriptorSet& wds = writes[writeCount++];
-                wds = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                wds.dstBinding = d * 32 + n;
-                wds.descriptorCount = 1;
-                wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                wds.pImageInfo = &textureInfos[d * 32 + n];
+                const TexBinding& tb = textureInfos[d * 32 + n];
+                writes[writeCount++] = ImageEntry(d * 32 + n, tb.image, tb.view, tb.sampler);
             }
         if (writeCount)
         {
-            bool same = !fresh && bound.textureLayout == layout.pipeline && bound.textureCount == writeCount;
-            for (uint32_t i = 0; same && i < writeCount; i++)  // (not memcmp: the struct has padding)
-                same = bound.textures[i].sampler == writes[i].pImageInfo->sampler &&
-                    bound.textures[i].imageView == writes[i].pImageInfo->imageView &&
-                    bound.textures[i].imageLayout == writes[i].pImageInfo->imageLayout;
+            bool same = !fresh && bound.textureLayout == layout.layout.get() && bound.textureCount == writeCount;
+            for (uint32_t i = 0; same && i < writeCount; i++)
+                same = bound.textures[i].sampler == writes[i].image.sampler && bound.textures[i].view == writes[i].image.view &&
+                    bound.textures[i].image == writes[i].image.image;
             if (!same)
             {
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, writeCount, writes);
-                bound.textureLayout = layout.pipeline;
+                Cmd().PushBindings(*layout.layout, 1, writes, writeCount);
+                bound.textureLayout = layout.layout.get();
                 bound.textureCount = writeCount;
                 for (uint32_t i = 0; i < writeCount; i++)
-                    bound.textures[i] = *writes[i].pImageInfo;
+                    bound.textures[i] = { writes[i].image.image, writes[i].image.view, writes[i].image.sampler };
             }
         }
         if (fresh || memcmp(&bound.pc, &pc, sizeof(pc)) != 0)
@@ -9798,7 +9550,7 @@ void main()
             front = CreateImage(rhi::ImageKind::Image2D, rhi::Format::RGBA8, { outW, outH, 1 }, 1,
                 rhi::kImageStorage | rhi::kImageCopySrc | rhi::kImageSampled);  // sampled: presenter post-processing
             Begin();
-            ToGeneral(front.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            ToGeneral(front);
             frontW = outW;
             frontH = outH;
             fprintf(stderr, "[renderer] front image %ux%u (%s%s)\n", outW, outH, scaled ? "host resolution" : "1x", b ? ", in-between pictures" : "");
@@ -9820,39 +9572,26 @@ void main()
         EndPass();
         Begin();
         FullBarrier();  // after earlier work, including the presenter's last read
-        VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
-        VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
-        VkWriteDescriptorSet w[7] = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
-        };
-        s_stateEpoch++;
+        std::vector<rhi::BindingEntry> w;
+        AddShared(w);
+        w.push_back(ImageEntry(1, front.rhi.get()));
+        {
+            rhi::BufferBinding pool = DummyStorage(s_scaled.poolBuffer.get()), table = DummyStorage(s_scaled.tableBuffer.get());
+            w.push_back(BufferEntry(2, pool.buffer, pool.offset, pool.size));
+            w.push_back(BufferEntry(3, table.buffer, table.offset, table.size));
+        }
         const bool fixedFront = scaled && (s_scaled.scale.x.Texel() || s_scaled.scale.y.Texel());
-        if (fixedFront && !(s_frontFixedPipeline && s_frontFixedScale == s_scaled.scale))
+        if (fixedFront && !(s_frontFixedProgram.pipeline && s_frontFixedScale == s_scaled.scale))
         {
             // (A live change's old one may still be in flight: kept, not destroyed. Rare.)
-            VkDescriptorSetLayoutBinding fb[4] = {
-                { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-                { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-            };
-            auto bindings = WithSharedParts(fb, 4);
             const gpu::RenderScale& sc = s_scaled.scale;
-            CreateComputePipeline(kFrontGlsl, bindings.data(), uint32_t(bindings.size()), 14 * sizeof(uint32_t), s_frontFixedSetLayout,
-                s_frontFixedLayout, s_frontFixedPipeline,
+            s_frontFixedProgram = MakeCompute(kFrontGlsl, WithSharedParts({ { 0, rhi::BindingKind::StorageBuffer }, { 1, rhi::BindingKind::StorageImage },
+                { 2, rhi::BindingKind::StorageBuffer }, { 3, rhi::BindingKind::StorageBuffer } }), 14 * sizeof(uint32_t),
                 std::format("#define SB_FIXED_NUM_X {}u\n#define SB_FIXED_DEN_X {}u\n#define SB_FIXED_NUM_Y {}u\n#define SB_FIXED_DEN_Y {}u\n",
                     sc.x.num, sc.x.den, sc.y.num, sc.y.den).c_str());
             s_frontFixedScale = sc;
         }
-        VkPipelineLayout frontLayout = fixedFront ? s_frontFixedLayout : s_frontLayout;
-        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fixedFront ? s_frontFixedPipeline : s_frontPipeline);
-        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, frontLayout, 0, AddSharedParts(w, 4), w);
-        vkCmdPushConstants(s_cmd, frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+        RunCompute(fixedFront ? s_frontFixedProgram : s_frontProgram, w, &pc, sizeof(pc), (outW + 7) / 8, (outH + 7) / 8);
         GuardGpu(pc.base, frontBytes, false, "front buffer");
         FullBarrier();
 #ifdef _WIN32
@@ -9917,11 +9656,10 @@ void main()
         {
             Begin();
             FullBarrier();
-            VkBufferImageCopy region{};
+            rhi::BufferImageCopy region;
             region.bufferOffset = at;
-            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.imageExtent = { width, height, 1 };
-            vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+            region.region = { 0, 0, width, height };
+            Cmd().CopyImageToBuffer(*front.rhi, *s_ringBuffer, &region, 1);
             Flush();
             if (FILE* f = fopen(checkPath.c_str(), "wb"))
             {
