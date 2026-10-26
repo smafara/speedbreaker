@@ -323,3 +323,12 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   houses, HUD). Lesson for the Metal backend: anything that makes output depend on timing
   (async compiles, frame-budgeted waits) must be switchable off for comparison runs.
   Replay of this scene takes ~6 s (the intro one 0.1 s), dominated by pipeline compiles.
+- 2026-10-26: pass/fail check added: `scripts/replay/replay_check.sh [--record] [--tolerance N]
+  [--max-bad-percent P] [<capture>...]` replays each `build/captures/<name>.sbtrace` and compares
+  its frames with `build/baselines/frames/<name>/` (git-ignored; recorded now from the Vulkan
+  backend: `intro` 6 frames, `world` 6 frames); `scripts/replay/compare_frames.py` does the
+  diff (a pixel is bad when a channel differs by more than the tolerance; a frame fails above
+  the allowed percentage of bad pixels). `SB_REPLAY_ENV` passes extra environment (a backend
+  switch later). Vulkan against its own baseline: 0 bad pixels in all 12 frames. Checked that it
+  fails: one pixel changed by 16 is reported at tolerance 0 and passes at tolerance 20.
+  This is the gate for every refactor step (D5): run it before each commit.
