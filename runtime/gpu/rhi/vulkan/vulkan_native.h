@@ -60,6 +60,8 @@ namespace gpu::rhi::vulkan
     // recorded into between its Begin and End, mixed with the list's calls).
     VkImage NativeImage(const Image& image);
     VkImageView NativeView(const Image& image);
+    VkImageView NativeImageView(const ImageView& view);
+    VkBuffer NativeBuffer(const Buffer& buffer);
     VkFormat NativeFormat(const Swapchain& swapchain);
     VkCommandBuffer NativeCommandBuffer(const CommandList& list);
     // An image of someone else's (the renderer's front image, until the

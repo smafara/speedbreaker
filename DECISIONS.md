@@ -671,3 +671,14 @@ replay on Metal).
   Metal: views are `newTextureView` with a swizzle, Stream is write-combined shared memory,
   guest memory is `newBufferWithBytesNoCopy` or a copy, the barriers are no-ops. Tests:
   `SwizzledView`, `GeneralImage` and `GuestAndStream` run on both backends.
+- Slice 2, resources: the renderer's guest memory, upload ring, scaled-memory buffers, shadow-map
+  probe buffer and black-check buffer are `rhi::Buffer`s (`CreateGuestMemory`, `MemoryKind::Stream`,
+  `Device`); every image (targets, textures, dummies, front images) is an `rhi::Image` made
+  `general`, with the texture views (swizzled sampling, R32_UINT store views, the depth view) from
+  `CreateImageView`. memory_plan.h, the test hooks and the image-memory blocks left
+  `renderer.cpp` for the Vulkan backend (~700 lines). The recording still uses raw Vulkan on the
+  objects' native handles (`NativeBuffer`, `NativeImage`, `NativeView`, `NativeImageView`) until
+  slices 4-5. Capability questions go through `GetCapabilities`, `SupportsImage` and
+  `FormatFeatures`. The presenter now keeps the device past `Shutdown` (the renderer's static
+  objects are destroyed with the process, after it). Replay: bit-identical (world: 3x3 scale,
+  scaled resolve memory, directly stored textures).

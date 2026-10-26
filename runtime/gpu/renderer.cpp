@@ -257,24 +257,10 @@ namespace gpu::renderer
         // ---------------------------------------------------------------
         // Memory
 
-        VkPhysicalDeviceMemoryProperties s_memProps;
-        bool s_memoryBudget = false;  // VK_EXT_memory_budget (the [perf] line's device memory)
-
-        uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags want)
-        {
-            for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
-                if ((bits & (1u << i)) && (s_memProps.memoryTypes[i].propertyFlags & want) == want)
-                    return i;
-            for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
-                if (bits & (1u << i))
-                    return i;
-            return 0;
-        }
-
         // Guest physical memory (512 MB), imported without a copy.
         constexpr VkDeviceSize kSharedSize = 512ull << 20;
-        VkBuffer s_shared = VK_NULL_HANDLE;
-        VkDeviceMemory s_sharedMemory = VK_NULL_HANDLE;
+        std::unique_ptr<rhi::Buffer> s_sharedBuffer;
+        VkBuffer s_shared = VK_NULL_HANDLE;  // its Vulkan handle, for the recording
         uint8_t* s_sharedHost = nullptr;
         // Devices that bind less of a storage buffer than guest memory
         // (maxStorageBufferRange: 128 MB on Turnip, the Steam Frame's Adreno,
@@ -352,8 +338,8 @@ namespace gpu::renderer
         constexpr uint32_t kSlots = 12;
         constexpr VkDeviceSize kSlotSize = 16ull << 20;
         constexpr VkDeviceSize kRingSize = kSlots * kSlotSize;
+        std::unique_ptr<rhi::Buffer> s_ringBuffer;
         VkBuffer s_ring = VK_NULL_HANDLE;
-        VkDeviceMemory s_ringMemory = VK_NULL_HANDLE;
         uint8_t* s_ringHost = nullptr;
         VkDeviceSize s_ringOffset = 0;
 
@@ -361,318 +347,86 @@ namespace gpu::renderer
         // loops[8], drawInfo[4], each a vec4/uvec4.
         constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
 
-        // Image memory. Images are bound at offsets into blocks of device
-        // memory (64 MB; gpu/block_ranges.h keeps each block's free ranges),
-        // one list per memory type, instead of an allocation each. On the
-        // Deck vkAllocateMemory was most of a new texture's cost (40-220 us
-        // in scripted runs, 380 us while the kernel was moving memory out of
-        // VRAM, about 1 ms after a long free roam, where frames that streamed
-        // textures spent a median 9.5 ms making images); a range in a block
-        // is a few us. A block is allocated ahead of need, off the command
-        // processor: the nfsmw-memory thread keeps an empty spare of each
-        // memory type in use (0.1-0.2 ms a block there, unless the kernel has
-        // memory to move), so the command processor takes the spare when a
-        // block fills and the thread makes the next. Without a spare ready (the first block, or a
-        // burst that outran the thread) the command processor allocates the
-        // block itself, counted in the [perf] line. An image bigger than half
-        // a block, one the driver wants in an allocation of its own
-        // (VkMemoryDedicatedRequirements) and any image when a block can't be
-        // had keep their own allocation, as before. A block whose images all
-        // went is a spare too, freed by the thread after a few seconds unused
-        // beside another. Images are destroyed only with the GPU idle
-        // (DestroyImage), so a range can be handed out again at once.
-        // NFSMW_IMAGE_POOL=0: an allocation per image (the old path);
-        // NFSMW_IMAGE_BLOCK_MB: the block size (16-1024).
-        struct ImageBlock
-        {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            uint32_t type = 0;
-            gpu::BlockRanges ranges;
-        };
-
+        // Images (the RHI's, kept in one layout for life: ImageDesc::general),
+        // with the Vulkan handles the recording below still uses. Image memory
+        // is the device's (blocks and spares in the Vulkan backend, D14).
         struct Image
         {
+            std::unique_ptr<rhi::Image> rhi;
             VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;  // its own, or its block's
             VkImageView view = VK_NULL_HANDLE;
             VkDeviceSize bytes = 0;  // its allocation or range (the [perf] line's memory)
-            ImageBlock* block = nullptr;  // bound at `offset` in this block, if any
-            VkDeviceSize offset = 0;
         };
 
-        const bool s_imagePool = [] { const char* v = std::getenv("NFSMW_IMAGE_POOL"); return !v || v[0] != '0'; }();
-        const VkDeviceSize s_blockSize = [] {
-            const char* v = std::getenv("NFSMW_IMAGE_BLOCK_MB");
-            return VkDeviceSize(v ? std::clamp(std::atoi(v), 16, 1024) : 64) << 20;
-        }();
-        std::vector<std::unique_ptr<ImageBlock>> s_blocks;  // in use (command processor)
-        // Empty blocks by memory type, the newest last, under s_spareMutex:
-        // the one the nfsmw-memory thread keeps ready, and blocks whose images
-        // all went. Those are kept kSpareKeep (a settings change drops
-        // textures or targets and makes them again at once) and then freed
-        // down to one.
-        struct Spare
-        {
-            VkDeviceMemory memory;
-            std::chrono::steady_clock::time_point since;
-        };
-        constexpr auto kSpareKeep = std::chrono::seconds(5);
-        std::mutex s_spareMutex;
-        std::condition_variable s_spareCv;
-        std::vector<Spare> s_spares[VK_MAX_MEMORY_TYPES];
-        uint32_t s_spareWanted = 0, s_spareFailed = 0;  // memory type bits
-        // Totals for the [perf] line (command processor): images made and
-        // the time it took, vkAllocateMemory calls for them (their own or a
-        // block's) and the time those took, blocks taken from the spares,
-        // blocks the spares didn't cover; under s_spareMutex, the memory
-        // thread's: blocks it made and their time, blocks freed.
-        struct ImageTotals
-        {
-            uint64_t images = 0, imageNs = 0, allocations = 0, allocationNs = 0, fromSpare = 0, blocksHere = 0;
-            uint64_t spareBlocks = 0, spareNs = 0, blocksFreed = 0;
-        };
-        ImageTotals s_imageTotals;
-
-        uint64_t SinceNs(std::chrono::steady_clock::time_point start)
-        {
-            return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-        }
-
-        VkDeviceMemory AllocateBlock(uint32_t type)
-        {
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = s_blockSize;
-            mai.memoryTypeIndex = type;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            return vkAllocateMemory(s_dev, &mai, nullptr, &memory) == VK_SUCCESS ? memory : VK_NULL_HANDLE;
-        }
-
-        // nfsmw-memory: makes a spare when one is wanted, and frees spares
-        // beyond one once they have been empty kSpareKeep.
-        void MemoryThread()
-        {
-            SetHostThreadName("nfsmw-memory");
-            hostcpu::LeaveReservedCore();  // started by the command processor
-            std::unique_lock lock(s_spareMutex);
-            while (true)
-            {
-                auto now = std::chrono::steady_clock::now();
-                auto next = now + std::chrono::hours(1);
-                bool worked = false;
-                for (uint32_t type = 0; type < VK_MAX_MEMORY_TYPES; type++)
-                {
-                    std::vector<Spare>& spares = s_spares[type];
-                    if (spares.size() > 1 && now - spares.front().since >= kSpareKeep)
-                    {
-                        VkDeviceMemory memory = spares.front().memory;
-                        spares.erase(spares.begin());
-                        s_imageTotals.blocksFreed++;
-                        lock.unlock();
-                        vkFreeMemory(s_dev, memory, nullptr);
-                        lock.lock();
-                        worked = true;
-                        break;
-                    }
-                    if (spares.size() > 1)
-                        next = std::min(next, spares.front().since + kSpareKeep);
-                    uint32_t bit = 1u << type;
-                    if ((s_spareWanted & bit) && !(s_spareFailed & bit) && spares.empty())
-                    {
-                        lock.unlock();
-                        auto start = std::chrono::steady_clock::now();
-                        VkDeviceMemory memory = AllocateBlock(type);
-                        uint64_t ns = SinceNs(start);
-                        lock.lock();
-                        s_spareWanted &= ~bit;
-                        if (!memory)
-                        {
-                            // Left to the command processor, which tries again
-                            // (and falls back to an allocation per image).
-                            s_spareFailed |= bit;
-                            fprintf(stderr, "[renderer] image memory: no spare block of memory type %u (%llu MB)\n", type,
-                                (unsigned long long)(s_blockSize >> 20));
-                        }
-                        else
-                        {
-                            s_imageTotals.spareBlocks++;
-                            s_imageTotals.spareNs += ns;
-                            s_spares[type].push_back({ memory, std::chrono::steady_clock::now() });
-                        }
-                        worked = true;
-                        break;
-                    }
-                    if (s_spareWanted & bit)
-                        s_spareWanted &= ~bit;  // (a spare came back meanwhile, or the thread can't make one)
-                }
-                if (!worked)
-                    s_spareCv.wait_until(lock, next);
-            }
-        }
-
-        // A block of `type` for a new image: a spare (the newest; the thread
-        // makes the next when it was the last), or one allocated here.
-        ImageBlock* NewBlock(uint32_t type)
-        {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            {
-                std::lock_guard lock(s_spareMutex);
-                std::vector<Spare>& spares = s_spares[type];
-                if (!spares.empty())
-                {
-                    memory = spares.back().memory;
-                    spares.pop_back();
-                }
-                if (spares.empty())
-                    s_spareWanted |= 1u << type;
-            }
-            s_spareCv.notify_one();
-            if (memory)
-                s_imageTotals.fromSpare++;
-            else
-            {
-                auto start = std::chrono::steady_clock::now();
-                memory = AllocateBlock(type);
-                s_imageTotals.allocations++;
-                s_imageTotals.allocationNs += SinceNs(start);
-                if (!memory)
-                    return nullptr;
-                s_imageTotals.blocksHere++;
-                std::lock_guard lock(s_spareMutex);
-                s_spareFailed &= ~(1u << type);
-            }
-            s_blocks.push_back(std::make_unique<ImageBlock>(ImageBlock{ memory, type, gpu::BlockRanges(s_blockSize) }));
-            return s_blocks.back().get();
-        }
-
-        // Binds `img` into a block of `type`; false when no block can be had.
-        bool BindToBlock(Image& img, const VkMemoryRequirements& req, uint32_t type)
-        {
-            ImageBlock* block = nullptr;
-            VkDeviceSize offset = gpu::BlockRanges::kNone;
-            for (auto& b : s_blocks)
-                if (b->type == type && (offset = b->ranges.Allocate(req.size, req.alignment)) != gpu::BlockRanges::kNone)
-                {
-                    block = b.get();
-                    break;
-                }
-            if (!block)
-            {
-                block = NewBlock(type);
-                if (!block || (offset = block->ranges.Allocate(req.size, req.alignment)) == gpu::BlockRanges::kNone)
-                    return false;
-            }
-            img.block = block;
-            img.offset = offset;
-            img.memory = block->memory;
-            return true;
-        }
-
-        void DestroyImage(Image& img);
-
-        // `imageNext`, `viewNext`: chained to the image's and its view's create infos.
-        // `fallible`: an image or view the device turns down returns an empty
-        // Image (nothing kept) instead of aborting.
-        Image CreateImage(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t layers,
-            VkImageUsageFlags usage, VkImageViewType viewType, VkImageAspectFlags aspect, VkImageCreateFlags flags = 0,
-            uint32_t levels = 1, const void* imageNext = nullptr, const void* viewNext = nullptr, bool fallible = false)
+        // `fallible`: an image the device turns down returns an empty Image
+        // instead of aborting.
+        Image CreateImage(rhi::ImageKind kind, rhi::Format format, rhi::Extent3D extent, uint32_t layers, uint32_t usage,
+            uint32_t levels = 1, rhi::Format storeFormat = rhi::Format::Undefined, bool fallible = false)
         {
             HitchTimer hitchTimer(s_hitch.imageMs);
             s_hitch.images++;
-            auto start = std::chrono::steady_clock::now();
+            rhi::ImageDesc desc;
+            desc.kind = kind;
+            desc.format = format;
+            desc.extent = extent;
+            desc.layers = layers;
+            desc.levels = levels;
+            desc.usage = usage;
+            desc.general = true;
+            desc.storeFormat = storeFormat;
             Image img;
-            VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            ici.pNext = imageNext;
-            ici.flags = flags;
-            ici.imageType = type;
-            ici.format = format;
-            ici.extent = extent;
-            ici.mipLevels = levels;
-            ici.arrayLayers = layers;
-            ici.samples = VK_SAMPLE_COUNT_1_BIT;
-            ici.tiling = VK_IMAGE_TILING_OPTIMAL;  // (image memory blocks hold nothing linear)
-            ici.usage = usage;
-            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            VkResult result = vkCreateImage(s_dev, &ici, nullptr, &img.image);
-            if (fallible && result != VK_SUCCESS)
-                return {};
-            Check(result, "vkCreateImage");
-            VkMemoryDedicatedRequirements dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
-            VkMemoryRequirements2 req2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated };
-            if (s_imagePool)
+            img.rhi = s_rhi->CreateImage(desc);
+            if (!img.rhi)
             {
-                VkImageMemoryRequirementsInfo2 info{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, nullptr, img.image };
-                vkGetImageMemoryRequirements2(s_dev, &info, &req2);
-            }
-            else
-                vkGetImageMemoryRequirements(s_dev, img.image, &req2.memoryRequirements);
-            const VkMemoryRequirements& req = req2.memoryRequirements;
-            uint32_t memoryType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            img.bytes = req.size;
-            if (!s_imagePool || dedicated.prefersDedicatedAllocation || dedicated.requiresDedicatedAllocation ||
-                req.size > s_blockSize / 2 || !BindToBlock(img, req, memoryType))
-            {
-                VkMemoryDedicatedAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, img.image };
-                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                mai.pNext = dedicated.requiresDedicatedAllocation ? &dai : nullptr;
-                mai.allocationSize = req.size;
-                mai.memoryTypeIndex = memoryType;
-                auto allocationStart = std::chrono::steady_clock::now();
-                Check(vkAllocateMemory(s_dev, &mai, nullptr, &img.memory), "vkAllocateMemory(image)");
-                s_imageTotals.allocations++;
-                s_imageTotals.allocationNs += SinceNs(allocationStart);
-            }
-            Check(vkBindImageMemory(s_dev, img.image, img.memory, img.offset), "vkBindImageMemory");
-            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.pNext = viewNext;
-            vci.image = img.image;
-            vci.viewType = viewType;
-            vci.format = format;
-            vci.subresourceRange = { aspect, 0, levels, 0, layers };
-            result = vkCreateImageView(s_dev, &vci, nullptr, &img.view);
-            if (fallible && result != VK_SUCCESS)
-            {
-                img.view = VK_NULL_HANDLE;
-                DestroyImage(img);
+                if (!fallible)
+                {
+                    fprintf(stderr, "[renderer] no image of %ux%u (format %d) could be made\n", extent.width, extent.height, int(format));
+                    abort();
+                }
                 return {};
             }
-            Check(result, "vkCreateImageView");
-            s_imageTotals.images++;
-            s_imageTotals.imageNs += SinceNs(start);
+            img.image = rhi::vulkan::NativeImage(*img.rhi);
+            img.view = rhi::vulkan::NativeView(*img.rhi);
+            img.bytes = img.rhi->Bytes();
             return img;
         }
 
+        // The RHI's name for a format of the renderer's (the formats it makes images in).
+        rhi::Format FromVk(VkFormat f)
+        {
+            switch (f)
+            {
+            case VK_FORMAT_R8_UNORM: return rhi::Format::R8;
+            case VK_FORMAT_R8G8_UNORM: return rhi::Format::RG8;
+            case VK_FORMAT_R8G8B8A8_UNORM: return rhi::Format::RGBA8;
+            case VK_FORMAT_R16_UNORM: return rhi::Format::R16;
+            case VK_FORMAT_R16G16_UNORM: return rhi::Format::RG16;
+            case VK_FORMAT_R16G16B16A16_UNORM: return rhi::Format::RGBA16;
+            case VK_FORMAT_R16G16_SNORM: return rhi::Format::RG16_SNORM;
+            case VK_FORMAT_R16G16B16A16_SNORM: return rhi::Format::RGBA16_SNORM;
+            case VK_FORMAT_R16_SFLOAT: return rhi::Format::R16F;
+            case VK_FORMAT_R16G16_SFLOAT: return rhi::Format::RG16F;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: return rhi::Format::RGBA16F;
+            case VK_FORMAT_R32_SFLOAT: return rhi::Format::R32F;
+            case VK_FORMAT_R32G32_SFLOAT: return rhi::Format::RG32F;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: return rhi::Format::RGBA32F;
+            case VK_FORMAT_R32_UINT: return rhi::Format::R32_UINT;
+            case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return rhi::Format::A2B10G10R10;
+            case VK_FORMAT_D32_SFLOAT_S8_UINT: return rhi::Format::D32F_S8;
+            case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return rhi::Format::BC1;
+            case VK_FORMAT_BC2_UNORM_BLOCK: return rhi::Format::BC2;
+            case VK_FORMAT_BC3_UNORM_BLOCK: return rhi::Format::BC3;
+            case VK_FORMAT_BC5_UNORM_BLOCK: return rhi::Format::BC5;
+            default: break;
+            }
+            fprintf(stderr, "[renderer] format %d has no RHI name\n", int(f));
+            abort();
+        }
+
         // Nothing the GPU may still run can use it (see ApplyLiveSettings):
-        // its memory, or its range of a block, is free for reuse at once.
+        // its memory is free for reuse at once.
         void DestroyImage(Image& img)
         {
-            if (img.view)
-                vkDestroyImageView(s_dev, img.view, nullptr);
-            if (img.image)
-                vkDestroyImage(s_dev, img.image, nullptr);
-            if (ImageBlock* block = img.block)
-            {
-                if (!block->ranges.Free(img.offset, img.bytes))
-                {
-                    fprintf(stderr, "[renderer] image memory: %llu bytes at %llu aren't in use in their block\n",
-                        (unsigned long long)img.bytes, (unsigned long long)img.offset);
-                    abort();
-                }
-                if (block->ranges.Empty())
-                {
-                    // A spare now: the memory thread frees it if it stays
-                    // unused beside another.
-                    Spare spare{ block->memory, std::chrono::steady_clock::now() };
-                    uint32_t type = block->type;
-                    std::erase_if(s_blocks, [block](const std::unique_ptr<ImageBlock>& b) { return b.get() == block; });
-                    {
-                        std::lock_guard lock(s_spareMutex);
-                        s_spares[type].push_back(spare);
-                    }
-                    s_spareCv.notify_one();
-                }
-            }
-            else if (img.memory)
-                vkFreeMemory(s_dev, img.memory, nullptr);
             img = {};
         }
 
@@ -1070,8 +824,8 @@ namespace gpu::renderer
         struct BlackCheck
         {
             bool on = false;
+            std::unique_ptr<rhi::Buffer> bufferRhi;
             VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
             const volatile uint32_t* host = nullptr;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -1975,7 +1729,8 @@ namespace gpu::renderer
             VkFormat vkFormat;
             bool blendable;
             Image image;
-            VkImageView sampleView = VK_NULL_HANDLE;  // depth aspect only, for resolves
+            std::unique_ptr<rhi::ImageView> sampleViewRhi;  // depth targets: the depth aspect only, for resolves
+            VkImageView sampleView = VK_NULL_HANDLE;        // that, or the image's own
             // NFSMW_UNTILED_AREA: in the last frame untiled draws drew it (until
             // the next one's first), whether one was cut short of the
             // attachments' common size, what those cut draws drew (their host
@@ -2169,11 +1924,11 @@ namespace gpu::renderer
                                hfr::Enabled() && video::HfrOffered() ? ", half the budget for Smooth Motion's two pictures a step" : "");
         }
 
-        void ReadRenderScale(const VkPhysicalDeviceProperties& props)
+        void ReadRenderScale(const rhi::Capabilities& caps)
         {
             // Settings > Video > Internal Resolution; NFSMW_RENDER_SCALE
             // (<n> or <sx>x<sy>, developer override) wins.
-            s_scaleBudget = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 6 : 4;
+            s_scaleBudget = caps.kind == rhi::Capabilities::Kind::Discrete ? 6 : 4;
 #ifdef _WIN32
             // An Intel integrated GPU on Windows renders at 1x, as iOS does:
             // a UHD 620 runs a race at 1x at ~20 fps, GPU-bound, and Auto
@@ -2190,10 +1945,10 @@ namespace gpu::renderer
             // Scripted drive, GPU time a frame: iPhone 15 Pro Max (A17 Pro)
             // 15 ms at 1x, 36-40 at 2x; iPad Pro M2 20 ms at 2x (43-50 fps).
             {
-                const video::ScaleBudget mobile = video::MobileScaleBudget(props.deviceName);
+                const video::ScaleBudget mobile = video::MobileScaleBudget(caps.deviceName);
                 s_scaleBudget = mobile.pixels;
                 fprintf(stderr, "[renderer] Auto internal resolution: at most %u host pixel%s per guest pixel on the %s (%s)\n",
-                    s_scaleBudget, s_scaleBudget == 1 ? "" : "s", props.deviceName, mobile.reason);
+                    s_scaleBudget, s_scaleBudget == 1 ? "" : "s", caps.deviceName, mobile.reason);
             }
 #elif defined(__APPLE__)
             // Apple GPUs are all integrated, but a recent Max or Ultra has
@@ -2202,7 +1957,7 @@ namespace gpu::renderer
             // An M1 or M2 Max has about half that GPU (its 3x3 would be ~20
             // ms): from the M3 on only. MoltenVK names the device after the
             // Metal one ("Apple M4 Max").
-            std::string_view name = props.deviceName;
+            std::string_view name = caps.deviceName;
             if (name.starts_with("Apple M") && (name.ends_with(" Max") || name.ends_with(" Ultra")))
             {
                 unsigned generation = 0;
@@ -2300,22 +2055,22 @@ namespace gpu::renderer
             rt->width = rt->scale.x.Size(rt->guestWidth);
             rt->height = rt->scale.y.Size(rt->guestHeight);
             rt->vkFormat = depth ? VK_FORMAT_D32_SFLOAT_S8_UINT : ColorFormat(format);
-            VkFormatProperties fp;
-            vkGetPhysicalDeviceFormatProperties(s_vk->physical, rt->vkFormat, &fp);
-            rt->blendable = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+            rt->blendable = (s_rhi->FormatFeatures(FromVk(rt->vkFormat)) & rhi::kFormatBlend) != 0;
             VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-            rt->image = CreateImage(VK_IMAGE_TYPE_2D, rt->vkFormat, { rt->width, rt->height, 1 }, 1, usage,
-                VK_IMAGE_VIEW_TYPE_2D, aspect);
+            const uint32_t usage = rhi::kImageSampled | rhi::kImageCopySrc | rhi::kImageCopyDst |
+                (depth ? rhi::kImageDepthStencil : rhi::kImageRenderTarget);
+            rt->image = CreateImage(rhi::ImageKind::Image2D, FromVk(rt->vkFormat), { rt->width, rt->height, 1 }, 1, usage);
             if (depth)
             {
-                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                vci.image = rt->image.image;
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = rt->vkFormat;
-                vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-                Check(vkCreateImageView(s_dev, &vci, nullptr, &rt->sampleView), "vkCreateImageView(depth)");
+                rhi::ImageViewDesc vd;
+                vd.depthOnly = true;
+                rt->sampleViewRhi = s_rhi->CreateImageView(*rt->image.rhi, vd);
+                if (!rt->sampleViewRhi)
+                {
+                    fprintf(stderr, "[renderer] the depth view of a render target couldn't be made\n");
+                    abort();
+                }
+                rt->sampleView = rhi::vulkan::NativeImageView(*rt->sampleViewRhi);
             }
             else
             {
@@ -2355,8 +2110,7 @@ namespace gpu::renderer
 
         void DestroyTarget(RenderTarget& rt)
         {
-            if (rt.sampleView && rt.sampleView != rt.image.view)
-                vkDestroyImageView(s_dev, rt.sampleView, nullptr);
+            rt.sampleViewRhi.reset();
             rt.sampleView = VK_NULL_HANDLE;
             DestroyImage(rt.image);
         }
@@ -3625,8 +3379,8 @@ namespace gpu::renderer
             bool tried = false, enabled = false, direct = false, coalesce = false;
             gpu::RenderScale scale;  // the scale its samples are at
             uint32_t slotWords = 0, slots = 0;
-            VkBuffer pool = VK_NULL_HANDLE, table = VK_NULL_HANDLE, scratch = VK_NULL_HANDLE;
-            VkDeviceMemory poolMemory = VK_NULL_HANDLE, tableMemory = VK_NULL_HANDLE, scratchMemory = VK_NULL_HANDLE;
+            std::unique_ptr<rhi::Buffer> poolBuffer, tableBuffer, scratchBuffer;
+            VkBuffer pool = VK_NULL_HANDLE, table = VK_NULL_HANDLE, scratch = VK_NULL_HANDLE;  // their Vulkan handles
             VkDeviceSize scratchSize = 0;  // also the largest scaled texture (no buffer when direct)
             VkDeviceSize poolBytes = 0, tableBytes = 0, scratchBytes = 0;  // allocated (the [perf] line's memory)
             std::vector<uint32_t> pageSlot;  // slot + 1; 0: none
@@ -3886,11 +3640,13 @@ void main()
             auto [it, fresh] = (cube ? s_directCubeFormats : s_directFormats).try_emplace(format, false);
             if (fresh)
             {
-                VkImageFormatProperties props;
-                it->second = vkGetPhysicalDeviceImageFormatProperties(s_vk->physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
-                    &props) == VK_SUCCESS && (!cube || props.maxArrayLayers >= 6);
+                rhi::ImageDesc desc;
+                desc.kind = cube ? rhi::ImageKind::Cube : rhi::ImageKind::Image2D;
+                desc.format = FromVk(format);
+                desc.layers = cube ? 6 : 1;
+                desc.usage = rhi::kImageSampled | rhi::kImageStorage | rhi::kImageCopyDst;
+                desc.storeFormat = rhi::Format::R32_UINT;
+                it->second = s_rhi->SupportsImage(desc);
             }
             return it->second;
         }
@@ -3924,7 +3680,9 @@ void main()
             // The same, a 2D view of each layer: [0] is storeView, and a
             // direct cube (NFSMW_DIRECT_CUBE) has one per face.
             VkImageView storeViews[6] = {};
+            std::unique_ptr<rhi::ImageView> storeViewsRhi[6];
             std::unordered_map<uint32_t, VkImageView> views;  // by swizzle
+            std::unordered_map<uint32_t, std::unique_ptr<rhi::ImageView>> viewsRhi;
             // How the untile reads a direct 1x texture (a resolve can store
             // into it the same way, see Resolve); sliceStride: a cube's guest
             // bytes from one face to the next.
@@ -4290,28 +4048,33 @@ void main()
             auto& view = t.views[swizzle];
             if (view)
                 return view;
-            auto comp = [](uint32_t s) {
-                switch (s & 7)
+            auto comp = [](uint32_t c) {
+                switch (c & 7)
                 {
-                case 0: return VK_COMPONENT_SWIZZLE_R;
-                case 1: return VK_COMPONENT_SWIZZLE_G;
-                case 2: return VK_COMPONENT_SWIZZLE_B;
-                case 3: return VK_COMPONENT_SWIZZLE_A;
-                case 4: return VK_COMPONENT_SWIZZLE_ZERO;
-                case 5: return VK_COMPONENT_SWIZZLE_ONE;
-                default: return VK_COMPONENT_SWIZZLE_IDENTITY;
+                case 0: return rhi::Swizzle::R;
+                case 1: return rhi::Swizzle::G;
+                case 2: return rhi::Swizzle::B;
+                case 3: return rhi::Swizzle::A;
+                case 4: return rhi::Swizzle::Zero;
+                case 5: return rhi::Swizzle::One;
+                default: return rhi::Swizzle::Identity;
                 }
             };
-            // Sampled only (a storable scaled texture's format need not support storage).
-            VkImageViewUsageCreateInfo usage{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_SAMPLED_BIT };
-            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.pNext = t.storeView ? &usage : nullptr;
-            vci.image = t.image.image;
-            vci.viewType = t.cube ? VK_IMAGE_VIEW_TYPE_CUBE : t.volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = t.format;
-            vci.components = { comp(swizzle), comp(swizzle >> 3), comp(swizzle >> 6), comp(swizzle >> 9) };
-            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, t.cube ? 6u : 1u };
-            Check(vkCreateImageView(s_dev, &vci, nullptr, &view), "vkCreateImageView(texture)");
+            // (The image's own view is a sampled one; a storable scaled
+            // texture's format need not support storage.)
+            rhi::ImageViewDesc vd;
+            vd.swizzle[0] = comp(swizzle);
+            vd.swizzle[1] = comp(swizzle >> 3);
+            vd.swizzle[2] = comp(swizzle >> 6);
+            vd.swizzle[3] = comp(swizzle >> 9);
+            auto& owned = t.viewsRhi[swizzle];
+            owned = s_rhi->CreateImageView(*t.image.rhi, vd);
+            if (!owned)
+            {
+                fprintf(stderr, "[renderer] a texture view couldn't be made\n");
+                abort();
+            }
+            view = rhi::vulkan::NativeImageView(*owned);
             return view;
         }
 
@@ -4497,48 +4260,41 @@ void main()
                     // The untile stores its words through an R32_UINT view
                     // (every scaled format is 32 bits a texel, as is each
                     // direct 1x one), a 2D one of each layer (a cube's faces).
-                    VkFormat formats[2] = { fi.vk, VK_FORMAT_R32_UINT };
-                    VkImageFormatListCreateInfo list{ VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, nullptr, 2, formats };
-                    VkImageViewUsageCreateInfo sampled{ VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, nullptr, VK_IMAGE_USAGE_SAMPLED_BIT };
                     // A cube's image and views are untried on some drivers
                     // (MoltenVK: 2D R32_UINT views of a cube's layers): one
                     // turned down is staged instead, below.
-                    t.image = CreateImage(VK_IMAGE_TYPE_2D, fi.vk, { t.width, t.height, 1 }, layers,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | (direct1x ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0),
-                        cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0),
-                        1, &list, &sampled, cube);
-                    VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                    vci.image = t.image.image;
-                    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                    vci.format = VK_FORMAT_R32_UINT;
-                    bool made = t.image.image != VK_NULL_HANDLE;
+                    t.image = CreateImage(cube ? rhi::ImageKind::Cube : rhi::ImageKind::Image2D, FromVk(fi.vk), { t.width, t.height, 1 }, layers,
+                        rhi::kImageSampled | rhi::kImageStorage | (direct1x ? rhi::kImageCopyDst : 0), 1, rhi::Format::R32_UINT, cube);
+                    bool made = t.image.rhi != nullptr;
                     for (uint32_t layer = 0; layer < layers && made; layer++)
                     {
-                        vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1 };
-                        VkResult result = vkCreateImageView(s_dev, &vci, nullptr, &t.storeViews[layer]);
-                        if (!cube)
-                            Check(result, "vkCreateImageView(scaled store)");
-                        if (result != VK_SUCCESS)
+                        rhi::ImageViewDesc vd;
+                        vd.format = rhi::Format::R32_UINT;
+                        vd.layer = layer;
+                        vd.layerCount = 1;
+                        t.storeViewsRhi[layer] = s_rhi->CreateImageView(*t.image.rhi, vd);
+                        if (!t.storeViewsRhi[layer])
                         {
-                            t.storeViews[layer] = VK_NULL_HANDLE;
+                            if (!cube)
+                            {
+                                fprintf(stderr, "[renderer] the store view of a scaled texture couldn't be made\n");
+                                abort();
+                            }
                             made = false;
                         }
+                        else
+                            t.storeViews[layer] = rhi::vulkan::NativeImageView(*t.storeViewsRhi[layer]);
                     }
                     t.storeView = t.storeViews[0];
                     if (!made)
                     {
                         fprintf(stderr, "[renderer] cube %ux%u format %d can't be stored directly (image or view refused): staged\n",
                             width, height, int(fi.vk));
-                        for (VkImageView& view : t.storeViews)
-                        {
-                            if (view)
-                                vkDestroyImageView(s_dev, view, nullptr);
-                            view = VK_NULL_HANDLE;
-                        }
+                        for (auto& view : t.storeViewsRhi)
+                            view.reset();
+                        std::fill(std::begin(t.storeViews), std::end(t.storeViews), VK_NULL_HANDLE);
                         t.storeView = VK_NULL_HANDLE;
-                        if (t.image.image)
-                            DestroyImage(t.image);
+                        DestroyImage(t.image);
                         s_directCubeFormats[fi.vk] = false;  // (once a format: DirectFormat says no from now on)
                     }
                     else if (direct1x)
@@ -4573,10 +4329,8 @@ void main()
                     }
                 }
                 if (!t.image.image)
-                    t.image = CreateImage(volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, fi.vk, { t.width, t.height, depth }, layers,
-                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        cube ? VK_IMAGE_VIEW_TYPE_CUBE : volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT,
-                        cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, t.levels);
+                    t.image = CreateImage(cube ? rhi::ImageKind::Cube : volume ? rhi::ImageKind::Image3D : rhi::ImageKind::Image2D, FromVk(fi.vk),
+                        { t.width, t.height, depth }, layers, rhi::kImageSampled | rhi::kImageCopyDst, t.levels);
             }
             Texture& t = *slotRef;
             {
@@ -4971,10 +4725,10 @@ void main()
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
         // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
         // (MoltenVK), so not on Apple GPUs unless NFSMW_SCALED_COALESCE=1.
-        bool ScaledCoalesce(const VkPhysicalDeviceProperties& props)
+        bool ScaledCoalesce(const rhi::Capabilities& caps)
         {
             const char* coalesce = std::getenv("NFSMW_SCALED_COALESCE");
-            return coalesce ? coalesce[0] != '0' : props.vendorID != 0x106B;
+            return coalesce ? coalesce[0] != '0' : caps.vendorId != 0x106B;
         }
 
         // The resolve pipelines a scale will use, made now (at start or at a
@@ -4985,10 +4739,8 @@ void main()
         {
             if (scale.IsOne())
                 return;
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             ResolvePipeline(false, scale);
-            if (ScaledCoalesce(props) && CoalescedFits(scale))
+            if (ScaledCoalesce(s_rhi->GetCapabilities()) && CoalescedFits(scale))
                 ResolvePipeline(true, scale);
         }
         VkPipelineLayout s_resolveLayout = VK_NULL_HANDLE;
@@ -5565,10 +5317,8 @@ void main()
         const bool s_logShadowMap = [] { const char* v = std::getenv("NFSMW_LOG_SHADOWMAP"); return v && v[0] && v[0] != '0'; }();
         struct ShadowMapProbe
         {
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
+            std::unique_ptr<rhi::Buffer> buffer;
             const uint8_t* host = nullptr;
-            bool coherent = true;
             VkDeviceSize size = 0;
             bool failed = false;
             uint64_t submission = 0, frame = 0;  // the copy's submission, and the frame
@@ -5655,58 +5405,25 @@ void main()
                 return;
             if (p.size < rangeBytes)
             {
-                if (p.buffer)
-                {
-                    vkDestroyBuffer(s_dev, p.buffer, nullptr);
-                    vkFreeMemory(s_dev, p.memory, nullptr);
-                    p.buffer = VK_NULL_HANDLE;
-                    p.memory = VK_NULL_HANDLE;
-                    p.host = nullptr;
-                    p.size = 0;
-                }
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = rangeBytes;
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-                VkMemoryRequirements req{};
-                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                void* mapped = nullptr;
-                const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-                bool ok = vkCreateBuffer(s_dev, &bci, nullptr, &p.buffer) == VK_SUCCESS;
-                if (ok)
-                {
-                    vkGetBufferMemoryRequirements(s_dev, p.buffer, &req);
-                    mai.allocationSize = req.size;
-                    // Cached host memory when there is some (the CPU reads the
-                    // copy), else any host-visible coherent type. (Inline: the
-                    // memory plan, gpu/memory_plan.h, replaced the renderer's
-                    // FindMemoryTypePreferring; the windows branch does the same.)
-                    const VkMemoryPropertyFlags cached = visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-                    mai.memoryTypeIndex = UINT32_MAX;
-                    for (uint32_t i = 0; i < s_memProps.memoryTypeCount && mai.memoryTypeIndex == UINT32_MAX; i++)
-                        if ((req.memoryTypeBits & (1u << i)) && (s_memProps.memoryTypes[i].propertyFlags & cached) == cached)
-                            mai.memoryTypeIndex = i;
-                    if (mai.memoryTypeIndex == UINT32_MAX)
-                        mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                    ok = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & visible) == visible &&
-                        vkAllocateMemory(s_dev, &mai, nullptr, &p.memory) == VK_SUCCESS;
-                }
-                ok = ok && vkBindBufferMemory(s_dev, p.buffer, p.memory, 0) == VK_SUCCESS &&
-                    vkMapMemory(s_dev, p.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS;
-                if (!ok)
+                p.buffer.reset();
+                p.host = nullptr;
+                p.size = 0;
+                // Cached host memory when there is some (the CPU reads the
+                // copy), else any host-visible coherent type (the device's).
+                rhi::BufferDesc bd;
+                bd.size = rangeBytes;
+                bd.usage = rhi::kBufferCopyDst;
+                bd.memory = rhi::MemoryKind::UploadCached;
+                bd.name = "shadow map probe";
+                p.buffer = s_rhi->CreateBuffer(bd);
+                if (!p.buffer)
                 {
                     fprintf(stderr, "[shadowmap] no host-visible buffer for the copy (%u bytes): off\n", rangeBytes);
-                    if (p.buffer)
-                        vkDestroyBuffer(s_dev, p.buffer, nullptr);
-                    if (p.memory)
-                        vkFreeMemory(s_dev, p.memory, nullptr);
-                    p.buffer = VK_NULL_HANDLE;
-                    p.memory = VK_NULL_HANDLE;
                     p.failed = true;
                     return;
                 }
-                p.host = static_cast<const uint8_t*>(mapped);
+                p.host = static_cast<const uint8_t*>(p.buffer->Map());
                 p.size = rangeBytes;
-                p.coherent = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
             }
             // The resolve's writes -> the copy -> the host's reads (after
             // the submission's fence).
@@ -5715,7 +5432,7 @@ void main()
             mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             VkBufferCopy copy{ rangeBase, 0, rangeBytes };
-            vkCmdCopyBuffer(s_cmd, s_shared, p.buffer, 1, &copy);
+            vkCmdCopyBuffer(s_cmd, s_shared, rhi::vulkan::NativeBuffer(*p.buffer), 1, &copy);
             mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
             vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
@@ -5751,11 +5468,7 @@ void main()
                 if (!done)
                     return;
             }
-            if (!p.coherent)
-            {
-                VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, p.memory, 0, VK_WHOLE_SIZE };
-                vkInvalidateMappedMemoryRanges(s_dev, 1, &range);
-            }
+            p.buffer->Invalidate(0, p.size);
             s_shadowMapState.store(kProbeCounting, std::memory_order_relaxed);
             std::thread(ShadowMapCount, ShadowMapSample{ p.host, p.rangeBase, p.rangeBytes, p.destBase, p.destPitch, p.endian, p.format,
                 p.srcBase, p.rect, p.frame, p.seconds }).detach();
@@ -6495,32 +6208,22 @@ void main()
         VkPipelineLayout s_scaledStoreLayout = VK_NULL_HANDLE;
         VkDescriptorSetLayout s_scaledStoreSetLayout = VK_NULL_HANDLE;
 
-        bool CreateDeviceBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory, const char* what,
+        bool CreateDeviceBuffer(VkDeviceSize size, uint32_t usage, std::unique_ptr<rhi::Buffer>& buffer, VkBuffer& handle, const char* what,
             VkDeviceSize* allocated = nullptr)
         {
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = size;
-            bci.usage = usage;
-            if (vkCreateBuffer(s_dev, &bci, nullptr, &buffer) != VK_SUCCESS)
+            rhi::BufferDesc bd;
+            bd.size = size;
+            bd.usage = usage;
+            bd.name = what;
+            buffer = s_rhi->CreateBuffer(bd);
+            if (!buffer)
             {
-                fprintf(stderr, "[renderer] %s: vkCreateBuffer failed\n", what);
+                fprintf(stderr, "[renderer] %s: a device buffer of %llu MB couldn't be made\n", what, (unsigned long long)(size >> 20));
                 return false;
             }
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_dev, buffer, &req);
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = req.size;
-            mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            if (vkAllocateMemory(s_dev, &mai, nullptr, &memory) != VK_SUCCESS)
-            {
-                fprintf(stderr, "[renderer] %s: vkAllocateMemory (%llu MB) failed\n", what, (unsigned long long)(size >> 20));
-                vkDestroyBuffer(s_dev, buffer, nullptr);
-                buffer = VK_NULL_HANDLE;
-                return false;
-            }
-            vkBindBufferMemory(s_dev, buffer, memory, 0);
+            handle = rhi::vulkan::NativeBuffer(*buffer);
             if (allocated)
-                *allocated = req.size;
+                *allocated = size;
             return true;
         }
 
@@ -6575,15 +6278,11 @@ void main()
         // The pool, page table and scratch buffer (the caller has the GPU idle).
         void FreeScaledBuffers()
         {
-            for (auto [buffer, memory] : { std::pair{ &s_scaled.pool, &s_scaled.poolMemory }, std::pair{ &s_scaled.table, &s_scaled.tableMemory },
-                     std::pair{ &s_scaled.scratch, &s_scaled.scratchMemory } })
+            for (auto [buffer, handle] : { std::pair{ &s_scaled.poolBuffer, &s_scaled.pool }, std::pair{ &s_scaled.tableBuffer, &s_scaled.table },
+                     std::pair{ &s_scaled.scratchBuffer, &s_scaled.scratch } })
             {
-                if (*buffer)
-                    vkDestroyBuffer(s_dev, *buffer, nullptr);
-                if (*memory)
-                    vkFreeMemory(s_dev, *memory, nullptr);
-                *buffer = VK_NULL_HANDLE;
-                *memory = VK_NULL_HANDLE;
+                buffer->reset();
+                *handle = VK_NULL_HANDLE;
             }
             s_scaled.poolBytes = s_scaled.tableBytes = s_scaled.scratchBytes = 0;
         }
@@ -6624,28 +6323,25 @@ void main()
             s_scaled.scale = s_renderScale;
             if (s_scaled.scale.IsOne())
                 return false;
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+            const rhi::Capabilities& caps = s_rhi->GetCapabilities();
             // gpu::ScaledPoolMegabytes: 512 MB on a discrete GPU, 128 MB at a
             // Steam Deck's native rows (1x10/9: 512 MB took ~510 MB more VRAM
             // than 1x, and 128 MB the same GPU time, 450 MB less).
-            uint64_t megabytes = gpu::ScaledPoolMegabytes(s_scaled.scale, props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+            uint64_t megabytes = gpu::ScaledPoolMegabytes(s_scaled.scale, caps.kind == rhi::Capabilities::Kind::Discrete);
             if (const char* v = std::getenv("NFSMW_SCALED_MB"))
                 megabytes = std::clamp<uint64_t>(std::strtoull(v, nullptr, 10), 16, 4096);
             // Kept across live changes of the internal resolution
             // (ResetScaledMemory), and made again larger for a scale that
             // wants more (below). Bound whole, so within the device's storage
             // buffer range (NFSMW_SCALED_MB=4096 is past a 4 GB - 1 limit).
-            VkDeviceSize poolSize = std::min<VkDeviceSize>(VkDeviceSize(megabytes) << 20, props.limits.maxStorageBufferRange) & ~VkDeviceSize(0xFFFF);
+            VkDeviceSize poolSize = std::min<VkDeviceSize>(VkDeviceSize(megabytes) << 20, caps.maxStorageBufferRange) & ~VkDeviceSize(0xFFFF);
             if (s_scaled.pool && s_scaled.poolBytes < poolSize)
             {
                 // (Commands in flight may still bind it, as a stand-in too.)
                 Flush();
                 video::WaitGpuIdle();
-                vkDestroyBuffer(s_dev, s_scaled.pool, nullptr);
-                vkFreeMemory(s_dev, s_scaled.poolMemory, nullptr);
+                s_scaled.poolBuffer.reset();
                 s_scaled.pool = VK_NULL_HANDLE;
-                s_scaled.poolMemory = VK_NULL_HANDLE;
                 s_scaled.poolBytes = 0;
             }
             s_scaled.slotWords = s_scaled.scale.SlotWords();
@@ -6658,38 +6354,35 @@ void main()
             // copy, one more full write and read of the texture.
             s_scaled.scratchSize = VkDeviceSize(s_scaled.scale.HostPixels(1280, 1024)) * 4;
             {
-                // (The image's format list is Vulkan 1.2.)
                 const char* v = std::getenv("NFSMW_SCALED_DIRECT");
-                VkFormatProperties fp;
-                vkGetPhysicalDeviceFormatProperties(s_vk->physical, VK_FORMAT_R32_UINT, &fp);
-                s_scaled.direct = !(v && v[0] == '0') && props.apiVersion >= VK_API_VERSION_1_2 &&
-                    (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+                s_scaled.direct = !(v && v[0] == '0');
                 for (uint32_t f = 0; f < 64 && s_scaled.direct; f++)
                 {
                     TextureFormatInfo fi;
-                    VkImageFormatProperties ifp;
                     if (GetTextureFormat(f, fi) && ScaledFormat(fi))
-                        s_scaled.direct = vkGetPhysicalDeviceImageFormatProperties(s_vk->physical, fi.vk, VK_IMAGE_TYPE_2D,
-                            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
-                            VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, &ifp) == VK_SUCCESS;
+                    {
+                        rhi::ImageDesc desc;
+                        desc.format = FromVk(fi.vk);
+                        desc.usage = rhi::kImageSampled | rhi::kImageStorage;
+                        desc.storeFormat = rhi::Format::R32_UINT;
+                        s_scaled.direct = s_rhi->SupportsImage(desc);
+                    }
                 }
             }
-            s_scaled.coalesce = ScaledCoalesce(props);
+            s_scaled.coalesce = ScaledCoalesce(caps);
             // A scratch buffer kept from a smaller scale is too small.
             if (s_scaled.scratch && s_scaled.scratchBytes < s_scaled.scratchSize)
             {
-                vkDestroyBuffer(s_dev, s_scaled.scratch, nullptr);
-                vkFreeMemory(s_dev, s_scaled.scratchMemory, nullptr);
+                s_scaled.scratchBuffer.reset();
                 s_scaled.scratch = VK_NULL_HANDLE;
-                s_scaled.scratchMemory = VK_NULL_HANDLE;
                 s_scaled.scratchBytes = 0;
             }
-            if ((!s_scaled.pool && !CreateDeviceBuffer(poolSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, s_scaled.pool, s_scaled.poolMemory,
+            if ((!s_scaled.pool && !CreateDeviceBuffer(poolSize, rhi::kBufferStorage, s_scaled.poolBuffer, s_scaled.pool,
                      "scaled pool", &s_scaled.poolBytes)) ||
-                (!s_scaled.table && !CreateDeviceBuffer(VkDeviceSize(kGuestPages) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    s_scaled.table, s_scaled.tableMemory, "scaled page table", &s_scaled.tableBytes)) ||
-                (!s_scaled.direct && !s_scaled.scratch && !CreateDeviceBuffer(s_scaled.scratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                    s_scaled.scratch, s_scaled.scratchMemory, "scaled scratch", &s_scaled.scratchBytes)))
+                (!s_scaled.table && !CreateDeviceBuffer(VkDeviceSize(kGuestPages) * 4, rhi::kBufferStorage | rhi::kBufferCopyDst,
+                    s_scaled.tableBuffer, s_scaled.table, "scaled page table", &s_scaled.tableBytes)) ||
+                (!s_scaled.direct && !s_scaled.scratch && !CreateDeviceBuffer(s_scaled.scratchSize, rhi::kBufferStorage | rhi::kBufferCopySrc,
+                    s_scaled.scratchBuffer, s_scaled.scratch, "scaled scratch", &s_scaled.scratchBytes)))
             {
                 fprintf(stderr, "[renderer] scaled resolve memory unavailable: textures stay 1x\n");
                 FreeScaledBuffers();
@@ -6974,20 +6667,19 @@ void main()
             const char* v = std::getenv("NFSMW_BLACK_CHECK");
             if (!v || v[0] != '1')
                 return;
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = kBlackEntries * sizeof(uint32_t);
-            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_black.buffer), "vkCreateBuffer(black check)");
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_dev, s_black.buffer, &req);
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = req.size;
-            mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            Check(vkAllocateMemory(s_dev, &mai, nullptr, &s_black.memory), "vkAllocateMemory(black check)");
-            vkBindBufferMemory(s_dev, s_black.buffer, s_black.memory, 0);
-            void* p;
-            Check(vkMapMemory(s_dev, s_black.memory, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory(black check)");
-            s_black.host = static_cast<const volatile uint32_t*>(p);
+            rhi::BufferDesc bd;
+            bd.size = kBlackEntries * sizeof(uint32_t);
+            bd.usage = rhi::kBufferStorage | rhi::kBufferCopyDst;
+            bd.memory = rhi::MemoryKind::Upload;
+            bd.name = "black check";
+            s_black.bufferRhi = s_rhi->CreateBuffer(bd);
+            if (!s_black.bufferRhi)
+            {
+                fprintf(stderr, "[black] no buffer for NFSMW_BLACK_CHECK: off\n");
+                return;
+            }
+            s_black.buffer = rhi::vulkan::NativeBuffer(*s_black.bufferRhi);
+            s_black.host = static_cast<const volatile uint32_t*>(s_black.bufferRhi->Map());
             VkDescriptorSetLayoutBinding b[2] = {
                 { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                 { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -7143,244 +6835,10 @@ void main()
 
         // ---------------------------------------------------------------
 
-        // Where guest memory and the upload ring go: gpu/memory_plan.h, which
-        // lists the places to try in order. A place the driver refuses (out of
-        // memory, say) is logged and the next one tried; only when none is
-        // left does the renderer give up.
-        memplan::Memory s_planMemory;  // the plan's view of the device's memory
-        uint32_t s_guestType = memplan::kNoType;  // the copy's memory type (kNoType: imported)
-        std::string s_guestChoice;  // for the [renderer] memory line
-        memplan::Gpu s_planGpu = memplan::Gpu::kOther;  // the kind the memory was planned for (memplan::OverPcieNote)
-
-        // Test hooks for the plan's fallbacks, which the machines we test on
-        // never need:
-        //   NFSMW_TEST_BAR_HEAP_MB=<MB>: the heaps holding CPU-mapped VRAM read
-        //     as that size to the plan, and the copy's and the ring's
-        //     allocations from those types fail (out of device memory) once
-        //     they would pass it, as on a GPU without resizable BAR;
-        //   NFSMW_TEST_ALLOC_FAIL=<places>: those places fail as out of device
-        //     memory (comma-separated: import, copy-vram, copy-system,
-        //     copy-cached, ring-vram, ring-cached, ring-system);
-        //   NFSMW_TEST_GPU_KIND=integrated|discrete|other: the plan takes the
-        //     GPU for that kind (the Deck's choice on the Steam Machine, say).
-        struct MemoryTest
-        {
-            uint64_t barBytes = 0, barUsed = 0;
-            std::string fail;  // ",a,b,"
-            const char* kind = nullptr;
-        };
-        MemoryTest s_memoryTest = [] {
-            MemoryTest t;
-            if (const char* v = std::getenv("NFSMW_TEST_BAR_HEAP_MB"); v && std::atoi(v) > 0)
-                t.barBytes = uint64_t(std::atoi(v)) << 20;
-            if (const char* v = std::getenv("NFSMW_TEST_ALLOC_FAIL"); v && v[0])
-                t.fail = std::string(",") + v + ",";
-            t.kind = std::getenv("NFSMW_TEST_GPU_KIND");
-            return t;
-        }();
-
-        // NFSMW_TEST_ALLOC_FAIL names this place.
-        bool MemoryTestRefuses(memplan::Place place, bool ring)
-        {
-            const char* name = memplan::Name(place, ring);
-            if (s_memoryTest.fail.find(std::string(",") + name + ",") == std::string::npos)
-                return false;
-            fprintf(stderr, "[renderer] NFSMW_TEST_ALLOC_FAIL: %s refused (out of device memory)\n", name);
-            return true;
-        }
-
-        // vkAllocateMemory for a planned place, through the test hooks.
-        VkResult AllocatePlanned(const memplan::Candidate& c, bool ring, VkDeviceSize size, VkDeviceMemory& memory)
-        {
-            if (MemoryTestRefuses(c.place, ring))
-                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            const VkMemoryPropertyFlags bar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-            bool mappedVram = (s_memProps.memoryTypes[c.type].propertyFlags & bar) == bar;
-            if (mappedVram && s_memoryTest.barBytes && s_memoryTest.barUsed + size > s_memoryTest.barBytes)
-            {
-                fprintf(stderr, "[renderer] NFSMW_TEST_BAR_HEAP_MB: %llu MB of CPU-mapped VRAM refused (%llu of %llu MB taken)\n",
-                    (unsigned long long)(size >> 20), (unsigned long long)(s_memoryTest.barUsed >> 20),
-                    (unsigned long long)(s_memoryTest.barBytes >> 20));
-                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            }
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.allocationSize = size;
-            mai.memoryTypeIndex = c.type;
-            VkResult r = vkAllocateMemory(s_dev, &mai, nullptr, &memory);
-            if (r == VK_SUCCESS && mappedVram)
-                s_memoryTest.barUsed += size;
-            return r;
-        }
-
-        // The device's memory as the plan sees it (NFSMW_TEST_BAR_HEAP_MB
-        // applied), logged once: bug reports then show what a GPU offers.
-        memplan::Memory PlanMemory()
-        {
-            memplan::Memory m;
-            std::string line;
-            for (uint32_t h = 0; h < s_memProps.memoryHeapCount; h++)
-            {
-                m.heaps.push_back(s_memProps.memoryHeaps[h].size);
-                line += std::format("{}{} {}{}", h ? ", " : "", h, memplan::Size(m.heaps.back()),
-                    (s_memProps.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? " device-local" : "");
-            }
-            line += "; types (type:heap/flags):";
-            for (uint32_t i = 0; i < s_memProps.memoryTypeCount; i++)
-            {
-                m.types.push_back({ s_memProps.memoryTypes[i].propertyFlags, s_memProps.memoryTypes[i].heapIndex });
-                line += std::format(" {}:{}/{:X}", i, m.types.back().heap, m.types.back().flags);
-            }
-            if (s_memoryTest.barBytes)
-            {
-                memplan::ShrinkMappedVram(m, s_memoryTest.barBytes);
-                line += std::format(" (NFSMW_TEST_BAR_HEAP_MB: CPU-mapped VRAM's heaps read as {} MB)", s_memoryTest.barBytes >> 20);
-            }
-            fprintf(stderr, "[renderer] memory heaps: %s\n", line.c_str());
-            return m;
-        }
-
-        uint32_t DriverId(const VkPhysicalDeviceProperties& props)
-        {
-            if (props.apiVersion < VK_API_VERSION_1_2)
-                return 0;
-            VkPhysicalDeviceDriverProperties driver{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
-            VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
-            props2.pNext = &driver;
-            vkGetPhysicalDeviceProperties2(s_vk->physical, &props2);
-            return uint32_t(driver.driverID);
-        }
-
-        // Guest physical memory imported without a copy (unified memory, or
-        // a discrete GPU reading system memory over PCIe).
-        bool ImportSharedMemory()
-        {
-            if (!s_vk->getMemoryHostPointerProperties)  // (no host-memory import)
-                return false;
-            if (MemoryTestRefuses(memplan::Place::kImport, false))
-            {
-                fprintf(stderr, "[renderer] importing guest memory failed (%d)\n", int(VK_ERROR_OUT_OF_DEVICE_MEMORY));
-                return false;
-            }
-            VkMemoryHostPointerPropertiesEXT hpp{ VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
-            if (VkResult r = s_vk->getMemoryHostPointerProperties(s_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                    s_sharedHost, &hpp); r != VK_SUCCESS)
-            {
-                // (A driver can refuse the pointer itself: on Windows guest
-                // memory is a view of a file mapping, which only Intel's
-                // driver is known to import. Logged, so a bug report tells
-                // this from a refused allocation.)
-                fprintf(stderr, "[renderer] importing guest memory failed: the driver doesn't take its host pointer (%d)\n", int(r));
-                return false;
-            }
-
-            VkExternalMemoryBufferCreateInfo embci{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
-            embci.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.pNext = &embci;
-            bci.size = kSharedSize;
-            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_shared), "vkCreateBuffer(shared)");
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_dev, s_shared, &req);
-
-            VkImportMemoryHostPointerInfoEXT import{ VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
-            import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-            import.pHostPointer = s_sharedHost;
-            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            mai.pNext = &import;
-            mai.allocationSize = kSharedSize;
-            mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits & hpp.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            VkResult r = vkAllocateMemory(s_dev, &mai, nullptr, &s_sharedMemory);
-            if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, s_shared, s_sharedMemory, 0)) != VK_SUCCESS)
-            {
-                vkFreeMemory(s_dev, s_sharedMemory, nullptr);
-                s_sharedMemory = VK_NULL_HANDLE;
-            }
-            if (r != VK_SUCCESS)
-            {
-                fprintf(stderr, "[renderer] importing guest memory failed (%d)\n", int(r));
-                vkDestroyBuffer(s_dev, s_shared, nullptr);
-                s_shared = VK_NULL_HANDLE;
-                return false;
-            }
-            return true;
-        }
-
-        // The buffer of guest memory's copy (an unbound one: a place that
-        // fails before binding leaves it for the next).
-        VkBuffer NewCopyBuffer(VkMemoryRequirements& req)
-        {
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = kSharedSize;
-            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            VkBuffer buffer = VK_NULL_HANDLE;
-            Check(vkCreateBuffer(s_dev, &bci, nullptr, &buffer), "vkCreateBuffer(shadow)");
-            vkGetBufferMemoryRequirements(s_dev, buffer, &req);
-            return buffer;
-        }
-
-        // Guest memory's copy for the GPU in `c`'s memory type, kept current
-        // page by page from the write watch (writewatch::SyncShadow): on a
-        // discrete GPU in VRAM the CPU writes through resizable BAR when it
-        // holds the copy, else in system memory; on an integrated one in
-        // system memory (memory_plan.h). False, with nothing kept, when the
-        // driver refuses it; `buffer` is then still unbound, or replaced.
-        bool CreateShadowSharedMemory(VkBuffer& buffer, const VkMemoryRequirements& req, const memplan::Candidate& c)
-        {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            void* p = nullptr;
-            const char* what = "vkAllocateMemory(shadow)";
-            VkResult r = AllocatePlanned(c, false, req.size, memory);
-            if (r == VK_SUCCESS && (r = vkMapMemory(s_dev, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
-                what = "vkMapMemory(shadow)";
-            else if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, buffer, memory, 0)) != VK_SUCCESS)
-            {
-                what = "vkBindBufferMemory(shadow)";
-                vkDestroyBuffer(s_dev, buffer, nullptr);  // (a buffer binds once)
-                VkMemoryRequirements again;
-                buffer = NewCopyBuffer(again);
-            }
-            if (r != VK_SUCCESS)
-            {
-                fprintf(stderr, "[renderer] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
-                    memplan::Name(c.place, false), c.type);
-                if (memory)
-                    vkFreeMemory(s_dev, memory, nullptr);
-                return false;
-            }
-            s_shared = buffer;
-            s_sharedMemory = memory;
-            // Write every page of the mapping once, before anything uses it.
-            // The first CPU write to a page of mapped VRAM faults it into the
-            // page tables; left to the first sync, a burst of new textures
-            // paid it mid-frame (on the Steam Machine, copying 7.9 MB of
-            // never-copied pages took 3.9 ms instead of 2.9, a scene load's
-            // 44 MB 22 ms instead of 14-17), while all 512 MB in order take
-            // ~100 ms here. The zeros are never read: SyncShadow copies a page
-            // before its first use. NFSMW_SHADOW_PREFAULT=0 leaves the faults
-            // to the first sync.
-            static const bool prefault = [] { const char* v = std::getenv("NFSMW_SHADOW_PREFAULT"); return !v || v[0] != '0'; }();
-            auto prefaultStart = std::chrono::steady_clock::now();
-            if (prefault)
-                for (VkDeviceSize offset = 0; offset < kSharedSize; offset += 4096)
-                    static_cast<volatile uint8_t*>(p)[offset] = 0;
-            double prefaultMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefaultStart).count();
-            writewatch::EnableShadow(static_cast<uint8_t*>(p));
-            s_shadowMode = true;
-            s_shadowInVram = (s_memProps.memoryTypes[c.type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-            fprintf(stderr, "[renderer] guest memory: GPU copy in %s (memory type %u, flags %X), updated from the write watch%s\n",
-                s_shadowInVram ? "VRAM (CPU-mapped)" : "host memory", c.type, s_memProps.memoryTypes[c.type].propertyFlags,
-                prefault ? std::format(" (pages touched in {:.0f} ms)", prefaultMs).c_str() : "");
-            return true;
-        }
-
-        // `failed`, a list of place names, as the log's ", after ... failed".
-        std::string AfterFailed(const std::string& failed)
-        {
-            return failed.empty() ? std::string() : " after " + failed + " failed";
-        }
-
+        // Where guest memory and the upload ring go is the device's to say
+        // (gpu/memory_plan.h in the Vulkan backend, D14): it tries the places
+        // in turn, logs what refused, and only when none is left does the
+        // renderer give up.
         // The driver refused every place the plan had for guest memory or the
         // upload ring (the line before this says which). Elsewhere abort(),
         // as before. Windows: the game ends with a message, not abort(),
@@ -7415,18 +6873,15 @@ void main()
         void CreateSharedMemory()
         {
             s_sharedHost = static_cast<uint8_t*>(g_memory.Translate(vmem::Physical().Base()));
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-            VkPhysicalDeviceFeatures features;
-            vkGetPhysicalDeviceFeatures(s_vk->physical, &features);  // the presenter enables anisotropy when supported
-            s_maxAnisotropy = features.samplerAnisotropy ? props.limits.maxSamplerAnisotropy : 1.0f;
-            s_autoAnisotropy = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 16 : 4;
+            const rhi::Capabilities& caps = s_rhi->GetCapabilities();
+            s_maxAnisotropy = caps.maxAnisotropy;
+            s_autoAnisotropy = caps.kind == rhi::Capabilities::Kind::Discrete ? 16 : 4;
 #if defined(__APPLE__) && TARGET_OS_IOS
             // An M-series iPad renders at 1x (ReadRenderScale), where 16x
             // cost nothing measurable (iPad Pro M2, scripted race: 60 fps in
             // the race and in the heavy windows, as at 4x). The A-series
             // GPUs of iPhones are unmeasured: 4x there.
-            if (std::string_view(props.deviceName).starts_with("Apple M"))
+            if (std::string_view(caps.deviceName).starts_with("Apple M"))
                 s_autoAnisotropy = 16;
 #endif
             {
@@ -7437,63 +6892,41 @@ void main()
                     anisotropy < 0 ? "the game's" : std::format("{}x", std::min(float(anisotropy), s_maxAnisotropy)).c_str());
             }
 
-            s_planMemory = PlanMemory();
-            memplan::GuestInput in;
-            in.gpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? memplan::Gpu::kDiscrete
-                : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? memplan::Gpu::kIntegrated : memplan::Gpu::kOther;
-            if (const char* kind = s_memoryTest.kind)
-            {
-                std::string_view k(kind);
-                in.gpu = k == "integrated" ? memplan::Gpu::kIntegrated : k == "discrete" ? memplan::Gpu::kDiscrete
-                    : k == "other" ? memplan::Gpu::kOther : in.gpu;
-                fprintf(stderr, "[renderer] NFSMW_TEST_GPU_KIND=%s: memory planned as for %s GPU\n", kind,
-                    in.gpu == memplan::Gpu::kDiscrete ? "a discrete" : in.gpu == memplan::Gpu::kIntegrated ? "an integrated" : "another");
-            }
-            in.importable = s_vk->getMemoryHostPointerProperties != nullptr;
-            in.importRefusal = memplan::ImportRefusal(DriverId(props));
-            in.overrides = memplan::ParseOverrides(std::getenv("NFSMW_SHARED_MEMORY"), std::getenv("NFSMW_SHADOW_MEMORY"),
-                std::getenv("NFSMW_RING_MEMORY"));
-            VkMemoryRequirements req;
-            VkBuffer copy = NewCopyBuffer(req);
-            in.bits = req.memoryTypeBits;
-            s_planGpu = in.gpu;
-            memplan::Plan plan = memplan::PlanGuestMemory(s_planMemory, in);
-            std::string failed;
-            const memplan::Candidate* placed = nullptr;
-            for (const memplan::Candidate& c : plan.order)
-            {
-                if (c.place == memplan::Place::kImport ? ImportSharedMemory() : CreateShadowSharedMemory(copy, req, c))
-                {
-                    placed = &c;
-                    break;
-                }
-                failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, false);
-            }
-            if (!placed)
-            {
-                fprintf(stderr, "[renderer] guest memory: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+            rhi::GuestMemory guest;
+            if (!s_rhi->CreateGuestMemory(s_sharedHost, kSharedSize, guest))
                 EndWithoutMemory();
-            }
-            if (placed->place == memplan::Place::kImport)
+            s_sharedBuffer = std::move(guest.buffer);
+            s_shared = rhi::vulkan::NativeBuffer(*s_sharedBuffer);
+            if (guest.shadow)
             {
-                vkDestroyBuffer(s_dev, copy, nullptr);
-                fprintf(stderr, "[renderer] guest memory: imported (zero-copy)\n");
-                s_guestChoice = "imported (zero-copy)";
+                // Write every page of the mapping once, before anything uses it.
+                // The first CPU write to a page of mapped VRAM faults it into the
+                // page tables; left to the first sync, a burst of new textures
+                // paid it mid-frame (on the Steam Machine, copying 7.9 MB of
+                // never-copied pages took 3.9 ms instead of 2.9, a scene load's
+                // 44 MB 22 ms instead of 14-17), while all 512 MB in order take
+                // ~100 ms here. The zeros are never read: SyncShadow copies a page
+                // before its first use. NFSMW_SHADOW_PREFAULT=0 leaves the faults
+                // to the first sync.
+                static const bool prefault = [] { const char* v = std::getenv("NFSMW_SHADOW_PREFAULT"); return !v || v[0] != '0'; }();
+                auto prefaultStart = std::chrono::steady_clock::now();
+                if (prefault)
+                    for (VkDeviceSize offset = 0; offset < kSharedSize; offset += 4096)
+                        static_cast<volatile uint8_t*>(guest.shadow)[offset] = 0;
+                if (prefault)
+                    fprintf(stderr, "[renderer] guest memory copy: pages touched in %.0f ms\n",
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prefaultStart).count());
+                writewatch::EnableShadow(guest.shadow);
+                s_shadowMode = true;
+                s_shadowInVram = guest.shadowInVram;
             }
-            else
-            {
-                s_guestType = placed->type;
-                s_guestChoice = std::format("as a GPU copy in {}, memory type {}", placed->place == memplan::Place::kVram ? "CPU-mapped VRAM"
-                    : placed->place == memplan::Place::kCached ? "cached host memory" : "host memory", placed->type);
-            }
-            s_guestChoice += " (" + plan.why + ")" + AfterFailed(failed);
         }
 
         void CreateRing()
         {
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = kRingSize;
-            bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            rhi::BufferDesc bd;
+            bd.size = kRingSize;
+            bd.usage = rhi::kBufferUniform | rhi::kBufferIndex | rhi::kBufferStorage;
 #ifdef _WIN32
             // Texture uploads copy the untiled texels from the ring into
             // their images (vkCmdCopyBufferToImage), which needs TRANSFER_SRC:
@@ -7505,64 +6938,15 @@ void main()
             // The drivers met so far copy anyway; a new driver needn't.
             // Windows only for now, so the other platforms stay as they are;
             // the spec wants it everywhere.
-            bci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bd.usage |= rhi::kBufferCopySrc | rhi::kBufferCopyDst;
 #endif
-            Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_ring), "vkCreateBuffer(ring)");
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_dev, s_ring, &req);
-            // Device-local when the host can map it (resizable BAR) and it
-            // fits, so the GPU reads constants and indices from VRAM; else
-            // cached system memory (memory_plan.h). NFSMW_RING_MEMORY=cached
-            // prefers cached system memory anyway: the CPU's ~40 MB of
-            // writes a frame then aren't write-combined PCIe stores (an A/B
-            // experiment: on the Steam Machine 2% less CPU, twice the GPU
-            // time); =vram|system name the other places.
-            memplan::Overrides o = memplan::ParseOverrides(nullptr, nullptr, std::getenv("NFSMW_RING_MEMORY"));
-            memplan::Plan plan = memplan::PlanRing(s_planMemory, req.memoryTypeBits, s_guestType, o.ring);
-            std::string failed;
-            const memplan::Candidate* placed = nullptr;
-            for (const memplan::Candidate& c : plan.order)
-            {
-                VkDeviceMemory memory = VK_NULL_HANDLE;
-                void* p = nullptr;
-                const char* what = "vkAllocateMemory(ring)";
-                VkResult r = AllocatePlanned(c, true, req.size, memory);
-                if (r == VK_SUCCESS && (r = vkMapMemory(s_dev, memory, 0, VK_WHOLE_SIZE, 0, &p)) != VK_SUCCESS)
-                    what = "vkMapMemory(ring)";
-                else if (r == VK_SUCCESS && (r = vkBindBufferMemory(s_dev, s_ring, memory, 0)) != VK_SUCCESS)
-                {
-                    what = "vkBindBufferMemory(ring)";
-                    vkDestroyBuffer(s_dev, s_ring, nullptr);  // (a buffer binds once)
-                    Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_ring), "vkCreateBuffer(ring)");
-                }
-                if (r != VK_SUCCESS)
-                {
-                    fprintf(stderr, "[renderer] %s failed: %d (%s, memory type %u): trying the next place\n", what, int(r),
-                        memplan::Name(c.place, true), c.type);
-                    if (memory)
-                        vkFreeMemory(s_dev, memory, nullptr);
-                    failed += std::string(failed.empty() ? "" : ", ") + memplan::Name(c.place, true);
-                    continue;
-                }
-                fprintf(stderr, "[renderer] upload ring: memory type %u (flags %X)\n", c.type, s_memProps.memoryTypes[c.type].propertyFlags);
-                s_ringMemory = memory;
-                s_ringHost = static_cast<uint8_t*>(p);
-                placed = &c;
-                break;
-            }
-            if (!placed)
-            {
-                fprintf(stderr, "[renderer] upload ring: no place could hold it (%s failed; %s)\n", failed.c_str(), plan.why.c_str());
+            bd.memory = rhi::MemoryKind::Stream;
+            bd.name = "upload ring";
+            s_ringBuffer = s_rhi->CreateBuffer(bd);
+            if (!s_ringBuffer)
                 EndWithoutMemory();
-            }
-            // The choice and why, in one line.
-            fprintf(stderr, "[renderer] memory: guest memory %s; upload ring in %s, memory type %u (%s)%s\n", s_guestChoice.c_str(),
-                placed->place == memplan::Place::kVram ? "CPU-mapped VRAM" : placed->place == memplan::Place::kCached ? "cached host memory"
-                    : "host memory", placed->type, plan.why.c_str(), AfterFailed(failed).c_str());
-            // Issue #40: say so when the GPU reads guest memory across PCIe.
-            if (const char* note = memplan::OverPcieNote(s_planGpu, s_shadowMode && s_shadowInVram,
-                    (s_memProps.memoryTypes[placed->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0))
-                fprintf(stderr, "[renderer] note: %s\n", note);
+            s_ring = rhi::vulkan::NativeBuffer(*s_ringBuffer);
+            s_ringHost = static_cast<uint8_t*>(s_ringBuffer->Map());
         }
 
         void CreateSet0()
@@ -7633,15 +7017,11 @@ void main()
             sci.maxLod = VK_LOD_CLAMP_NONE;
             Check(vkCreateSampler(s_dev, &sci, nullptr, &s_sampler), "vkCreateSampler");
 
-            VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            s_dummy[0] = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { 1, 1, 1 }, 1, usage,
-                VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
-            s_dummy[1] = CreateImage(VK_IMAGE_TYPE_3D, VK_FORMAT_R8G8B8A8_UNORM, { 1, 1, 1 }, 1, usage,
-                VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_ASPECT_COLOR_BIT);
-            s_dummy[2] = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { 1, 1, 1 }, 6, usage,
-                VK_IMAGE_VIEW_TYPE_CUBE, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
-            s_dummyStorage = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R32_UINT, { 1, 1, 1 }, 1, VK_IMAGE_USAGE_STORAGE_BIT,
-                VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+            const uint32_t usage = rhi::kImageSampled | rhi::kImageCopyDst;
+            s_dummy[0] = CreateImage(rhi::ImageKind::Image2D, rhi::Format::RGBA8, { 1, 1, 1 }, 1, usage);
+            s_dummy[1] = CreateImage(rhi::ImageKind::Image3D, rhi::Format::RGBA8, { 1, 1, 1 }, 1, usage);
+            s_dummy[2] = CreateImage(rhi::ImageKind::Cube, rhi::Format::RGBA8, { 1, 1, 1 }, 6, usage);
+            s_dummyStorage = CreateImage(rhi::ImageKind::Image2D, rhi::Format::R32_UINT, { 1, 1, 1 }, 1, rhi::kImageStorage);
             Begin();
             ToGeneral(s_dummyStorage.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
             VkClearColorValue white{ { 1.0f, 1.0f, 1.0f, 1.0f } };
@@ -7695,15 +7075,11 @@ void main()
                 s_scaledByStart.erase(it);
             if (t.scaled)
                 ReleaseHeldPages(&t, t.guestStart, t.guestSize);
-            for (auto& [swizzle, view] : t.views)
-                vkDestroyImageView(s_dev, view, nullptr);
             t.views.clear();
-            for (uint32_t layer = 1; layer < 6; layer++)  // ([0] is storeView)
-                if (t.storeViews[layer])
-                    vkDestroyImageView(s_dev, t.storeViews[layer], nullptr);
+            t.viewsRhi.clear();
+            for (auto& view : t.storeViewsRhi)
+                view.reset();
             std::fill(std::begin(t.storeViews), std::end(t.storeViews), VK_NULL_HANDLE);
-            if (t.storeView)
-                vkDestroyImageView(s_dev, t.storeView, nullptr);
             t.storeView = VK_NULL_HANDLE;
             DestroyImage(t.image);
         }
@@ -7940,25 +7316,17 @@ void main()
         PassDefaultsForDevice();  // before anything reads them
 #endif
         {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-            ReadRenderScale(props);
+            const rhi::Capabilities& caps = s_rhi->GetCapabilities();
+            ReadRenderScale(caps);
             const char* split = std::getenv("NFSMW_SPLIT_MEMORY");
-            s_splitMemory = split ? split[0] == '1' : props.limits.maxStorageBufferRange < kSharedSize;
+            s_splitMemory = split ? split[0] == '1' : caps.maxStorageBufferRange < kSharedSize;
             if (s_splitMemory)
                 fprintf(stderr, "[renderer] guest memory bound as 4 parts of %llu MB (storage buffers bind up to %u MB here)\n",
-                    (unsigned long long)(kSharedPart >> 20), props.limits.maxStorageBufferRange >> 20);
+                    (unsigned long long)(kSharedPart >> 20), uint32_t(caps.maxStorageBufferRange >> 20));
             s_resolutionSetting = settings::GetInt(settings::Id::InternalResolution);
             s_loadMips = settings::GetBool(settings::Id::Mipmaps);
             s_liveGeneration = settings::Generation();
-            uint32_t count = 0;
-            vkEnumerateDeviceExtensionProperties(s_vk->physical, nullptr, &count, nullptr);
-            std::vector<VkExtensionProperties> extensions(count);
-            vkEnumerateDeviceExtensionProperties(s_vk->physical, nullptr, &count, extensions.data());
-            for (const VkExtensionProperties& e : extensions)
-                s_memoryBudget |= strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
         }
-        vkGetPhysicalDeviceMemoryProperties(s_vk->physical, &s_memProps);
         s_pushDescriptorSet = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
             vkGetDeviceProcAddr(s_dev, "vkCmdPushDescriptorSetKHR"));
         if (!s_pushDescriptorSet)
@@ -8020,8 +7388,6 @@ void main()
             fprintf(stderr, "[renderer] NFSMW_UNTILED_AREA%s: untiled passes load and store their draws' guest viewport, not the whole target\n",
                 s_untiledArea == 2 ? "=alt (every other [perf] window)" : "");
         std::thread(CompletionThread).detach();
-        if (s_imagePool)
-            std::thread(MemoryThread).detach();
 
         CreateSharedMemory();
         SetSharedInfo();
@@ -10429,9 +9795,8 @@ void main()
         {
             // A new size: wait for any use of the old image before replacing it.
             DestroyFrontImage(front, frontW, frontH);
-            front = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { outW, outH, 1 }, 1,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,  // sampled: presenter post-processing
-                VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+            front = CreateImage(rhi::ImageKind::Image2D, rhi::Format::RGBA8, { outW, outH, 1 }, 1,
+                rhi::kImageStorage | rhi::kImageCopySrc | rhi::kImageSampled);  // sampled: presenter post-processing
             Begin();
             ToGeneral(front.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
             frontW = outW;
@@ -10813,9 +10178,10 @@ void main()
             long preemptions = 0;
         };
         static Totals last{};
+        const rhi::ImageMemoryStats imageStats = s_rhi->GetImageMemoryStats();
         Totals now{ g_cpBusyNs, {}, s_stats.draws, s_stats.tileSkips, s_stats.resolves, s_stats.submits, s_stats.snapshotBytes,
-            s_gpuExecNs.load(), timeline::g_gameWaitNs.load(), timeline::g_gamePresentNs.load(), s_imageTotals.allocations,
-            s_imageTotals.allocationNs, writewatch::GetGuardStats() };
+            s_gpuExecNs.load(), timeline::g_gameWaitNs.load(), timeline::g_gamePresentNs.load(), imageStats.allocations,
+            imageStats.allocationNs, writewatch::GetGuardStats() };
         std::copy(std::begin(g_cpWaitKindNs), std::end(g_cpWaitKindNs), now.waitNs);
         // This (the command processor's) thread's CPU time, and on Linux the
         // times the scheduler took its core away: busy time the thread wasn't
@@ -10923,53 +10289,25 @@ void main()
         }
         m.scaled = s_scaled.poolBytes + s_scaled.tableBytes + s_scaled.scratchBytes;
         m.front = s_front.bytes + s_frontScaled.bytes + s_frontBetween.bytes + s_frontBetweenScaled.bytes;
-        auto own = [&m](const Image& image) {
-            if (image.memory && !image.block)
-            {
-                m.own++;
-                m.ownBytes += image.bytes;
-            }
-        };
-        for (const auto& [key, rt] : s_targets)
-            own(rt->image);
-        for (const auto& [key, t] : s_textures)
-            own(t->image);
-        for (const Image* image : { &s_front, &s_frontScaled, &s_frontBetween, &s_frontBetweenScaled, &s_dummy[0], &s_dummy[1], &s_dummy[2], &s_dummyStorage })
-            own(*image);
-        for (const auto& block : s_blocks)
-        {
-            m.blocks++;
-            m.blockBytes += block->ranges.Size();
-            m.rangeBytes += block->ranges.Used();
-            m.ranges += block->ranges.Ranges();
-        }
-        {
-            std::lock_guard lock(s_spareMutex);
-            for (const std::vector<Spare>& spares : s_spares)
-                m.spares += uint32_t(spares.size());
-            m.spareBlocks = s_imageTotals.spareBlocks;
-            m.spareNs = s_imageTotals.spareNs;
-            m.blocksFreed = s_imageTotals.blocksFreed;
-        }
-        m.spareBytes = m.spares * s_blockSize;
-        m.images = s_imageTotals.images;
-        m.imageNs = s_imageTotals.imageNs;
-        m.allocations = s_imageTotals.allocations;
-        m.allocationNs = s_imageTotals.allocationNs;
-        m.fromSpare = s_imageTotals.fromSpare;
-        m.blocksHere = s_imageTotals.blocksHere;
-        if (s_vk && s_memoryBudget)
-        {
-            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
-            VkPhysicalDeviceMemoryProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget };
-            vkGetPhysicalDeviceMemoryProperties2(s_vk->physical, &props);
-            for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++)
-                if (props.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                {
-                    m.deviceUsed += budget.heapUsage[h];
-                    m.deviceBudget += budget.heapBudget[h];
-                }
-        }
+        const rhi::ImageMemoryStats stats = s_rhi->GetImageMemoryStats();
+        m.own = stats.own;
+        m.ownBytes = stats.ownBytes;
+        m.blocks = stats.blocks;
+        m.blockBytes = stats.blockBytes;
+        m.rangeBytes = stats.rangeBytes;
+        m.ranges = stats.ranges;
+        m.spares = stats.spares;
+        m.spareBytes = stats.spareBytes;
+        m.spareBlocks = stats.spareBlocks;
+        m.spareNs = stats.spareNs;
+        m.blocksFreed = stats.blocksFreed;
+        m.images = stats.images;
+        m.imageNs = stats.imageNs;
+        m.allocations = stats.allocations;
+        m.allocationNs = stats.allocationNs;
+        m.fromSpare = stats.fromSpare;
+        m.blocksHere = stats.blocksHere;
+        s_rhi->GetMemoryUsage(m.deviceUsed, m.deviceBudget);
         return m;
     }
 

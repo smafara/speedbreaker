@@ -1409,6 +1409,9 @@ namespace gpu::rhi::vulkan
                         ? VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                         : VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
                 uint32_t type = m_c->FindMemoryType(req.memoryTypeBits, want);
+                // Cached where there is some (the CPU reads it), else any coherent host-visible type.
+                if (type == UINT32_MAX && desc.memory == MemoryKind::UploadCached)
+                    type = m_c->FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                 VkDeviceMemory memory = VK_NULL_HANDLE;
                 if (type != UINT32_MAX)
                 {
@@ -2471,6 +2474,8 @@ namespace gpu::rhi::vulkan
 
     VkImage NativeImage(const Image& image) { return static_cast<const VkImageObject&>(image).Handle(); }
     VkImageView NativeView(const Image& image) { return static_cast<const VkImageObject&>(image).View(); }
+    VkImageView NativeImageView(const ImageView& view) { return static_cast<const VkImageViewObject&>(view).Handle(); }
+    VkBuffer NativeBuffer(const Buffer& buffer) { return static_cast<const VkBufferObject&>(buffer).Handle(); }
     VkFormat NativeFormat(const Swapchain& swapchain) { return static_cast<const VkSwapchainObject&>(swapchain).VkFormatOf(); }
     std::unique_ptr<Image> WrapImage(Device& device, VkImage image, Format format, uint32_t width, uint32_t height, uint32_t usage)
     {

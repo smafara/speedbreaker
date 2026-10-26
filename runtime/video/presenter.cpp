@@ -3572,6 +3572,10 @@ namespace video
             SDL_DestroyWindow(s_window);
         // No SDL_Quit: the process exits next, and the game's audio thread
         // may still be feeding its stream (SDL_Quit freed it under it).
+        // The device is kept, not destroyed: the renderer's objects (textures,
+        // targets, buffers) are statics of its own, destroyed after this
+        // with the process, and each needs the device to go with it.
+        (void)s_rhi.release();
     }
 }
 
