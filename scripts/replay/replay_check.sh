@@ -8,6 +8,11 @@
 # build/captures/<name>.sbtrace, baselines build/baselines/frames/<name>/
 # (both hold game memory or game images: never commit them). With no name,
 # all captures there. --record replaces the baseline with this run's frames.
+# Two kinds of picture are compared: frame_*.ppm, each swap's front buffer in
+# guest memory (what the renderer produced; backend-independent, 1280x720),
+# and presented.ppm, the last picture as the window shows it after the
+# presenter's post-processing (AA, scaling; the window's size, so this
+# machine's settings and display: re-record when they change).
 # Run from the repository root, with build/main built. Exit status 0 if all
 # passed.
 #   SB_REPLAY_ENV="NAME=value ..."  extra environment for the replay (a backend)
@@ -43,6 +48,7 @@ for name in "${names[@]}"; do
     mkdir -p "$out"
     # No timeout(1) on macOS: perl's alarm.
     env ${SB_REPLAY_ENV:-} NFSMW_REPLAY="$capture" NFSMW_REPLAY_EXIT=1 NFSMW_DUMP_FRAMES="$out" NFSMW_DUMP_EVERY=1 \
+        NFSMW_DUMP_PRESENTED="$out/presented.ppm" \
         perl -e 'alarm 300; exec @ARGV' "$binary" >"$work/$name.log" 2>&1 || {
         echo "$name: the replay failed (log: $work/$name.log)"; trap - EXIT; status=1; continue; }
     base="build/baselines/frames/$name"

@@ -23,7 +23,6 @@
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <report/report.h>
-#include <csignal>
 #include <unordered_set>
 
 namespace gpu
@@ -1198,11 +1197,7 @@ namespace gpu
             {
                 uint32_t next = trace::ReplayNext(Physical(0));
                 if (next == trace::kReplayEnd)
-                {
-                    s_replayDone = true;
-                    if (const char* e = std::getenv("NFSMW_REPLAY_EXIT"); e && e[0] == '1')
-                        std::raise(SIGTERM);  // as the window's close button
-                }
+                    s_replayDone = true;  // (main.cpp ends the run: NFSMW_REPLAY_EXIT)
                 else
                     s_replayWrite = next;
             }

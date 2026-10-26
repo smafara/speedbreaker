@@ -3955,7 +3955,13 @@ void main()
         }
         else
         {
-            if (!ui::WantsFrames())
+            // (A screenshot asked for wants one too: CaptureFrame is answered by a frame drawn.)
+            bool capturePending;
+            {
+                std::lock_guard lock(s_captureMutex);
+                capturePending = !s_captureRequests.empty();
+            }
+            if (!ui::WantsFrames() && !capturePending)
             {
                 frontLock.unlock();
                 SDL_Delay(2);

@@ -60,6 +60,9 @@ namespace gpu::trace
     // Reads the header and loads the snapshot into guest physical memory.
     bool ReplayLoad(const char* path, uint8_t* physical, ReplayState& state);
 
+    // Any thread: the replay has run all its batches (and their GPU work).
+    bool ReplayFinished();
+
     constexpr uint32_t kReplayEnd = ~0u;
     // Command processor thread, with the previous batch consumed: waits for
     // its work to finish, applies the next batch's CPU changes to guest

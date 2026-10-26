@@ -332,3 +332,16 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   switch later). Vulkan against its own baseline: 0 bad pixels in all 12 frames. Checked that it
   fails: one pixel changed by 16 is reported at tolerance 0 and passes at tolerance 20.
   This is the gate for every refactor step (D5): run it before each commit.
+- 2026-10-26: presented-picture check (the presenter refactor needs it: the frame dumps are the
+  front buffer in guest memory, before the presenter's post-processing and swapchain).
+  `NFSMW_DUMP_PRESENTED=<file>` (replay only; main.cpp) saves, 30 frames after the replay's
+  end, `video::CaptureFrame()`: the game picture as the window shows it, without UI;
+  `NFSMW_REPLAY_EXIT=1` now ends the run from main.cpp (not the command processor).
+  `RunFrame` returned early without drawing when the game stopped presenting and the UI
+  needed nothing, so a screenshot request never got an answer: a pending `CaptureFrame` now
+  counts as wanting a frame (this also helps the bug report's screenshot while the game is
+  idle). `replay_check.sh` passes it as `presented.ppm`, compared like the frame dumps.
+  Size on this machine: 5120x2880 (the window), so that baseline depends on this machine's
+  window size and settings (AA, scaling): re-record if they change. Two replays of `world`
+  give byte-identical presented pictures; a flipped byte in the baseline fails the check.
+  The whole check (both captures, 7 pictures each) takes ~2 s with warm pipeline caches.

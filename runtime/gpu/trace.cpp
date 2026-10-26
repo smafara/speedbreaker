@@ -5,6 +5,7 @@
 
 #include <kernel/write_watch.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -210,6 +211,7 @@ namespace gpu::trace
         const char* const s_replayPath = std::getenv("NFSMW_REPLAY");
         FILE* s_replay = nullptr;
         uint64_t s_replayBatches = 0;
+        std::atomic<bool> s_replayFinished{ false };
         std::chrono::steady_clock::time_point s_replayBegan;
 
         bool Get(void* data, size_t size)
@@ -246,6 +248,11 @@ namespace gpu::trace
     const char* ReplayPath()
     {
         return s_replayPath;
+    }
+
+    bool ReplayFinished()
+    {
+        return s_replayFinished;
     }
 
     bool ReplayLoad(const char* path, uint8_t* physical, ReplayState& state)
@@ -300,6 +307,7 @@ namespace gpu::trace
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - s_replayBegan).count());
             fclose(s_replay);
             s_replay = nullptr;
+            s_replayFinished = true;
             return false;
         }
     }

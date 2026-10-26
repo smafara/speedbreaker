@@ -643,8 +643,37 @@ int main(int argc, char** argv)
     // iOS: the "needs a controller" notice, a few seconds into the game
     // (not over the installer).
     hid::NoteGameStarting();
+    // NFSMW_REPLAY: at its end, NFSMW_DUMP_PRESENTED=<file> saves the last
+    // picture as the window shows it (after the post-processing, without the
+    // UI; a PPM), and NFSMW_REPLAY_EXIT=1 ends the run.
+    const char* presentedPath = std::getenv("NFSMW_DUMP_PRESENTED");
+    const char* replayExit = std::getenv("NFSMW_REPLAY_EXIT");
+    int framesSinceReplay = 0;
+    std::future<video::CapturedFrame> presented;
     while (video::RunFrame())
-        ;
+    {
+        if (!gpu::trace::ReplayRequested() || !gpu::trace::ReplayFinished())
+            continue;
+        // A few frames for the presenter to show the replay's last picture.
+        if (++framesSinceReplay == 30 && presentedPath && *presentedPath)
+            presented = video::CaptureFrame();
+        if (presented.valid() && presented.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            video::CapturedFrame frame = presented.get();
+            if (FILE* f = fopen(presentedPath, "wb"); f && !frame.rgb.empty())
+            {
+                fprintf(f, "P6\n%u %u\n255\n", frame.width, frame.height);
+                fwrite(frame.rgb.data(), 1, frame.rgb.size(), f);
+                fclose(f);
+                fprintf(stderr, "[replay] presented picture %ux%u saved to %s\n", frame.width, frame.height, presentedPath);
+            }
+            else
+                fprintf(stderr, "[replay] no presented picture to save (%s)\n", presentedPath);
+            presentedPath = nullptr;
+        }
+        if (replayExit && replayExit[0] == '1' && (!presentedPath || !*presentedPath) && framesSinceReplay >= 30)
+            break;
+    }
     if (int sig = quitsignals::Requested())
         fprintf(stderr, "[runtime] %s: quitting, as the window's close button does\n", quitsignals::Name(sig));
     fprintf(stderr, "[runtime] window closed\n");

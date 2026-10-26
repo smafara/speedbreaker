@@ -25,19 +25,24 @@ def read_ppm(path):
     return width, height, pixels
 
 
-def compare(a, b, tolerance):
+def compare(a, b, tolerance, width):
     """(bad pixels, largest channel difference, mean absolute difference)."""
     if a == b:
         return 0, 0, 0.0
     bad = largest = total = 0
-    for i in range(0, len(a), 3):
-        if a[i:i + 3] == b[i:i + 3]:
+    stride = width * 3
+    for row in range(0, len(a), stride):
+        ra, rb = a[row:row + stride], b[row:row + stride]
+        if ra == rb:
             continue
-        worst = max(abs(a[i] - b[i]), abs(a[i + 1] - b[i + 1]), abs(a[i + 2] - b[i + 2]))
-        total += abs(a[i] - b[i]) + abs(a[i + 1] - b[i + 1]) + abs(a[i + 2] - b[i + 2])
-        largest = max(largest, worst)
-        if worst > tolerance:
-            bad += 1
+        for i in range(0, stride, 3):
+            if ra[i:i + 3] == rb[i:i + 3]:
+                continue
+            d = (abs(ra[i] - rb[i]), abs(ra[i + 1] - rb[i + 1]), abs(ra[i + 2] - rb[i + 2]))
+            total += sum(d)
+            largest = max(largest, *d)
+            if max(d) > tolerance:
+                bad += 1
     return bad, largest, total / len(a)
 
 
@@ -62,7 +67,7 @@ def main():
             print(f"FAIL {name}: size {wa}x{ha} vs {wb}x{hb}")
             failed = True
             continue
-        bad, largest, mean = compare(a, b, args.tolerance)
+        bad, largest, mean = compare(a, b, args.tolerance, wa)
         percent = 100.0 * bad / (wa * ha)
         ok = percent <= args.max_bad_percent
         failed |= not ok
