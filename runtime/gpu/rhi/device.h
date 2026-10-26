@@ -125,6 +125,12 @@ namespace gpu::rhi
         uint32_t index = 0;
         BindingKind kind = BindingKind::StorageBuffer;
         uint8_t stages = 0;      // ShaderStage bits
+        // CombinedImageSampler: a sampler fixed in the layout (the renderer
+        // uses one for every texture). Metal allows 16 samplers a stage but
+        // 128 textures: the backend binds this one sampler once, rather than
+        // one per texture the shader's combined image-samplers would become.
+        // nullptr: ImageBinding::sampler is given at bind time.
+        const Sampler* immutableSampler = nullptr;
     };
 
     // A table of slots: persistent (a BindingSet) or pushed per draw.

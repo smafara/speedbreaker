@@ -82,7 +82,8 @@ namespace gpu::rhi
     enum class Filter : uint8_t { Nearest, Linear };
     enum class AddressMode : uint8_t { Repeat, ClampToEdge, MirrorRepeat };
 
-    enum class Topology : uint8_t { PointList, LineList, LineStrip, TriangleList, TriangleStrip, TriangleFan };
+    // (No triangle fan: the renderer converts fans and polygons to lists, and Metal has no fan.)
+    enum class Topology : uint8_t { PointList, LineList, LineStrip, TriangleList, TriangleStrip };
     enum class CullMode : uint8_t { None, Front, Back };
     enum class CompareOp : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
     enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap, DecrementWrap };

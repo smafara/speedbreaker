@@ -384,3 +384,20 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   devices that can't); (d) occlusion counting, fragment shading rate, multiview and depth/
   stencil resolve are not in the draft (the last two: check whether they are used at all);
   (e) pipeline cache blob format is per backend; (f) `Present`/swapchain come with step 2.
+- 2026-10-26: draft fixes after the risk review: `Topology::TriangleFan` removed (the renderer
+  converts fans/polygons to lists; Metal has none), `BindingSlot::immutableSampler` added (one
+  sampler for all textures, bound once on Metal).
+  SHADER-PATH SPIKE (throwaway, in the scratchpad, not in the repo): the 115 SPIR-V modules in
+  `~/Library/Caches/SpeedBreaker/spirv` (real translated Xenos vertex/pixel shaders and the
+  renderer's compute shaders: 46 vertex, 59 fragment, 10 compute) through SPIRV-Cross
+  (`--msl --msl-version 30000`): 115 of 115 convert; then compiled with the system Metal
+  compiler (`MTLDevice newLibraryWithSource`, Apple M5 Max; the offline `metal` tool is not
+  installed: it needs `xcodebuild -downloadComponent MetalToolchain`, not done): 115 of 115
+  compile, 3.3 s total, avg 28 ms, worst 267 ms (library only; pipeline-state creation is
+  extra and not measured). Resource use: at most 4 buffers, 7 textures and 7 samplers in a
+  shader (Metal: 31 / 128 / 16), no buffer-index collisions. Vertex shaders take the ring and
+  the 512 MB guest memory as `const device` buffers, the constants as a 10 KB `constant`
+  buffer (dynamic offset), the compute resolves guest memory as a device buffer plus a
+  `texture2d<uint, access::write>`. So the D4 path (GLSL -> SPIR-V -> MSL) is viable for the
+  whole current shader set; it says nothing yet about correct results (that is the replay
+  check on a Metal backend) or pipeline-state creation time.
