@@ -365,9 +365,8 @@ namespace gpu::renderer
         // loops[8], drawInfo[4], each a vec4/uvec4.
         constexpr uint32_t kConstantsSize = (512 + 48 + 2 + 8 + 4) * 16;
 
-        // Images (the RHI's, kept in one layout for life: ImageDesc::general),
-        // with the Vulkan handles the recording below still uses. Image memory
-        // is the device's (blocks and spares in the Vulkan backend, D14).
+        // Images (the RHI's, kept in one layout for life: ImageDesc::general).
+        // Image memory is the device's (blocks and spares in the Vulkan backend, D14).
         struct Image
         {
             std::unique_ptr<rhi::Image> rhi;
@@ -466,7 +465,7 @@ namespace gpu::renderer
             std::unique_ptr<rhi::Fence> fence;
             bool inFlight = false;
             // A write whose `event` is set runs as soon as the GPU passes that
-            // point of the command buffer (vkCmdSetEvent after the work it
+            // point of the command buffer (the event signalled after the work it
             // follows); the rest run when the whole submission completes.
             struct Write { std::function<void()> fn; rhi::Event* event = nullptr; std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(); };
             std::vector<Write> writes;
@@ -542,7 +541,7 @@ namespace gpu::renderer
         double s_emptyUs = 0;
 
         // Occlusion queries counted on the GPU (NFSMW_OCCLUSION=1; the
-        // presenter decides: VulkanContext::occlusionCounting). Command
+        // presenter decides: video::RendererPolicy::occlusionCounting). Command
         // processor thread, but for the results ring (completion thread) and
         // the store statistics (under s_submitMutex). See ZpassDone.
         bool s_zpdOn = false;                  // constant after Initialize
@@ -705,10 +704,9 @@ namespace gpu::renderer
                 sub.list->WriteTimestamp(*s_timestamps, s_slot * 2, false);
             }
             // Occlusion queries: the slot's last submission has retired, its
-            // results harvested; reset the queries it used (a host reset is a
-            // memset on MoltenVK; else a command, outside any pass here: for
-            // devices before Vulkan 1.2, which requires host reset, so not
-            // exercised on MoltenVK, RADV or Turnip).
+            // results harvested; reset the queries it used (QueryPool::Reset
+            // when the device can reset from the host, else a command, outside
+            // any pass here).
             if (s_zpdOn && s_zpdUsed[s_slot])
             {
                 if (!s_zpdPool[s_slot]->Reset(0, s_zpdUsed[s_slot]))
@@ -2321,7 +2319,7 @@ namespace gpu::renderer
                 // One reaching past the attachments' common size (a target
                 // larger than another attached) is consumed here, but the
                 // part beyond this pass is never cleared; one not covering
-                // the pass is also a vkCmdClearAttachments outside the render
+                // the pass is also a ClearAttachments outside the render
                 // area (invalid usage). A deferred clear relies on its
                 // target's next pass holding it, and NFSMW_CLEAR_FLUSH_RECT
                 // defers more of them: with it, logged once per target.
@@ -2330,7 +2328,7 @@ namespace gpu::renderer
                         "pending clear %ux%u@%d,%d of target b%u p%u%s reaches past its pass (area %ux%u@%d,%d): the rest is not cleared%s",
                         it->rect.extent.width, it->rect.extent.height, it->rect.offset.x, it->rect.offset.y, it->rt->base, it->rt->pitch,
                         it->rt->depth ? " (depth)" : "", s_passArea.extent.width, s_passArea.extent.height, s_passArea.offset.x,
-                        s_passArea.offset.y, whole ? "" : " (cleared in the pass: a vkCmdClearAttachments rect outside its render area)");
+                        s_passArea.offset.y, whole ? "" : " (cleared in the pass: a ClearAttachments rect outside its render area)");
                 rhi::ColorAttachment* colorAtt = nullptr;
                 if (it->rt != depth)
                     for (int i = 0; i < 4; i++)

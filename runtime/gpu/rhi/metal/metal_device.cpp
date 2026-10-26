@@ -160,23 +160,6 @@ namespace gpu::rhi::metal
             return MTL::PixelFormatInvalid;
         }
 
-        uint32_t BytesPerPixel(Format f)
-        {
-            switch (f)
-            {
-            case Format::R8: return 1;
-            case Format::RG8: case Format::R16: case Format::R16F: return 2;
-            case Format::RGBA8: case Format::BGRA8: case Format::RGBA8_sRGB: case Format::BGRA8_sRGB: case Format::RG16:
-            case Format::RG16_SNORM: case Format::RG16F: case Format::R32F: case Format::R32_UINT: case Format::A2B10G10R10: return 4;
-            case Format::RGBA16: case Format::RGBA16_SNORM: case Format::RGBA16F: case Format::RG32F: case Format::D32F_S8: return 8;
-            case Format::RGBA32F: return 16;
-            default: return 0;  // blocks (BC) and Undefined
-            }
-        }
-
-        bool IsBlock(Format f) { return f == Format::BC1 || f == Format::BC2 || f == Format::BC3 || f == Format::BC5; }
-        bool HasDepth(Format f) { return f == Format::D32F_S8; }
-
         MTL::CompareFunction ToMtl(CompareOp op)
         {
             switch (op)

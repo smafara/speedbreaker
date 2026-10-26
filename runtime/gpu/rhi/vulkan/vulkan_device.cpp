@@ -186,8 +186,6 @@ namespace gpu::rhi::vulkan
             return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         }
 
-        bool HasDepth(Format f) { return f == Format::D32F_S8; }
-
         VkImageAspectFlags Aspect(Format f)
         {
             return HasDepth(f) ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
