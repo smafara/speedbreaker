@@ -142,6 +142,26 @@ order: until the renderer moves, the presenter wraps it (transitional `WrapImage
 Vulkan backend) needs the frame list's native command buffer: transitional
 `NativeCommandBuffer`; the ImGui Metal backend later needs the encoder instead.
 
+### D13. The Metal backend (2026-10-26, chosen by the user: metal-cpp, vendored)
+`runtime/gpu/rhi/metal/`. Metal through **metal-cpp** (Apple, Apache-2.0, header-only,
+vendored unmodified in `runtime/thirdparty/metal-cpp` at commit 8cdde68 = macOS 27.0.1; Apache-2.0
+is one-way compatible with the project's GPL-3.0-or-later; recorded in THIRD_PARTY_NOTICES.md).
+Reasons for it over Objective-C++: the backend stays plain C++ files that read next to
+`vulkan_device.cpp`; and the repo's `.mm` files are built without ARC anyway, so ObjC++ would
+not have spared the manual retain/release (here: `NS::SharedPtr`, and an autorelease pool per
+entry point since the game's threads have none). Shaders: SPIR-V -> SPIRV-Cross (MSL, Apache-2.0;
+`-DSB_SPIRV_CROSS_ROOT=<prefix>`, the Vulkan SDK's macOS folder works) -> `MTLLibrary` when a
+pipeline is created. Every (table, slot) gets a fixed Metal buffer/texture/sampler index
+(`SlotMap`), push constants the buffer after them (`setBytes`), vertex shaders get Y flipped
+(Vulkan's NDC y runs down). A command list is one `MTLCommandBuffer` with one encoder at a time;
+what was bound is kept and applied to each new encoder (Vulkan's bindings belong to the command
+buffer, Metal's to the encoder). `Transition` does nothing (hazard-tracked resources); an `Event`
+is a `MTLSharedEvent` signalled between encoders; a `Fence` is set by the completion handler.
+`ClearAttachments` and scaled `BlitImage` are small internal MSL pipelines. Opt-in:
+`-DSB_METAL=ON` (default off until it can present). Tests: `tests/rhi_test_body.h` is the same
+suite for both backends (`rhi_vulkan_test`, `rhi_metal_test`), with an orientation/winding test
+added so the two can't drift on the picture's way up or on which face is the front.
+
 ## Findings from the survey (2026-10-25)
 
 Vulkan footprint (approximate counts of `Vk*`/`vk*`/`VK_*` references):
@@ -540,4 +560,14 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   post_check pictures bit-identical, ctest 71/71, a 35 s live run with
   NFSMW_CHECK_PRESENT_SEC, NFSMW_UPSCALE_COMPARE and NFSMW_LOG_COVERS saved the presented frame
   and the three compare pictures (5120x2880, not black).
+- 2026-10-26: Metal M1 done for buffers, host import, binding sets, pushed bindings, push
+  constants, compute, events, images, samplers, graphics pipelines, rendering (depth, blend,
+  partial clear, stencil/blend/bias state), copies, blits, clears: `rhi_metal_test` passes
+  everything `rhi_vulkan_test` does on the M5 Max, plus the orientation test on both. Findings:
+  host import needs 16 KB for pointer and size and works (CPU writes after the import are seen
+  without re-importing); an event signalled mid-list was seen after 0.2-0.5 ms while the list ran
+  for 64 ms (the encoder break costs nothing visible here); two small graphics pipelines (SPIR-V
+  -> MSL -> library -> state) took 0.4-0.7 ms. Not done on Metal yet: occlusion and timestamp
+  queries (caps say so), the swapchain (M2), pipeline cache save/load (Metal keeps its own),
+  depth/stencil aspect copies, read-only depth attachments.
 

@@ -389,8 +389,11 @@ namespace
         blendDesc.depthFormat = Format::D32F_S8;  // (attached, tested off: the pass has one)
         blendDesc.blend[0] = { true, BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha, BlendOp::Add, BlendFactor::One, BlendFactor::Zero,
             BlendOp::Add, 0xF };
+        const auto began = std::chrono::steady_clock::now();
         auto depthPipeline = g_device->CreateGraphicsPipeline(depthDesc);
         auto blendPipeline = g_device->CreateGraphicsPipeline(blendDesc);
+        printf("  two graphics pipelines made in %.1f ms (SPIR-V in; on Metal also MSL, library, pipeline state)\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
         CHECK(depthPipeline && blendPipeline, "graphics pipelines");
         if (!depthPipeline || !blendPipeline)
             return;
@@ -441,6 +444,64 @@ namespace
             }
         CHECK(ok, "depth rejection, alpha blending and the mid-pass clear (pixel 0,0 = %u,%u,%u; 7,7 = %u,%u,%u)", px[0], px[1], px[2],
             px[(7 * 8 + 7) * 4], px[(7 * 8 + 7) * 4 + 1], px[(7 * 8 + 7) * 4 + 2]);
+    }
+
+    // Which way up a picture comes out, and which face is the front: the
+    // vertices of orient.vert run top left, top right, bottom left, as seen on
+    // the screen, so the top left half of the target is lit, and the triangle
+    // is front-facing for frontCounterClockwise = false (Vulkan's rule: the
+    // framebuffer's y runs down). Both backends must agree.
+    void Orientation()
+    {
+        BindingLayoutDesc ld;
+        ld.pushConstantBytes = sizeof(DrawConstants);
+        auto layout = g_device->CreateBindingLayout(ld);
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget | kImageCopySrc);
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        // Cull Back / Front, frontCounterClockwise false / true: lit or not.
+        bool lit[2][2];
+        bool pictureOk = true;
+        for (int cull = 0; cull < 2; cull++)
+            for (int ccw = 0; ccw < 2; ccw++)
+            {
+                GraphicsPipelineDesc d;
+                d.vertex = Code(k_orient_vert, sizeof(k_orient_vert) / 4);
+                d.fragment = Code(k_color_frag, sizeof(k_color_frag) / 4);
+                d.layout = layout.get();
+                d.colorFormats[0] = Format::RGBA8;
+                d.cull = cull ? CullMode::Front : CullMode::Back;
+                d.frontCounterClockwise = ccw;
+                auto pipeline = g_device->CreateGraphicsPipeline(d);
+                CHECK(pipeline != nullptr, "orientation pipeline");
+                if (!pipeline)
+                    return;
+                Run([&](CommandList& cmd) {
+                    ImageTransition begin[] = { { target.get(), State::Undefined, State::RenderTarget } };
+                    cmd.Transition(begin, 1);
+                    RenderingDesc rd;
+                    rd.color[0] = { target.get(), LoadOp::Clear, StoreOp::Store, { { 0, 0, 0, 1 } } };
+                    rd.area = { 0, 0, 8, 8 };
+                    cmd.BeginRendering(rd);
+                    cmd.SetViewport(0, 0, 8, 8, 0, 1);
+                    cmd.SetScissor({ 0, 0, 8, 8 });
+                    cmd.SetPipeline(*pipeline);
+                    DrawConstants c = { { 1, 1, 1, 1 }, 0.0f };
+                    cmd.PushConstants(*layout, &c, sizeof(c));
+                    cmd.Draw(3, 1, 0, 0);
+                    cmd.EndRendering();
+                    Readback(cmd, *target, *back, State::RenderTarget, 8, 8);
+                });
+                back->Invalidate(0, 8 * 8 * 4);
+                const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+                auto at = [&](int x, int y) { return px[(y * 8 + x) * 4] > 128; };
+                lit[cull][ccw] = at(1, 1);
+                if (lit[cull][ccw])
+                    pictureOk &= at(1, 1) && at(5, 0) && at(0, 5) && !at(1, 7) && !at(7, 1) && !at(6, 6);
+            }
+        CHECK(pictureOk, "the lit half is the top left one");
+        CHECK(lit[0][0] && !lit[0][1] && !lit[1][0] && lit[1][1],
+            "the triangle is front-facing with frontCounterClockwise = false: cull Back shows it %d/%d, cull Front %d/%d", lit[0][0], lit[0][1],
+            lit[1][0], lit[1][1]);
     }
 
     void Textures()
@@ -552,6 +613,8 @@ int main()
     Timestamps();
     printf("rendering: depth, blend, partial clear\n");
     Rendering();
+    printf("orientation, winding\n");
+    Orientation();
     printf("sampled texture, pushed binding, immutable sampler\n");
     Textures();
     printf("image clear, blit, copy\n");

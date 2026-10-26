@@ -82,6 +82,9 @@ namespace gpu::rhi::metal
             Ptr<MTL::CommandQueue> queue;
             std::string deviceName;
             Capabilities caps;
+            Ptr<MTL::SamplerState> blitSamplers[2];  // nearest, linear: the scaled copies'
+
+            MTL::SamplerState* BlitSampler(Filter f) const { return blitSamplers[f == Filter::Linear].get(); }
         };
 
         // ---- formats ----------------------------------------------------------
@@ -460,10 +463,12 @@ namespace gpu::rhi::metal
             GraphicsPipelineDesc desc;  // (shader pointers dropped: raster and depth-stencil state only)
             MTL::Device* device = nullptr;
             MTL::PrimitiveType primitive = MTL::PrimitiveTypeTriangle;
+            MTL::CullMode cull = MTL::CullModeNone;
+            MTL::Winding winding = MTL::WindingClockwise;
 
             // The depth-stencil state for the stencil masks set now. Metal keeps
             // them in the state object, Vulkan makes them dynamic.
-            MTL::DepthStencilState* DepthStencil(uint8_t compareMask, uint8_t writeMask)
+            MTL::DepthStencilState* DepthStencil(uint8_t compareMask, uint8_t writeMask) const
             {
                 const uint16_t key = uint16_t(compareMask) << 8 | writeMask;
                 std::lock_guard lock(m_mutex);
@@ -472,9 +477,7 @@ namespace gpu::rhi::metal
                     return it->second.get();
                 auto d = Own(MTL::DepthStencilDescriptor::alloc()->init());
                 d->setDepthCompareFunction(desc.depthTest ? ToMtl(desc.depthCompare) : MTL::CompareFunctionAlways);
-                d->setDepthWriteEnabled(desc.depthTest && desc.depthWrite);
-                if (!desc.depthTest && desc.depthWrite)
-                    d->setDepthWriteEnabled(true);  // (Vulkan: writes need no test; Always passes)
+                d->setDepthWriteEnabled(desc.depthTest && desc.depthWrite);  // (Vulkan: writes only with the test on)
                 if (desc.stencilTest)
                 {
                     auto face = [&](const StencilFace& f) {
@@ -498,8 +501,8 @@ namespace gpu::rhi::metal
             }
 
         private:
-            std::mutex m_mutex;
-            std::map<uint16_t, Ptr<MTL::DepthStencilState>> m_states;
+            mutable std::mutex m_mutex;
+            mutable std::map<uint16_t, Ptr<MTL::DepthStencilState>> m_states;
         };
 
         // ---- synchronisation ---------------------------------------------------------
@@ -579,21 +582,118 @@ namespace gpu::rhi::metal
 
         // ---- command lists -------------------------------------------------------------
 
+        // MSL of our own: a clear of part of the attachments in a pass
+        // (ClearAttachments) and a scaled copy of one image into another
+        // (BlitImage; Metal's blit encoder can't scale). One pipeline per
+        // target format, made on first use.
+        class InternalPipelines
+        {
+        public:
+            explicit InternalPipelines(Context& c) : m_c(c) {}
+
+            // The pipeline that fills the attachments `colorMask` selects (of
+            // `formats`), the depth if `depth`, with the values in buffer 0.
+            MTL::RenderPipelineState* Clear(const Format colorFormats[4], uint32_t colorMask, Format depthFormat, bool depth)
+            {
+                std::string key = "clear";
+                for (int i = 0; i < 4; i++)
+                    key += "," + std::to_string(int(colorFormats[i])) + (colorMask >> i & 1 ? "w" : "-");
+                key += "," + std::to_string(int(depthFormat)) + (depth ? "d" : "-");
+                std::lock_guard lock(m_mutex);
+                if (auto it = m_states.find(key); it != m_states.end())
+                    return it->second.get();
+                std::string src = "#include <metal_stdlib>\nusing namespace metal;\nstruct K { float4 c[4]; float d; };\n"
+                                  "vertex float4 vs(uint v [[vertex_id]]) { float2 p = float2(float((v << 1) & 2u), float(v & 2u)); return float4(p * 2.0 - 1.0, 0.0, 1.0); }\n"
+                                  "struct O {\n";
+                for (int i = 0; i < 4; i++)
+                    if (colorFormats[i] != Format::Undefined)
+                        src += "  float4 c" + std::to_string(i) + " [[color(" + std::to_string(i) + ")]];\n";
+                if (depth)
+                    src += "  float d [[depth(any)]];\n";
+                src += "};\nfragment O fs(constant K& k [[buffer(0)]]) {\n  O o;\n";
+                for (int i = 0; i < 4; i++)
+                    if (colorFormats[i] != Format::Undefined)
+                        src += "  o.c" + std::to_string(i) + " = k.c[" + std::to_string(i) + "];\n";
+                if (depth)
+                    src += "  o.d = k.d;\n";
+                src += "  return o;\n}\n";
+                auto d = Own(MTL::RenderPipelineDescriptor::alloc()->init());
+                if (!Functions(src, "vs", "fs", *d.get()))
+                    Fail("the internal clear shader didn't compile");
+                for (int i = 0; i < 4; i++)
+                    if (colorFormats[i] != Format::Undefined)
+                    {
+                        MTL::RenderPipelineColorAttachmentDescriptor* a = d->colorAttachments()->object(i);
+                        a->setPixelFormat(ToMtl(colorFormats[i]));
+                        a->setWriteMask(colorMask >> i & 1 ? MTL::ColorWriteMaskAll : MTL::ColorWriteMaskNone);
+                    }
+                if (depthFormat != Format::Undefined)
+                {
+                    d->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
+                    d->setStencilAttachmentPixelFormat(MTL::PixelFormatDepth32Float_Stencil8);
+                }
+                return Store(key, *d.get());
+            }
+
+            // The pipeline that draws a source texture into a `format` target
+            // over the viewport; origin and scale of the source in buffer 0.
+            MTL::RenderPipelineState* Scale(Format format)
+            {
+                const std::string key = "scale," + std::to_string(int(format));
+                std::lock_guard lock(m_mutex);
+                if (auto it = m_states.find(key); it != m_states.end())
+                    return it->second.get();
+                const std::string src =
+                    "#include <metal_stdlib>\nusing namespace metal;\nstruct B { float2 origin; float2 scale; };\n"
+                    "struct V { float4 pos [[position]]; float2 uv; };\n"
+                    "vertex V vs(uint v [[vertex_id]], constant B& b [[buffer(0)]]) {\n"
+                    "  float2 p = float2(float((v << 1) & 2u), float(v & 2u));\n"
+                    "  V o; o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0); o.uv = b.origin + p * b.scale; return o; }\n"
+                    "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { return t.sample(s, in.uv); }\n";
+                auto d = Own(MTL::RenderPipelineDescriptor::alloc()->init());
+                if (!Functions(src, "vs", "fs", *d.get()))
+                    Fail("the internal scale shader didn't compile");
+                d->colorAttachments()->object(0)->setPixelFormat(ToMtl(format));
+                return Store(key, *d.get());
+            }
+
+        private:
+            bool Functions(const std::string& src, const char* vs, const char* fs, MTL::RenderPipelineDescriptor& d)
+            {
+                Ptr<MTL::Function> v = MakeFunction(*m_c.device.get(), src, vs), f = MakeFunction(*m_c.device.get(), src, fs);
+                if (!v || !f)
+                    return false;
+                d.setVertexFunction(v.get());
+                d.setFragmentFunction(f.get());
+                return true;
+            }
+
+            MTL::RenderPipelineState* Store(const std::string& key, MTL::RenderPipelineDescriptor& d)
+            {
+                NS::Error* error = nullptr;
+                Ptr<MTL::RenderPipelineState> state = Own(m_c.device->newRenderPipelineState(&d, &error));
+                if (!state)
+                    Fail(("an internal pipeline failed: " + Describe(error)).c_str());
+                MTL::RenderPipelineState* raw = state.get();
+                m_states.emplace(key, std::move(state));
+                return raw;
+            }
+
+            Context& m_c;
+            std::mutex m_mutex;
+            std::map<std::string, Ptr<MTL::RenderPipelineState>> m_states;
+        };
+
         class MetalCommandList final : public CommandList
         {
         public:
-            explicit MetalCommandList(Context& c) : m_c(c) {}
-            ~MetalCommandList() override
-            {
-                EndEncoder();
-                m_commands.reset();
-            }
+            MetalCommandList(Context& c, InternalPipelines& internal) : m_c(c), m_internal(internal) {}
+            ~MetalCommandList() override { EndEncoder(); }
 
             // Ends the recording and commits it; `fence` is signalled when it has run.
             void Commit(MetalFence& fence)
             {
-                if (m_commands->status() != MTL::CommandBufferStatusNotEnqueued && m_commands->status() != MTL::CommandBufferStatusEnqueued)
-                    Fail("a command list was submitted twice");
+                EndEncoder();
                 std::shared_ptr<FenceState> state = fence.Arm();
                 m_commands->addCompletedHandler([state](MTL::CommandBuffer* cb) {
                     if (cb->error())
@@ -613,29 +713,165 @@ namespace gpu::rhi::metal
                 m_sets = {};
                 m_pushed = {};
                 m_constantsSize = 0;
-                m_pipeline = nullptr;
+                m_computePipeline = nullptr;
+                m_graphicsPipeline = nullptr;
+                m_rs = {};
                 m_commands = Keep(m_c.queue->commandBuffer());
             }
 
             void End() override { EndEncoder(); }
 
             // ---- passes ----
-            void BeginRendering(const RenderingDesc&) override { Fail("BeginRendering: not yet"); }
-            void EndRendering() override { Fail("EndRendering: not yet"); }
-            void ClearAttachments(const Rect2D&, const ClearColor*, uint32_t, const ClearDepthStencil*, bool, bool) override { Fail("ClearAttachments: not yet"); }
+            void BeginRendering(const RenderingDesc& desc) override
+            {
+                Pool pool;
+                EndEncoder();
+                auto pass = Own(MTL::RenderPassDescriptor::alloc()->init());
+                m_passFormats = {};
+                m_rs.targetWidth = desc.area.x + desc.area.width;
+                m_rs.targetHeight = desc.area.y + desc.area.height;
+                auto loadAction = [](LoadOp op) {
+                    return op == LoadOp::Clear ? MTL::LoadActionClear : op == LoadOp::Load ? MTL::LoadActionLoad : MTL::LoadActionDontCare;
+                };
+                auto storeAction = [](StoreOp op) { return op == StoreOp::Store ? MTL::StoreActionStore : MTL::StoreActionDontCare; };
+                for (int i = 0; i < 4; i++)
+                {
+                    const ColorAttachment& a = desc.color[i];
+                    if (!a.image)
+                        break;
+                    auto* image = static_cast<MetalImage*>(a.image);
+                    MTL::RenderPassColorAttachmentDescriptor* d = pass->colorAttachments()->object(i);
+                    d->setTexture(image->Handle());
+                    d->setLoadAction(loadAction(a.load));
+                    d->setStoreAction(storeAction(a.store));
+                    d->setClearColor(MTL::ClearColor::Make(a.clear.rgba[0], a.clear.rgba[1], a.clear.rgba[2], a.clear.rgba[3]));
+                    m_passFormats.color[i] = image->Desc().format;
+                    m_rs.targetWidth = image->Desc().extent.width;
+                    m_rs.targetHeight = image->Desc().extent.height;
+                }
+                if (desc.depth.image)
+                {
+                    auto* image = static_cast<MetalImage*>(desc.depth.image);
+                    MTL::RenderPassDepthAttachmentDescriptor* d = pass->depthAttachment();
+                    d->setTexture(image->Handle());
+                    d->setLoadAction(loadAction(desc.depth.load));
+                    d->setStoreAction(desc.depth.readOnly ? MTL::StoreActionStore : storeAction(desc.depth.store));
+                    d->setClearDepth(desc.depth.clear.depth);
+                    MTL::RenderPassStencilAttachmentDescriptor* st = pass->stencilAttachment();
+                    st->setTexture(image->Handle());
+                    st->setLoadAction(loadAction(desc.depth.load));
+                    st->setStoreAction(desc.depth.readOnly ? MTL::StoreActionStore : storeAction(desc.depth.store));
+                    st->setClearStencil(desc.depth.clear.stencil);
+                    m_passFormats.depth = image->Desc().format;
+                    m_rs.targetWidth = image->Desc().extent.width;
+                    m_rs.targetHeight = image->Desc().extent.height;
+                }
+                m_render = Keep(m_commands->renderCommandEncoder(pass.get()));
+                ReapplyRender();
+            }
+
+            void EndRendering() override { EndEncoder(); }
+
+            void ClearAttachments(const Rect2D& area, const ClearColor* color, uint32_t colorMask, const ClearDepthStencil* depthStencil, bool clearDepth,
+                bool clearStencil) override
+            {
+                float constants[17] = {};  // K: float4 c[4]; float d
+                for (int i = 0; i < 4; i++)
+                    if (color && (colorMask >> i & 1))
+                        memcpy(&constants[i * 4], color[i].rgba, 16);
+                const bool depth = clearDepth && depthStencil && m_passFormats.depth != Format::Undefined;
+                if (depth)
+                    constants[16] = depthStencil->depth;
+                const bool stencil = clearStencil && depthStencil && m_passFormats.depth != Format::Undefined;
+                MTL::RenderPipelineState* pipeline = m_internal.Clear(m_passFormats.color, colorMask, m_passFormats.depth, depth);
+                m_render->setRenderPipelineState(pipeline);
+                // The depth-stencil state: writes the depth when asked, and the stencil by Replace.
+                {
+                    Pool pool;
+                    auto d = Own(MTL::DepthStencilDescriptor::alloc()->init());
+                    d->setDepthCompareFunction(MTL::CompareFunctionAlways);
+                    d->setDepthWriteEnabled(depth);
+                    if (stencil)
+                    {
+                        auto s = Own(MTL::StencilDescriptor::alloc()->init());
+                        s->setStencilCompareFunction(MTL::CompareFunctionAlways);
+                        s->setStencilFailureOperation(MTL::StencilOperationReplace);
+                        s->setDepthFailureOperation(MTL::StencilOperationReplace);
+                        s->setDepthStencilPassOperation(MTL::StencilOperationReplace);
+                        d->setFrontFaceStencil(s.get());
+                        d->setBackFaceStencil(s.get());
+                    }
+                    auto state = Own(m_c.device->newDepthStencilState(d.get()));
+                    m_render->setDepthStencilState(state.get());
+                }
+                if (stencil)
+                    m_render->setStencilReferenceValue(depthStencil->stencil);
+                m_render->setCullMode(MTL::CullModeNone);
+                m_render->setDepthBias(0, 0, 0);
+                m_render->setViewport(MTL::Viewport{ 0, 0, double(m_rs.targetWidth), double(m_rs.targetHeight), 0.0, 1.0 });
+                m_render->setScissorRect(Clamp(area));
+                m_render->setVertexBytes(constants, sizeof(constants), 0);
+                m_render->setFragmentBytes(constants, sizeof(constants), 0);
+                m_render->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+                ReapplyRender();  // what the clear changed
+            }
 
             // ---- state ----
             void SetPipeline(const Pipeline& pipeline) override
             {
-                m_pipeline = &static_cast<const MetalPipeline&>(pipeline);
-                if (m_compute && m_pipeline->IsCompute())
-                    ApplyPipeline();
+                const auto* p = &static_cast<const MetalPipeline&>(pipeline);
+                if (p->IsCompute())
+                {
+                    m_computePipeline = static_cast<const MetalComputePipeline*>(p);
+                    if (m_compute)
+                        ApplyComputePipeline();
+                }
+                else
+                {
+                    m_graphicsPipeline = static_cast<const MetalGraphicsPipeline*>(p);
+                    if (m_render)
+                        ApplyGraphicsPipeline();
+                }
             }
-            void SetViewport(float, float, float, float, float, float) override { Fail("SetViewport: not yet"); }
-            void SetScissor(const Rect2D&) override { Fail("SetScissor: not yet"); }
-            void SetStencil(uint8_t, uint8_t, uint8_t) override { Fail("SetStencil: not yet"); }
-            void SetDepthBias(float, float, float) override { Fail("SetDepthBias: not yet"); }
-            void SetBlendConstants(const float[4]) override { Fail("SetBlendConstants: not yet"); }
+            void SetViewport(float x, float y, float width, float height, float minDepth, float maxDepth) override
+            {
+                m_rs.viewport = MTL::Viewport{ x, y, width, height, minDepth, maxDepth };
+                m_rs.viewportSet = true;
+                if (m_render)
+                    m_render->setViewport(m_rs.viewport);
+            }
+            void SetScissor(const Rect2D& rect) override
+            {
+                m_rs.scissor = rect;
+                m_rs.scissorSet = true;
+                if (m_render)
+                    m_render->setScissorRect(Clamp(rect));
+            }
+            void SetStencil(uint8_t reference, uint8_t compareMask, uint8_t writeMask) override
+            {
+                m_rs.stencilRef = reference;
+                m_rs.compareMask = compareMask;
+                m_rs.writeMask = writeMask;
+                if (m_render && m_graphicsPipeline)
+                {
+                    m_render->setStencilReferenceValue(reference);
+                    m_render->setDepthStencilState(m_graphicsPipeline->DepthStencil(compareMask, writeMask));
+                }
+            }
+            void SetDepthBias(float constant, float clamp, float slope) override
+            {
+                m_rs.biasConstant = constant;
+                m_rs.biasClamp = clamp;
+                m_rs.biasSlope = slope;
+                if (m_render && m_graphicsPipeline && m_graphicsPipeline->desc.depthBias)
+                    m_render->setDepthBias(constant, slope, clamp);
+            }
+            void SetBlendConstants(const float rgba[4]) override
+            {
+                memcpy(m_rs.blend, rgba, 16);
+                if (m_render)
+                    m_render->setBlendColor(rgba[0], rgba[1], rgba[2], rgba[3]);
+            }
 
             // ---- bindings ----
             void BindSet(const BindingLayout& layout, uint32_t table, BindingSet& set, const uint32_t* dynamicOffsets, uint32_t dynamicCount) override
@@ -644,10 +880,8 @@ namespace gpu::rhi::metal
                 b.layout = &static_cast<const MetalBindingLayout&>(layout);
                 b.set = &static_cast<MetalBindingSet&>(set);
                 b.dynamic.assign(dynamicOffsets, dynamicOffsets + dynamicCount);
-                m_pushed.at(table).entries.clear();
                 m_pushed.at(table).layout = nullptr;
-                if (m_compute)
-                    ApplyTable(table);
+                ApplyTable(table);
             }
             void PushBindings(const BindingLayout& layout, uint32_t table, const BindingEntry* entries, size_t count) override
             {
@@ -655,8 +889,7 @@ namespace gpu::rhi::metal
                 p.layout = &static_cast<const MetalBindingLayout&>(layout);
                 p.entries.assign(entries, entries + count);
                 m_sets.at(table).set = nullptr;
-                if (m_compute)
-                    ApplyTable(table);
+                ApplyTable(table);
             }
             void PushConstants(const BindingLayout& layout, const void* data, uint32_t size) override
             {
@@ -665,18 +898,30 @@ namespace gpu::rhi::metal
                 m_constantsLayout = &static_cast<const MetalBindingLayout&>(layout);
                 memcpy(m_constants, data, size);
                 m_constantsSize = size;
-                if (m_compute)
-                    m_compute->setBytes(m_constants, m_constantsSize, m_constantsLayout->PushConstantBuffer());
+                ApplyConstants();
             }
 
             // ---- work ----
-            void Draw(uint32_t, uint32_t, uint32_t, uint32_t) override { Fail("Draw: not yet"); }
-            void DrawIndexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) override { Fail("DrawIndexed: not yet"); }
-            void BindIndexBuffer(Buffer&, uint64_t, bool) override { Fail("BindIndexBuffer: not yet"); }
+            void Draw(uint32_t vertices, uint32_t instances, uint32_t firstVertex, uint32_t firstInstance) override
+            {
+                m_render->drawPrimitives(m_graphicsPipeline->primitive, firstVertex, vertices, instances, firstInstance);
+            }
+            void DrawIndexed(uint32_t indices, uint32_t instances, uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) override
+            {
+                const uint32_t size = m_rs.index32 ? 4 : 2;
+                m_render->drawIndexedPrimitives(m_graphicsPipeline->primitive, indices, m_rs.index32 ? MTL::IndexTypeUInt32 : MTL::IndexTypeUInt16,
+                    static_cast<MetalBuffer*>(m_rs.indexBuffer)->Handle(), m_rs.indexOffset + uint64_t(firstIndex) * size, instances, vertexOffset, firstInstance);
+            }
+            void BindIndexBuffer(Buffer& buffer, uint64_t offset, bool index32) override
+            {
+                m_rs.indexBuffer = &buffer;
+                m_rs.indexOffset = offset;
+                m_rs.index32 = index32;
+            }
             void Dispatch(uint32_t x, uint32_t y, uint32_t z) override
             {
                 BeginCompute();
-                m_compute->dispatchThreadgroups(MTL::Size::Make(x, y, z), static_cast<const MetalComputePipeline*>(m_pipeline)->Group());
+                m_compute->dispatchThreadgroups(MTL::Size::Make(x, y, z), m_computePipeline->Group());
             }
 
             // ---- transfers ----
@@ -684,9 +929,66 @@ namespace gpu::rhi::metal
             {
                 BeginBlit()->copyFromBuffer(static_cast<MetalBuffer&>(src).Handle(), srcOffset, static_cast<MetalBuffer&>(dst).Handle(), dstOffset, size);
             }
-            void CopyBufferToImage(Buffer&, Image&, const BufferImageCopy*, uint32_t) override { Fail("CopyBufferToImage: not yet"); }
-            void CopyImageToBuffer(Image&, Buffer&, const BufferImageCopy*, uint32_t) override { Fail("CopyImageToBuffer: not yet"); }
-            void BlitImage(Image&, const Rect2D&, Image&, const Rect2D&, Filter) override { Fail("BlitImage: not yet"); }
+            void CopyBufferToImage(Buffer& src, Image& dst, const BufferImageCopy* regions, uint32_t count) override
+            {
+                MTL::BlitCommandEncoder* blit = BeginBlit();
+                auto& image = static_cast<MetalImage&>(dst);
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    const BufferImageCopy& r = regions[i];
+                    const Layout l = LayoutOf(image.Desc().format, r);
+                    for (uint32_t layer = 0; layer < r.layerCount; layer++)
+                        blit->copyFromBuffer(static_cast<MetalBuffer&>(src).Handle(), r.bufferOffset + uint64_t(layer) * l.perImage * r.depth, l.perRow, l.perImage,
+                            MTL::Size::Make(r.region.width, r.region.height, r.depth), image.Handle(), r.layer + layer, r.level,
+                            MTL::Origin::Make(r.region.x, r.region.y, r.z));
+                }
+            }
+            void CopyImageToBuffer(Image& src, Buffer& dst, const BufferImageCopy* regions, uint32_t count) override
+            {
+                MTL::BlitCommandEncoder* blit = BeginBlit();
+                auto& image = static_cast<MetalImage&>(src);
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    const BufferImageCopy& r = regions[i];
+                    const Layout l = LayoutOf(image.Desc().format, r);
+                    for (uint32_t layer = 0; layer < r.layerCount; layer++)
+                        blit->copyFromTexture(image.Handle(), r.layer + layer, r.level, MTL::Origin::Make(r.region.x, r.region.y, r.z),
+                            MTL::Size::Make(r.region.width, r.region.height, r.depth), static_cast<MetalBuffer&>(dst).Handle(),
+                            r.bufferOffset + uint64_t(layer) * l.perImage * r.depth, l.perRow, l.perImage);
+                }
+            }
+            void BlitImage(Image& src, const Rect2D& srcRect, Image& dst, const Rect2D& dstRect, Filter filter) override
+            {
+                auto& s = static_cast<MetalImage&>(src);
+                auto& d = static_cast<MetalImage&>(dst);
+                if (srcRect.width == dstRect.width && srcRect.height == dstRect.height && s.Desc().format == d.Desc().format)
+                {
+                    BeginBlit()->copyFromTexture(s.Handle(), 0, 0, MTL::Origin::Make(srcRect.x, srcRect.y, 0), MTL::Size::Make(srcRect.width, srcRect.height, 1),
+                        d.Handle(), 0, 0, MTL::Origin::Make(dstRect.x, dstRect.y, 0));
+                    return;
+                }
+                Pool pool;
+                EndEncoder();
+                auto pass = Own(MTL::RenderPassDescriptor::alloc()->init());
+                MTL::RenderPassColorAttachmentDescriptor* a = pass->colorAttachments()->object(0);
+                a->setTexture(d.Handle());
+                a->setLoadAction(MTL::LoadActionLoad);
+                a->setStoreAction(MTL::StoreActionStore);
+                auto render = Keep(m_commands->renderCommandEncoder(pass.get()));
+                render->setRenderPipelineState(m_internal.Scale(d.Desc().format));
+                render->setViewport(MTL::Viewport{ double(dstRect.x), double(dstRect.y), double(dstRect.width), double(dstRect.height), 0.0, 1.0 });
+                const uint32_t w = d.Desc().extent.width, h = d.Desc().extent.height;
+                const int32_t x0 = std::max(dstRect.x, 0), y0 = std::max(dstRect.y, 0);
+                const int32_t x1 = std::min<int32_t>(dstRect.x + dstRect.width, w), y1 = std::min<int32_t>(dstRect.y + dstRect.height, h);
+                render->setScissorRect(MTL::ScissorRect{ NS::UInteger(x0), NS::UInteger(y0), NS::UInteger(std::max(x1 - x0, 0)), NS::UInteger(std::max(y1 - y0, 0)) });
+                const float sw = float(s.Desc().extent.width), sh = float(s.Desc().extent.height);
+                const float b[4] = { srcRect.x / sw, srcRect.y / sh, srcRect.width / sw, srcRect.height / sh };
+                render->setVertexBytes(b, sizeof(b), 0);
+                render->setFragmentTexture(s.Handle(), 0);
+                render->setFragmentSamplerState(m_c.BlitSampler(filter), 0);
+                render->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+                render->endEncoding();
+            }
             void FillBuffer(Buffer& dst, uint64_t offset, uint64_t size, uint32_t value) override
             {
                 const uint8_t b = uint8_t(value);
@@ -705,8 +1007,36 @@ namespace gpu::rhi::metal
                 BeginBlit()->copyFromBuffer(temp.get(), 0, static_cast<MetalBuffer&>(dst).Handle(), offset, size);
                 m_temps.push_back(std::move(temp));
             }
-            void ClearImage(Image&, const ClearColor&) override { Fail("ClearImage: not yet"); }
-            void ClearImage(Image&, const ClearDepthStencil&) override { Fail("ClearImage: not yet"); }
+            void ClearImage(Image& image, const ClearColor& color) override
+            {
+                Pool pool;
+                EndEncoder();
+                auto pass = Own(MTL::RenderPassDescriptor::alloc()->init());
+                MTL::RenderPassColorAttachmentDescriptor* a = pass->colorAttachments()->object(0);
+                a->setTexture(static_cast<MetalImage&>(image).Handle());
+                a->setLoadAction(MTL::LoadActionClear);
+                a->setStoreAction(MTL::StoreActionStore);
+                a->setClearColor(MTL::ClearColor::Make(color.rgba[0], color.rgba[1], color.rgba[2], color.rgba[3]));
+                m_commands->renderCommandEncoder(pass.get())->endEncoding();
+            }
+            void ClearImage(Image& image, const ClearDepthStencil& value) override
+            {
+                Pool pool;
+                EndEncoder();
+                auto pass = Own(MTL::RenderPassDescriptor::alloc()->init());
+                MTL::Texture* texture = static_cast<MetalImage&>(image).Handle();
+                MTL::RenderPassDepthAttachmentDescriptor* d = pass->depthAttachment();
+                d->setTexture(texture);
+                d->setLoadAction(MTL::LoadActionClear);
+                d->setStoreAction(MTL::StoreActionStore);
+                d->setClearDepth(value.depth);
+                MTL::RenderPassStencilAttachmentDescriptor* s = pass->stencilAttachment();
+                s->setTexture(texture);
+                s->setLoadAction(MTL::LoadActionClear);
+                s->setStoreAction(MTL::StoreActionStore);
+                s->setClearStencil(value.stencil);
+                m_commands->renderCommandEncoder(pass.get())->endEncoding();
+            }
 
             // ---- synchronisation ----
             void Transition(const ImageTransition*, size_t, const BufferTransition*, size_t) override {}  // Metal tracks the hazards
@@ -735,6 +1065,51 @@ namespace gpu::rhi::metal
                 const MetalBindingLayout* layout = nullptr;
                 std::vector<BindingEntry> entries;
             };
+            // Dynamic state that outlives an encoder (as Vulkan's does the render pass).
+            struct RenderState
+            {
+                bool viewportSet = false, scissorSet = false;
+                MTL::Viewport viewport{};
+                Rect2D scissor;
+                uint8_t stencilRef = 0, compareMask = 0xFF, writeMask = 0xFF;
+                float biasConstant = 0, biasClamp = 0, biasSlope = 0;
+                float blend[4] = {};
+                Buffer* indexBuffer = nullptr;
+                uint64_t indexOffset = 0;
+                bool index32 = false;
+                uint32_t targetWidth = 0, targetHeight = 0;
+            };
+            struct PassFormats
+            {
+                Format color[4] = {};
+                Format depth = Format::Undefined;
+            };
+            struct Layout
+            {
+                uint32_t perRow, perImage;
+            };
+
+            // Bytes per row and per image of a buffer region (BC: of blocks).
+            static Layout LayoutOf(Format format, const BufferImageCopy& r)
+            {
+                const uint32_t width = r.bufferRowLength ? r.bufferRowLength : r.region.width;
+                if (IsBlock(format))
+                {
+                    const uint32_t block = format == Format::BC1 ? 8 : 16;
+                    const uint32_t perRow = (width + 3) / 4 * block;
+                    return { perRow, perRow * ((r.region.height + 3) / 4) };
+                }
+                const uint32_t perRow = width * BytesPerPixel(format);
+                return { perRow, perRow * r.region.height };
+            }
+
+            MTL::ScissorRect Clamp(const Rect2D& r) const
+            {
+                const int32_t x0 = std::clamp<int32_t>(r.x, 0, int32_t(m_rs.targetWidth)), y0 = std::clamp<int32_t>(r.y, 0, int32_t(m_rs.targetHeight));
+                const int32_t x1 = std::clamp<int32_t>(r.x + int32_t(r.width), 0, int32_t(m_rs.targetWidth));
+                const int32_t y1 = std::clamp<int32_t>(r.y + int32_t(r.height), 0, int32_t(m_rs.targetHeight));
+                return MTL::ScissorRect{ NS::UInteger(x0), NS::UInteger(y0), NS::UInteger(std::max(x1 - x0, 0)), NS::UInteger(std::max(y1 - y0, 0)) };
+            }
 
             void EndEncoder()
             {
@@ -747,6 +1122,11 @@ namespace gpu::rhi::metal
                 {
                     m_blit->endEncoding();
                     m_blit.reset();
+                }
+                if (m_render)
+                {
+                    m_render->endEncoding();
+                    m_render.reset();
                 }
             }
 
@@ -769,24 +1149,68 @@ namespace gpu::rhi::metal
                 EndEncoder();
                 m_compute = Keep(m_commands->computeCommandEncoder());
                 // What was bound before: Metal's belongs to the encoder.
-                if (m_pipeline && m_pipeline->IsCompute())
-                    ApplyPipeline();
+                if (m_computePipeline)
+                    ApplyComputePipeline();
                 for (uint32_t t = 0; t < m_sets.size(); t++)
                     ApplyTable(t);
-                if (m_constantsSize)
-                    m_compute->setBytes(m_constants, m_constantsSize, m_constantsLayout->PushConstantBuffer());
+                ApplyConstants();
             }
 
-            void ApplyPipeline() { m_compute->setComputePipelineState(static_cast<const MetalComputePipeline*>(m_pipeline)->Handle()); }
+            void ApplyComputePipeline() { m_compute->setComputePipelineState(m_computePipeline->Handle()); }
 
-            // Table `table` as last bound (a set or pushed entries) on the compute encoder.
+            void ApplyGraphicsPipeline()
+            {
+                const MetalGraphicsPipeline& p = *m_graphicsPipeline;
+                m_render->setRenderPipelineState(p.state.get());
+                m_render->setDepthStencilState(p.DepthStencil(m_rs.compareMask, m_rs.writeMask));
+                m_render->setCullMode(p.cull);
+                m_render->setFrontFacingWinding(p.winding);
+                m_render->setDepthClipMode(p.desc.depthClamp ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip);
+                if (p.desc.depthBias)
+                    m_render->setDepthBias(m_rs.biasConstant, m_rs.biasSlope, m_rs.biasClamp);
+                else
+                    m_render->setDepthBias(0, 0, 0);
+            }
+
+            // A fresh render encoder gets everything the list has set so far.
+            void ReapplyRender()
+            {
+                if (m_graphicsPipeline)
+                    ApplyGraphicsPipeline();
+                m_render->setStencilReferenceValue(m_rs.stencilRef);
+                m_render->setBlendColor(m_rs.blend[0], m_rs.blend[1], m_rs.blend[2], m_rs.blend[3]);
+                m_render->setViewport(m_rs.viewportSet ? m_rs.viewport : MTL::Viewport{ 0, 0, double(m_rs.targetWidth), double(m_rs.targetHeight), 0.0, 1.0 });
+                m_render->setScissorRect(Clamp(m_rs.scissorSet ? m_rs.scissor : Rect2D{ 0, 0, m_rs.targetWidth, m_rs.targetHeight }));
+                for (uint32_t t = 0; t < m_sets.size(); t++)
+                    ApplyTable(t);
+                ApplyConstants();
+            }
+
+            void ApplyConstants()
+            {
+                if (!m_constantsSize)
+                    return;
+                const uint32_t index = m_constantsLayout->PushConstantBuffer();
+                if (m_compute)
+                    m_compute->setBytes(m_constants, m_constantsSize, index);
+                if (m_render)
+                {
+                    m_render->setVertexBytes(m_constants, m_constantsSize, index);
+                    m_render->setFragmentBytes(m_constants, m_constantsSize, index);
+                }
+            }
+
+            // Table `table` as last bound (a set or pushed entries) on the encoder in use.
             void ApplyTable(uint32_t table)
             {
+                if (!m_compute && !m_render)
+                    return;
                 const Bound& b = m_sets[table];
                 const Pushed& p = m_pushed[table];
                 if (b.set)
                 {
-                    ApplyEntries(*b.layout, table, b.set->Entries().data(), b.set->Entries().size(), b.dynamic);
+                    const std::vector<BindingEntry> entries = b.set->Entries();
+                    ApplyEntries(*b.layout, table, entries.data(), entries.size(), b.dynamic);
                 }
                 else if (p.layout)
                 {
@@ -801,6 +1225,7 @@ namespace gpu::rhi::metal
                     const SlotMap* m = layout.Find(table, entries[i].slot);
                     if (!m)
                         Fail("a binding has no slot in its layout");
+                    const uint8_t stages = m->slot.stages;
                     switch (m->slot.kind)
                     {
                     case BindingKind::StorageBuffer:
@@ -809,27 +1234,59 @@ namespace gpu::rhi::metal
                         uint64_t offset = entries[i].buffer.offset;
                         if (m->dynamicOrder >= 0 && size_t(m->dynamicOrder) < dynamic.size())
                             offset += dynamic[m->dynamicOrder];
-                        m_compute->setBuffer(static_cast<MetalBuffer*>(entries[i].buffer.buffer)->Handle(), offset, m->buffer);
+                        MTL::Buffer* buffer = static_cast<MetalBuffer*>(entries[i].buffer.buffer)->Handle();
+                        if (m_compute)
+                            m_compute->setBuffer(buffer, offset, m->buffer);
+                        if (m_render && (stages & uint8_t(ShaderStage::Vertex)))
+                            m_render->setVertexBuffer(buffer, offset, m->buffer);
+                        if (m_render && (stages & uint8_t(ShaderStage::Fragment)))
+                            m_render->setFragmentBuffer(buffer, offset, m->buffer);
                         break;
                     }
                     case BindingKind::CombinedImageSampler:
                     case BindingKind::StorageImage:
-                        m_compute->setTexture(static_cast<MetalImage*>(entries[i].image.image)->Handle(), m->texture);
+                    {
+                        MTL::Texture* texture = static_cast<MetalImage*>(entries[i].image.image)->Handle();
+                        MTL::SamplerState* sampler = nullptr;
                         if (m->slot.kind == BindingKind::CombinedImageSampler)
                         {
-                            const Sampler* sampler = m->slot.immutableSampler ? m->slot.immutableSampler : entries[i].image.sampler;
-                            m_compute->setSamplerState(static_cast<const MetalSampler*>(sampler)->Handle(), m->sampler);
+                            const Sampler* s = m->slot.immutableSampler ? m->slot.immutableSampler : entries[i].image.sampler;
+                            sampler = static_cast<const MetalSampler*>(s)->Handle();
+                        }
+                        if (m_compute)
+                        {
+                            m_compute->setTexture(texture, m->texture);
+                            if (sampler)
+                                m_compute->setSamplerState(sampler, m->sampler);
+                        }
+                        if (m_render && (stages & uint8_t(ShaderStage::Vertex)))
+                        {
+                            m_render->setVertexTexture(texture, m->texture);
+                            if (sampler)
+                                m_render->setVertexSamplerState(sampler, m->sampler);
+                        }
+                        if (m_render && (stages & uint8_t(ShaderStage::Fragment)))
+                        {
+                            m_render->setFragmentTexture(texture, m->texture);
+                            if (sampler)
+                                m_render->setFragmentSamplerState(sampler, m->sampler);
                         }
                         break;
+                    }
                     }
                 }
             }
 
             Context& m_c;
+            InternalPipelines& m_internal;
             Ptr<MTL::CommandBuffer> m_commands;
             Ptr<MTL::BlitCommandEncoder> m_blit;
             Ptr<MTL::ComputeCommandEncoder> m_compute;
-            const MetalPipeline* m_pipeline = nullptr;
+            Ptr<MTL::RenderCommandEncoder> m_render;
+            const MetalComputePipeline* m_computePipeline = nullptr;
+            const MetalGraphicsPipeline* m_graphicsPipeline = nullptr;
+            RenderState m_rs;
+            PassFormats m_passFormats;
             std::array<Bound, 4> m_sets;
             std::array<Pushed, 4> m_pushed;
             const MetalBindingLayout* m_constantsLayout = nullptr;
@@ -843,7 +1300,7 @@ namespace gpu::rhi::metal
         class MetalDevice final : public Device
         {
         public:
-            explicit MetalDevice(std::unique_ptr<Context> context) : m_c(std::move(context)) {}
+            explicit MetalDevice(std::unique_ptr<Context> context) : m_c(std::move(context)), m_internal(*m_c) {}
 
             const Capabilities& GetCapabilities() const override { return m_c->caps; }
 
@@ -874,7 +1331,44 @@ namespace gpu::rhi::metal
                 return std::make_unique<MetalBuffer>(std::move(buffer), size, host);
             }
 
-            std::unique_ptr<Image> CreateImage(const ImageDesc&) override { return nullptr; }  // (images: not yet)
+            std::unique_ptr<Image> CreateImage(const ImageDesc& desc) override
+            {
+                Pool pool;
+                const MTL::PixelFormat format = ToMtl(desc.format);
+                if (format == MTL::PixelFormatInvalid)
+                    return nullptr;
+                auto d = Own(MTL::TextureDescriptor::alloc()->init());
+                d->setTextureType(desc.kind == ImageKind::Image3D ? MTL::TextureType3D : desc.kind == ImageKind::Cube ? MTL::TextureTypeCube
+                    : desc.layers > 1 ? MTL::TextureType2DArray : MTL::TextureType2D);
+                d->setPixelFormat(format);
+                d->setWidth(desc.extent.width);
+                d->setHeight(desc.extent.height);
+                d->setDepth(desc.kind == ImageKind::Image3D ? desc.extent.depth : 1);
+                d->setMipmapLevelCount(desc.levels);
+                d->setArrayLength(desc.kind == ImageKind::Cube || desc.layers <= 1 ? 1 : desc.layers);
+                MTL::TextureUsage usage = 0;
+                if (desc.usage & kImageSampled)
+                    usage |= MTL::TextureUsageShaderRead;
+                if (desc.usage & kImageStorage)
+                    usage |= MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite;
+                // Clears and scaled copies are render passes here, so what can be copied into can be drawn to.
+                if ((desc.usage & (kImageRenderTarget | kImageDepthStencil)) ||
+                    ((desc.usage & kImageCopyDst) && !IsBlock(desc.format) && !HasDepth(desc.format)))
+                    usage |= MTL::TextureUsageRenderTarget;
+                if ((desc.usage & kImageRenderTarget) && (desc.usage & kImageCopySrc))
+                    usage |= MTL::TextureUsageShaderRead;  // (a scaled copy from it samples it)
+                if ((desc.usage & kImageCopySrc) && !IsBlock(desc.format))
+                    usage |= MTL::TextureUsageShaderRead;  // (the same, from any copy source)
+                d->setUsage(usage);
+                d->setStorageMode(MTL::StorageModePrivate);
+                Ptr<MTL::Texture> texture = Own(m_c->device->newTexture(d.get()));
+                if (!texture)
+                    return nullptr;
+                if (desc.name && *desc.name)
+                    texture->setLabel(NS::String::string(desc.name, NS::UTF8StringEncoding));
+                const MTL::SizeAndAlign size = m_c->device->heapTextureSizeAndAlign(d.get());
+                return std::make_unique<MetalImage>(desc, std::move(texture), size.size);
+            }
 
             std::unique_ptr<Sampler> CreateSampler(const SamplerDesc& desc) override
             {
@@ -899,7 +1393,68 @@ namespace gpu::rhi::metal
                 return std::make_unique<MetalBindingSet>(static_cast<const MetalBindingLayout&>(layout), table);
             }
 
-            std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override { return nullptr; }  // (graphics: not yet)
+            std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) override
+            {
+                Pool pool;
+                const auto& layout = *static_cast<const MetalBindingLayout*>(desc.layout);
+                std::string vsEntry, fsEntry;
+                const std::string vsMsl = ToMsl(desc.vertex, spv::ExecutionModelVertex, layout, vsEntry, nullptr);
+                const std::string fsMsl = ToMsl(desc.fragment, spv::ExecutionModelFragment, layout, fsEntry, nullptr);
+                Ptr<MTL::Function> vs = MakeFunction(*m_c->device.get(), vsMsl, vsEntry), fs = MakeFunction(*m_c->device.get(), fsMsl, fsEntry);
+                if (!vs || !fs)
+                    return nullptr;
+                auto d = Own(MTL::RenderPipelineDescriptor::alloc()->init());
+                d->setVertexFunction(vs.get());
+                d->setFragmentFunction(fs.get());
+                d->setInputPrimitiveTopology(TopologyClass(desc.topology));
+                for (int i = 0; i < 4; i++)
+                {
+                    if (desc.colorFormats[i] == Format::Undefined)
+                        continue;
+                    const BlendAttachment& b = desc.blend[i];
+                    MTL::RenderPipelineColorAttachmentDescriptor* a = d->colorAttachments()->object(i);
+                    a->setPixelFormat(ToMtl(desc.colorFormats[i]));
+                    a->setBlendingEnabled(b.enable);
+                    a->setSourceRGBBlendFactor(ToMtl(b.srcColor));
+                    a->setDestinationRGBBlendFactor(ToMtl(b.dstColor));
+                    a->setRgbBlendOperation(ToMtl(b.colorOp));
+                    a->setSourceAlphaBlendFactor(ToMtl(b.srcAlpha));
+                    a->setDestinationAlphaBlendFactor(ToMtl(b.dstAlpha));
+                    a->setAlphaBlendOperation(ToMtl(b.alphaOp));
+                    // Vulkan's mask is R G B A from the low bit; Metal's is the reverse.
+                    MTL::ColorWriteMask mask = 0;
+                    if (b.writeMask & 1) mask |= MTL::ColorWriteMaskRed;
+                    if (b.writeMask & 2) mask |= MTL::ColorWriteMaskGreen;
+                    if (b.writeMask & 4) mask |= MTL::ColorWriteMaskBlue;
+                    if (b.writeMask & 8) mask |= MTL::ColorWriteMaskAlpha;
+                    a->setWriteMask(mask);
+                }
+                if (desc.depthFormat != Format::Undefined)
+                {
+                    d->setDepthAttachmentPixelFormat(ToMtl(desc.depthFormat));
+                    if (HasDepth(desc.depthFormat))
+                        d->setStencilAttachmentPixelFormat(ToMtl(desc.depthFormat));
+                }
+                NS::Error* error = nullptr;
+                Ptr<MTL::RenderPipelineState> state = Own(m_c->device->newRenderPipelineState(d.get(), &error));
+                if (!state)
+                {
+                    fprintf(stderr, "[rhi/metal] render pipeline failed: %s\n", Describe(error).c_str());
+                    return nullptr;
+                }
+                auto pipeline = std::make_unique<MetalGraphicsPipeline>();
+                pipeline->state = std::move(state);
+                pipeline->desc = desc;
+                pipeline->desc.vertex = pipeline->desc.fragment = {};
+                pipeline->desc.layout = nullptr;
+                pipeline->device = m_c->device.get();
+                pipeline->primitive = ToMtl(desc.topology);
+                pipeline->cull = desc.cull == CullMode::None ? MTL::CullModeNone : desc.cull == CullMode::Front ? MTL::CullModeFront : MTL::CullModeBack;
+                // Vulkan's front face is judged in framebuffer space, y down; with the vertex
+                // shaders' Y flipped (ToMsl) that is Metal's, so the sense carries over.
+                pipeline->winding = desc.frontCounterClockwise ? MTL::WindingCounterClockwise : MTL::WindingClockwise;
+                return pipeline;
+            }
 
             std::unique_ptr<Pipeline> CreateComputePipeline(const ComputePipelineDesc& desc) override
             {
@@ -924,7 +1479,7 @@ namespace gpu::rhi::metal
             std::vector<uint8_t> SavePipelineCache() override { return {}; }  // (Metal's own cache keeps what it compiled)
             void LoadPipelineCache(const void*, size_t) override {}
 
-            std::unique_ptr<CommandList> CreateCommandList() override { return std::make_unique<MetalCommandList>(*m_c); }
+            std::unique_ptr<CommandList> CreateCommandList() override { return std::make_unique<MetalCommandList>(*m_c, m_internal); }
             std::unique_ptr<Fence> CreateFence(bool signaled) override { return std::make_unique<MetalFence>(signaled); }
             std::unique_ptr<Event> CreateEvent() override
             {
@@ -958,6 +1513,7 @@ namespace gpu::rhi::metal
             }
 
             std::unique_ptr<Context> m_c;
+            InternalPipelines m_internal;
         };
     }
 
@@ -971,6 +1527,16 @@ namespace gpu::rhi::metal
         c->queue = Own(c->device->newCommandQueue());
         if (!c->queue)
             return nullptr;
+        for (int i = 0; i < 2; i++)
+        {
+            auto d = Own(MTL::SamplerDescriptor::alloc()->init());
+            const MTL::SamplerMinMagFilter f = i ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+            d->setMagFilter(f);
+            d->setMinFilter(f);
+            d->setSAddressMode(MTL::SamplerAddressModeClampToEdge);
+            d->setTAddressMode(MTL::SamplerAddressModeClampToEdge);
+            c->blitSamplers[i] = Own(c->device->newSamplerState(d.get()));
+        }
         c->deviceName = c->device->name()->utf8String();
         Capabilities& caps = c->caps;
         caps.backend = "Metal";
