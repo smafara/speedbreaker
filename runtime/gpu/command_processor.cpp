@@ -357,6 +357,36 @@ namespace gpu
 
         void ExecuteBuffer(Reader& r, PPCContext& ctx);
 
+        // NFSMW_HASH_STREAM=1 (DECISIONS.md D7, the capture/replay study): a hash of
+        // every packet the command processor consumes (indirect buffers
+        // included), logged and restarted at each swap, to see from two runs
+        // of one scene how much of the GPU's input varies and where it first
+        // does. Not part of the game's work: off unless set.
+        struct StreamHash
+        {
+            uint64_t hash = 0xCBF29CE484222325ull;
+            uint64_t dwords = 0, packets = 0;
+        };
+        StreamHash s_streamHash;
+
+        void HashPacket(const Reader& r, uint32_t from)
+        {
+            uint64_t h = s_streamHash.hash;
+            uint32_t at = from;
+            while (at != r.offset)
+            {
+                uint32_t v;
+                memcpy(&v, r.base + at, 4);
+                h = (h ^ v) * 0x100000001B3ull;
+                s_streamHash.dwords++;
+                at += 4;
+                if (at >= r.size)
+                    at = 0;
+            }
+            s_streamHash.hash = h;
+            s_streamHash.packets++;
+        }
+
         // NFSMW_DUMP_SHADERS=<dir>: save each distinct shader's microcode
         // (guest byte order) as <dir>/<vs|ps>_<hash>.bin for offline work.
         void DumpShader(uint32_t type, const uint32_t* words, uint32_t dwords)
@@ -537,6 +567,13 @@ namespace gpu
                 s_counter++;
                 timeline::Mark(timeline::Swap);
                 uint64_t frame = ++s_frames;
+                if (static const bool hashing = std::getenv("NFSMW_HASH_STREAM") != nullptr; hashing)
+                {
+                    fprintf(stderr, "[hash] frame %llu packets %llu dwords %llu stream %016llx\n", (unsigned long long)frame,
+                        (unsigned long long)s_streamHash.packets, (unsigned long long)s_streamHash.dwords,
+                        (unsigned long long)s_streamHash.hash);
+                    s_streamHash = StreamHash{};
+                }
                 renderer::OnSwap(frame);
                 // Every 120 frames: frame rate and per-frame costs since the last line.
                 // Frame times are guest time (guesttime::NowNs: the host's
@@ -1074,8 +1111,10 @@ namespace gpu
 
         void ExecuteBuffer(Reader& r, PPCContext& ctx)
         {
+            static const bool hashing = std::getenv("NFSMW_HASH_STREAM") != nullptr;
             while (r.offset != r.end)
             {
+                const uint32_t packetStart = r.offset;
                 uint32_t packet = r.Read();
                 if (packet == 0)
                     continue;
@@ -1111,6 +1150,8 @@ namespace gpu
                     ExecuteType3(r, packet, ctx);
                     break;
                 }
+                if (hashing)
+                    HashPacket(r, packetStart);
             }
         }
 

@@ -236,3 +236,19 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   start; two shorter dips (167 ms, 117 ms) at the transitions to and from the world. Use
   these as the reference: after each refactor step the steady in-world numbers should be
   unchanged within noise. Still missing: screenshots for visual diffs.
+- 2026-10-26: D7 agreed in the form recommended (ring-hash experiment first; replay as a
+  mode of the main binary). Added `NFSMW_HASH_STREAM=1` to `gpu/command_processor.cpp`: hashes
+  every consumed packet (indirect buffers included) and logs
+  `[hash] frame N packets P dwords D stream H` at each XE_SWAP. Off unless set.
+  RESULT, two unattended 45 s runs from launch (same build, no input): frames 1-233 are
+  bit-identical (same packets, dwords and stream hash, including all boot/loading frames).
+  First divergence at frame 234, and the cause is the GAME, not renderer noise: run 1
+  opened `MOVIES/psa_ENGLISH_ntsc.wmv`, run 2 `MOVIES/attract_movie_ENGLISH_ntsc.wmv`
+  (a different intro movie), so the guest took a different branch (RNG or time driven; not
+  yet traced). The streams never re-converge after that. Implication: the GPU input is far
+  more deterministic than feared; a deterministic mode (fixed seed/time, scripted input via
+  the existing `NFSMW_UI_KEYS` style hooks) may be viable for front-end scenes, and capture
+  and replay is still needed for in-world frames (threads, traffic). Also found: the
+  existing `NFSMW_DUMP_FRAMES=<dir>` (every 60th front buffer as PPM, CPU path); the
+  front buffer is a guest-memory resolve target, so a diff at that level is
+  backend-independent.
