@@ -571,3 +571,12 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   queries (caps say so), the swapchain (M2), pipeline cache save/load (Metal keeps its own),
   depth/stencil aspect copies, read-only depth attachments.
 
+- 2026-10-26: Metal queries done. Occlusion: every pool is a range of one device-wide visibility
+  buffer (16384 slots), because a render pass names its visibility buffer when it begins, before
+  any BeginQuery; BeginQuery/EndQuery switch the encoder's visibility mode to that slot's offset,
+  ResetQueries is a blit fill. Timestamps: Apple GPUs sample at encoder edges only, so a stamp is
+  an empty-work blit encoder of its own sampled at its start (the end-of-encoder sample read back
+  zero here); GPU ticks are nanoseconds on the M5 Max (calibrated against the CPU clock at start,
+  ratio 1.0000). New backend-neutral `Occlusion` test (visible draw counts, depth-rejected draw
+  counts zero, reset clears) passes on Metal and Vulkan. Contract note: a query that was never
+  begun reads as not ready on Vulkan, so tests read only queries they ended.

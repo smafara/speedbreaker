@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "../command_list.h"
@@ -85,6 +87,39 @@ namespace gpu::rhi::metal
             Ptr<MTL::SamplerState> blitSamplers[2];  // nearest, linear: the scaled copies'
 
             MTL::SamplerState* BlitSampler(Filter f) const { return blitSamplers[f == Filter::Linear].get(); }
+
+            // Occlusion counts. A render pass names one visibility buffer when it
+            // begins, before any query is, so every pool is a range of this one.
+            static constexpr uint32_t kVisibilitySlots = 16384;
+            Ptr<MTL::Buffer> visibility;
+            std::mutex visibilityMutex;
+            std::vector<std::pair<uint32_t, uint32_t>> visibilityFree{ { 0, kVisibilitySlots } };  // (first, count)
+            // The timestamp counter set, when the GPU can sample it at encoder edges.
+            Ptr<MTL::CounterSet> timestampCounters;
+            Ptr<MTL::Buffer> scratch;  // what the timestamp encoders write
+
+            // First slot of `count` free ones; false when there's no room.
+            bool AllocateVisibility(uint32_t count, uint32_t& first)
+            {
+                std::lock_guard lock(visibilityMutex);
+                for (auto it = visibilityFree.begin(); it != visibilityFree.end(); ++it)
+                {
+                    if (it->second < count)
+                        continue;
+                    first = it->first;
+                    it->first += count;
+                    it->second -= count;
+                    if (!it->second)
+                        visibilityFree.erase(it);
+                    return true;
+                }
+                return false;
+            }
+            void ReleaseVisibility(uint32_t first, uint32_t count)
+            {
+                std::lock_guard lock(visibilityMutex);
+                visibilityFree.emplace_back(first, count);
+            }
         };
 
         // ---- formats ----------------------------------------------------------
@@ -572,12 +607,68 @@ namespace gpu::rhi::metal
         class MetalQueryPool final : public QueryPool
         {
         public:
-            MetalQueryPool(QueryKind kind, uint32_t count) : m_kind(kind), m_count(count) {}
-            bool Read(uint32_t, uint32_t, uint64_t*) override { return false; }  // (queries: not yet)
+            MetalQueryPool(Context& c, QueryKind kind, uint32_t count) : m_c(c), m_kind(kind), m_count(count)
+            {
+                Pool pool;
+                if (kind == QueryKind::Occlusion)
+                {
+                    if (!c.AllocateVisibility(count, m_first))
+                        Fail("out of occlusion query slots");
+                    return;
+                }
+                if (!c.timestampCounters)
+                    Fail("timestamps are not offered");
+                auto d = Own(MTL::CounterSampleBufferDescriptor::alloc()->init());
+                d->setCounterSet(c.timestampCounters.get());
+                d->setStorageMode(MTL::StorageModeShared);
+                d->setSampleCount(count);
+                NS::Error* error = nullptr;
+                m_samples = Own(c.device->newCounterSampleBuffer(d.get(), &error));
+                if (!m_samples)
+                    Fail(("the timestamp buffer failed: " + Describe(error)).c_str());
+            }
+            ~MetalQueryPool() override
+            {
+                if (m_kind == QueryKind::Occlusion)
+                    m_c.ReleaseVisibility(m_first, m_count);
+            }
+
+            bool Read(uint32_t first, uint32_t count, uint64_t* out) override
+            {
+                if (first + count > m_count)
+                    return false;
+                if (m_kind == QueryKind::Occlusion)
+                {
+                    const auto* counts = static_cast<const uint64_t*>(m_c.visibility->contents()) + m_first + first;
+                    std::copy(counts, counts + count, out);
+                    return true;
+                }
+                Pool pool;
+                NS::Data* data = m_samples->resolveCounterRange(NS::Range(first, count));
+                if (!data || data->length() < count * sizeof(uint64_t))
+                    return false;
+                const auto* ticks = static_cast<const uint64_t*>(data->bytes());
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    if (ticks[i] == MTL::CounterErrorValue)  // never written
+                        return false;
+                    out[i] = ticks[i];
+                }
+                return true;
+            }
+
+            QueryKind Kind() const { return m_kind; }
+            uint32_t Count() const { return m_count; }
+            // Occlusion: the byte offset of query `index` in the visibility buffer.
+            NS::UInteger VisibilityOffset(uint32_t index) const { return NS::UInteger(m_first + index) * sizeof(uint64_t); }
+            MTL::CounterSampleBuffer* Samples() const { return m_samples.get(); }
 
         private:
+            Context& m_c;
             QueryKind m_kind;
             uint32_t m_count;
+            uint32_t m_first = 0;
+            Ptr<MTL::CounterSampleBuffer> m_samples;
         };
 
         // ---- command lists -------------------------------------------------------------
@@ -766,6 +857,8 @@ namespace gpu::rhi::metal
                     m_rs.targetWidth = image->Desc().extent.width;
                     m_rs.targetHeight = image->Desc().extent.height;
                 }
+                if (m_c.visibility)
+                    pass->setVisibilityResultBuffer(m_c.visibility.get());
                 m_render = Keep(m_commands->renderCommandEncoder(pass.get()));
                 ReapplyRender();
             }
@@ -1048,10 +1141,47 @@ namespace gpu::rhi::metal
             }
 
             // ---- queries ----
-            void ResetQueries(QueryPool&, uint32_t, uint32_t) override {}
-            void WriteTimestamp(QueryPool&, uint32_t, bool) override {}
-            void BeginQuery(QueryPool&, uint32_t) override { Fail("BeginQuery: not yet"); }
-            void EndQuery(QueryPool&, uint32_t) override { Fail("EndQuery: not yet"); }
+            void ResetQueries(QueryPool& pool, uint32_t first, uint32_t count) override
+            {
+                // Timestamps are overwritten by the next stamp; counts are zeroed
+                // where the queue will get to them.
+                auto& p = static_cast<MetalQueryPool&>(pool);
+                if (p.Kind() != QueryKind::Occlusion)
+                    return;
+                Pool autorelease;
+                BeginBlit()->fillBuffer(m_c.visibility.get(), NS::Range(p.VisibilityOffset(first), NS::UInteger(count) * sizeof(uint64_t)), 0);
+            }
+
+            // Apple GPUs sample counters at the edges of encoders only, so a stamp
+            // is an encoder of its own, sampled as it starts (an end sample came back
+            // zero): after the encoders recorded before it, `end` or not.
+            void WriteTimestamp(QueryPool& pool, uint32_t index, bool) override
+            {
+                auto& p = static_cast<MetalQueryPool&>(pool);
+                Pool autorelease;
+                EndEncoder();
+                auto pass = Own(MTL::BlitPassDescriptor::alloc()->init());
+                MTL::BlitPassSampleBufferAttachmentDescriptor* a = pass->sampleBufferAttachments()->object(0);
+                a->setSampleBuffer(p.Samples());
+                a->setStartOfEncoderSampleIndex(index);
+                a->setEndOfEncoderSampleIndex(MTL::CounterDontSample);
+                auto* blit = m_commands->blitCommandEncoder(pass.get());
+                blit->fillBuffer(m_c.scratch.get(), NS::Range(0, 4), 0);  // (an encoder with no work may be dropped)
+                blit->endEncoding();
+            }
+
+            void BeginQuery(QueryPool& pool, uint32_t index) override
+            {
+                if (!m_render)
+                    Fail("BeginQuery outside a render pass");
+                m_render->setVisibilityResultMode(MTL::VisibilityResultModeCounting, static_cast<MetalQueryPool&>(pool).VisibilityOffset(index));
+            }
+            void EndQuery(QueryPool& pool, uint32_t index) override
+            {
+                if (!m_render)
+                    Fail("EndQuery outside a render pass");
+                m_render->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, static_cast<MetalQueryPool&>(pool).VisibilityOffset(index));
+            }
 
         private:
             struct Bound
@@ -1486,7 +1616,7 @@ namespace gpu::rhi::metal
                 Pool pool;
                 return std::make_unique<MetalEvent>(Own(m_c->device->newSharedEvent()));
             }
-            std::unique_ptr<QueryPool> CreateQueryPool(QueryKind kind, uint32_t count) override { return std::make_unique<MetalQueryPool>(kind, count); }
+            std::unique_ptr<QueryPool> CreateQueryPool(QueryKind kind, uint32_t count) override { return std::make_unique<MetalQueryPool>(*m_c, kind, count); }
 
             std::unique_ptr<Swapchain> CreateSwapchain(Surface&, const SwapchainDesc&) override { return nullptr; }  // (the window: not yet)
 
@@ -1546,8 +1676,31 @@ namespace gpu::rhi::metal
         caps.hostMemoryAlignment = 16384;  // the page size (Apple silicon)
         caps.maxBufferSize = c->device->maxBufferLength();
         caps.textureCompressionBC = c->device->supportsBCTextureCompression();
-        caps.occlusionQueries = false;
-        caps.timestampQueries = false;
+        c->visibility = Own(c->device->newBuffer(Context::kVisibilitySlots * sizeof(uint64_t), MTL::ResourceStorageModeShared));
+        c->scratch = Own(c->device->newBuffer(16, MTL::ResourceStorageModePrivate));
+        std::memset(c->visibility->contents(), 0, c->visibility->length());
+        caps.occlusionQueries = true;
+        if (c->device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary))
+        {
+            NS::Array* sets = c->device->counterSets();
+            for (NS::UInteger i = 0; sets && i < sets->count(); i++)
+            {
+                auto* set = static_cast<MTL::CounterSet*>(sets->object(i));
+                if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
+                    c->timestampCounters = Keep(set);
+            }
+        }
+        caps.timestampQueries = bool(c->timestampCounters);
+        if (caps.timestampQueries)
+        {
+            // GPU ticks to nanoseconds: how far the GPU's clock moves against the CPU's.
+            MTL::Timestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
+            c->device->sampleTimestamps(&cpu0, &gpu0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            c->device->sampleTimestamps(&cpu1, &gpu1);
+            const double ratio = gpu1 > gpu0 ? double(cpu1 - cpu0) / double(gpu1 - gpu0) : 1.0;
+            caps.timestampPeriodNs = ratio;
+        }
         caps.fragmentShadingRate = false;
         caps.presentTiming = false;
         caps.scheduledPresent = false;

@@ -589,6 +589,68 @@ namespace
     }
 }
 
+    // Occlusion counts: samples that passed the depth test inside the query.
+    void Occlusion()
+    {
+        if (!g_device->GetCapabilities().occlusionQueries)
+        {
+            printf("  occlusion: not offered (skipped)\n");
+            return;
+        }
+        BindingLayoutDesc ld;
+        ld.pushConstantBytes = sizeof(DrawConstants);
+        auto layout = g_device->CreateBindingLayout(ld);
+        GraphicsPipelineDesc d = FullscreenDesc(*layout, Format::RGBA8, Code(k_color_frag, sizeof(k_color_frag) / 4));
+        d.depthFormat = Format::D32F_S8;
+        d.depthTest = d.depthWrite = true;
+        d.depthCompare = CompareOp::Less;
+        auto pipeline = g_device->CreateGraphicsPipeline(d);
+        CHECK(pipeline != nullptr, "occlusion pipeline");
+        if (!pipeline)
+            return;
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget);
+        auto depth = MakeImage(Format::D32F_S8, 8, 8, kImageDepthStencil);
+        auto pool = g_device->CreateQueryPool(QueryKind::Occlusion, 2);
+        auto pass = [&](bool resetFirst, bool queryVisible) {
+            Run([&](CommandList& cmd) {
+                if (resetFirst)
+                    cmd.ResetQueries(*pool, 0, 2);
+                ImageTransition begin[] = { { target.get(), State::Undefined, State::RenderTarget }, { depth.get(), State::Undefined, State::DepthWrite } };
+                cmd.Transition(begin, 2);
+                RenderingDesc rd;
+                rd.color[0] = { target.get(), LoadOp::Clear, StoreOp::DontCare, { { 0, 0, 0, 1 } } };
+                rd.depth = { depth.get(), LoadOp::Clear, StoreOp::DontCare, { 1.0f, 0 }, false };
+                rd.area = { 0, 0, 8, 8 };
+                cmd.BeginRendering(rd);
+                cmd.SetViewport(0, 0, 8, 8, 0, 1);
+                cmd.SetScissor({ 0, 0, 8, 8 });
+                cmd.SetPipeline(*pipeline);
+                auto draw = [&](float z) {
+                    DrawConstants c = { { 1, 1, 1, 1 }, z };
+                    cmd.PushConstants(*layout, &c, sizeof(c));
+                    cmd.Draw(3, 1, 0, 0);
+                };
+                cmd.BeginQuery(*pool, 0);
+                if (queryVisible)
+                    draw(0.3f);  // the whole target
+                cmd.EndQuery(*pool, 0);
+                cmd.BeginQuery(*pool, 1);
+                draw(0.5f);  // behind the first (or the first, when it wasn't drawn)
+                cmd.EndQuery(*pool, 1);
+                cmd.EndRendering();
+            });
+        };
+        pass(true, true);
+        uint64_t n[2] = {};
+        CHECK(pool->Read(0, 2, n), "occlusion results ready after the fence");
+        CHECK(n[0] > 0, "the visible draw counted samples (%llu)", (unsigned long long)n[0]);
+        CHECK(n[1] == 0, "the draw behind it counted none (%llu)", (unsigned long long)n[1]);
+        pass(true, false);  // the second pass draws one thing only, in query 1
+        CHECK(pool->Read(0, 2, n), "results of the second pass");
+        CHECK(n[0] == 0, "a reset clears the old count (%llu)", (unsigned long long)n[0]);
+        CHECK(n[1] > 0, "the lone draw is in front now (%llu)", (unsigned long long)n[1]);
+    }
+
 int main()
 {
     g_device = MakeDevice();
@@ -615,6 +677,8 @@ int main()
     Rendering();
     printf("orientation, winding\n");
     Orientation();
+    printf("occlusion queries\n");
+    Occlusion();
     printf("sampled texture, pushed binding, immutable sampler\n");
     Textures();
     printf("image clear, blit, copy\n");
