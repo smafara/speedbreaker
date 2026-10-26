@@ -252,3 +252,23 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   existing `NFSMW_DUMP_FRAMES=<dir>` (every 60th front buffer as PPM, CPU path); the
   front buffer is a guest-memory resolve target, so a diff at that level is
   backend-independent.
+- 2026-10-26 CORRECTION to the entry above: the two runs were not unattended. The user
+  watched the intros in run 1 and skipped them in run 2, so the movie difference at frame
+  234 is human input, not an RNG or clock branch in the game. Nothing in frames 1-233 (or
+  anywhere yet) shows game-side non-determinism; the real question is still open. Redo with
+  hands off (no input at all), then with an identical input sequence.
+- 2026-10-26: hands-off retest (no input at all, two 60 s runs from launch, same build; both
+  played the same four intro movies in the same order). RESULT: the streams do NOT stay
+  identical. Frames 1-19 match except 10-11 (packet counts differ by 2 there, then
+  re-converge); from about frame 20 on, only 762 of 3222 frames have even the same packet
+  count and 17 of 3222 the same hash (none after frame 500). Frame counts also differ
+  (3225 vs 3222 frames in 60 s). The earlier "233 identical frames" pair was therefore the
+  boot/loading phase only, before movie playback and its threads start; do not generalize
+  it. Cause is timing: with the frame index (swap count) as the alignment, a movie frame
+  shown over 1 or 2 swaps (decode thread, vblank) shifts everything after it. Comparing
+  runs by swap index is not meaningful in time-driven phases.
+  CONCLUSION: running the game again does not reproduce the GPU input even without a human;
+  a deterministic mode would have to freeze guest time and thread scheduling, which is
+  out of reach here. The capture and replay design (D7) stands as the verification plan.
+  `NFSMW_HASH_STREAM` stays as a diagnostic (and will be reused to check that a replay
+  reproduces the captured stream exactly).
