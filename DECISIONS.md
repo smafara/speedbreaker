@@ -710,3 +710,16 @@ replay on Metal).
   for point lists. Not done: Dear ImGui's Metal backend (no UI in Metal mode), layer colour
   space, a live (non-replay) run's timing and pipeline-compile cost on Metal, Windows branches
   untested, `THIRD_PARTY_NOTICES.md` row for SPIRV-Cross.
+- 2026-10-26: UI on Metal, and a renderer setting. Dear ImGui ships a Metal backend, but it is
+  Objective-C against `MTLRenderCommandEncoder`, which the RHI's list owns, and isn't vendored
+  here; instead `ui/imgui_rhi.cpp` draws ImGui's draw data on the RHI (vertices read from a
+  storage buffer, RHI images for the font atlas through ImGui 1.92's texture requests, three
+  buffer slots), the same code on any backend. `ui::Prepare` (texture uploads, vertices; outside a
+  pass) and `ui::Draw(CommandList&)` replace the `VkCommandBuffer` one; the Vulkan path keeps
+  `imgui_impl_vulkan` (so Vulkan is unchanged) and is picked by `Initialize` vs `InitializeRhi`
+  (SDL's backend: InitForMetal). Checked live on Metal with scripted keys: the settings menu draws
+  over the running game. New Settings > Graphics > Renderer (`[video] renderer`, `NFSMW_BACKEND`,
+  restart): Metal (default) or Vulkan (MoltenVK); shown only on Apple builds with -DSB_METAL=ON,
+  elsewhere Vulkan. The replay script now runs Vulkan explicitly (`NFSMW_BACKEND=vulkan`;
+  `SB_REPLAY_ENV` overrides). Two source-reading tests looked for `vkCmdDraw` in renderer.cpp and
+  now look for `Cmd().Draw`.

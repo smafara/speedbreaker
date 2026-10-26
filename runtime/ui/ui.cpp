@@ -14,6 +14,8 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
+#include "imgui_rhi.h"
+#include <gpu/rhi/vulkan/vulkan_native.h>
 // FeedWheelNav: the input events the backend has queued this frame; on iOS also DragToScroll (the window under a
 // touch, its scroll and the active item).
 #include <imgui_internal.h>
@@ -47,6 +49,7 @@ namespace ui
         VulkanTarget s_target{};
         bool s_ready = false;
         bool s_rendererReady = false;
+        std::unique_ptr<RhiRenderer> s_rhiRenderer;  // the RHI path; else the Vulkan backend
         bool s_frameBuilt = false;
         bool s_settingsOpen = false;
         std::function<void()> s_modal;
@@ -662,56 +665,81 @@ namespace ui
         }
     }
 
+    namespace
+    {
+        // The setup both paths share. `initRenderer` makes the renderer's side
+        // (false: it couldn't); `metal`: SDL's backend for a Metal window.
+        bool Start(SDL_Window* window, bool metal, const std::function<bool()>& initRenderer)
+        {
+            s_window = window;
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.IniFilename = nullptr;  // no imgui.ini: layouts are fixed
+            io.LogFilename = nullptr;
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+            // Controller first: the focused item always shows, so A (Enter) works
+            // on a screen's first frame without a d-pad press to reveal it.
+            io.ConfigNavCursorVisibleAlways = true;
+
+            ImFontConfig config;
+            config.FontDataOwnedByAtlas = false;
+            io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kFont), int(sizeof(kFont)), kFontSize, &config);
+            ApplyStyle();
+
+            if (!(metal ? ImGui_ImplSDL3_InitForMetal(window) : ImGui_ImplSDL3_InitForVulkan(window)))
+            {
+                fprintf(stderr, "[ui] SDL3 backend failed\n");
+                ImGui::DestroyContext();
+                return false;
+            }
+            if (!initRenderer())
+            {
+                fprintf(stderr, "[ui] renderer backend failed\n");
+                ImGui_ImplSDL3_Shutdown();
+                ImGui::DestroyContext();
+                return false;
+            }
+            s_rendererReady = true;
+            s_ready = true;
+#if defined(__APPLE__) && TARGET_OS_IOS
+            // Else iOS takes the three-finger tap for its edit menu (and a
+            // three-finger swipe for undo), cancelling the touches.
+            platform::ios::DisableSystemEditGestures(window);
+            fprintf(stderr, "[ui] ready (Dear ImGui %s): View + Menu or a three-finger tap opens the settings\n", IMGUI_VERSION);
+#else
+            fprintf(stderr, "[ui] ready (Dear ImGui %s): F1 or Back + Start opens the settings\n", IMGUI_VERSION);
+#endif
+            return true;
+        }
+    }
+
     bool Initialize(SDL_Window* window, const VulkanTarget& target)
     {
         if (s_ready)
             return true;
-        s_window = window;
         s_target = target;
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.IniFilename = nullptr;  // no imgui.ini: layouts are fixed
-        io.LogFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-        // Controller first: the focused item always shows, so A (Enter) works
-        // on a screen's first frame without a d-pad press to reveal it.
-        io.ConfigNavCursorVisibleAlways = true;
+        return Start(window, false, [&] { return InitRenderer(target.format); });
+    }
 
-        ImFontConfig config;
-        config.FontDataOwnedByAtlas = false;
-        io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kFont), int(sizeof(kFont)), kFontSize, &config);
-        ApplyStyle();
-
-        if (!ImGui_ImplSDL3_InitForVulkan(window))
-        {
-            fprintf(stderr, "[ui] SDL3 backend failed\n");
-            ImGui::DestroyContext();
-            return false;
-        }
-        if (!InitRenderer(target.format))
-        {
-            fprintf(stderr, "[ui] Vulkan backend failed\n");
-            ImGui_ImplSDL3_Shutdown();
-            ImGui::DestroyContext();
-            return false;
-        }
-        s_rendererReady = true;
-        s_ready = true;
-#if defined(__APPLE__) && TARGET_OS_IOS
-        // Else iOS takes the three-finger tap for its edit menu (and a
-        // three-finger swipe for undo), cancelling the touches.
-        platform::ios::DisableSystemEditGestures(window);
-        fprintf(stderr, "[ui] ready (Dear ImGui %s): View + Menu or a three-finger tap opens the settings\n", IMGUI_VERSION);
-#else
-        fprintf(stderr, "[ui] ready (Dear ImGui %s): F1 or Back + Start opens the settings\n", IMGUI_VERSION);
-#endif
-        return true;
+    bool InitializeRhi(SDL_Window* window, gpu::rhi::Device& device)
+    {
+        if (s_ready)
+            return true;
+        return Start(window, true, [&] {
+            ImGuiIO& io = ImGui::GetIO();
+            io.BackendRendererName = "speedbreaker_rhi";
+            io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures;
+            s_rhiRenderer = std::make_unique<RhiRenderer>(device);
+            if (!s_rhiRenderer->Ready())
+                s_rhiRenderer.reset();
+            return s_rhiRenderer != nullptr;
+        });
     }
 
     void SetFormat(VkFormat format)
     {
-        if (!s_ready || format == s_target.format)
+        if (!s_ready || s_rhiRenderer || format == s_target.format)
             return;
         s_target.format = format;
         ImGui_ImplVulkan_PipelineInfo pipeline{};
@@ -733,6 +761,9 @@ namespace ui
             return;
         if (s_settingsOpen)
             CloseSettings();
+        if (s_rhiRenderer)
+            s_rhiRenderer.reset();
+        else
         {
             std::lock_guard lock(*s_target.queueMutex);
             ImGui_ImplVulkan_Shutdown();
@@ -1079,7 +1110,8 @@ namespace ui
         bool toast = !toastText.empty();
         if (!s_modal && !s_settingsOpen && !perf && !toast)
             return false;
-        ImGui_ImplVulkan_NewFrame();
+        if (!s_rhiRenderer)
+            ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         FeedWheelNav();  // after the backend's gamepads: a wheel's keys merged with the controller's
         // SDL gave the window's size and pixels; the UI is drawn into the
@@ -1151,14 +1183,25 @@ namespace ui
         return s_frameBuilt;
     }
 
-    void Draw(VkCommandBuffer cmd)
+    void Prepare(gpu::rhi::CommandList& list, gpu::rhi::Format target)
+    {
+        if (s_frameBuilt && s_rhiRenderer)
+            s_rhiRenderer->Prepare(list, ImGui::GetDrawData(), target);
+    }
+
+    void Draw(gpu::rhi::CommandList& list)
     {
         if (!s_frameBuilt)
             return;
         s_frameBuilt = false;
+        if (s_rhiRenderer)
+        {
+            s_rhiRenderer->Draw(list, ImGui::GetDrawData());
+            return;
+        }
         // Font uploads submit and wait on the shared queue.
         std::lock_guard lock(*s_target.queueMutex);
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), gpu::rhi::vulkan::NativeCommandBuffer(list));
     }
 
     void SetModal(std::function<void()> draw)

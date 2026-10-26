@@ -30,6 +30,8 @@
 #include <SDL3/SDL_video.h>
 #include <vulkan/vulkan.h>
 
+namespace gpu::rhi { class CommandList; class Device; enum class Format : uint8_t; }
+
 namespace ui
 {
     struct VulkanTarget
@@ -46,7 +48,10 @@ namespace ui
 
     // Main thread, once the swapchain exists. False: no UI (the game still runs).
     bool Initialize(SDL_Window* window, const VulkanTarget& target);
-    // The swapchain was recreated in another format.
+    // The same on the RHI, for a backend with no Dear ImGui backend of its own
+    // (Metal): ui/imgui_rhi.h draws it. The format is read at Prepare.
+    bool InitializeRhi(SDL_Window* window, gpu::rhi::Device& device);
+    // The swapchain was recreated in another format (the Vulkan backend's).
     void SetFormat(VkFormat format);
     // The swapchain's size (each time it is built). The UI's framebuffer
     // scale follows it (iOS's present scale: Screen Resolution or
@@ -84,9 +89,13 @@ namespace ui
     // before recording it: lays out this frame. False: nothing to draw
     // (don't call Draw).
     bool BeginFrame();
-    // Records the frame laid out by BeginFrame(), inside a dynamic-rendering
-    // pass on the swapchain image (any viewport; it sets its own).
-    void Draw(VkCommandBuffer cmd);
+    // The RHI path only (nothing on the Vulkan one): the frame's texture
+    // uploads and vertices, on the list that Draw records, outside a pass.
+    // `target`: the format of the image Draw writes.
+    void Prepare(gpu::rhi::CommandList& list, gpu::rhi::Format target);
+    // Records the frame laid out by BeginFrame(), inside a pass on the
+    // swapchain image (any viewport; it sets its own).
+    void Draw(gpu::rhi::CommandList& list);
 
     // The presenter showed a new game frame (the performance overlay counts them).
     void NoteGameFrame();

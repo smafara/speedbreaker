@@ -54,6 +54,7 @@ namespace settings
         Anisotropy,
         Mipmaps,
         InternalResolution,
+        RenderBackend,  // Apple only, where the build has Metal: Metal or Vulkan (MoltenVK); at launch
         WindowWidth,   // hidden: the window's size, remembered between runs
         WindowHeight,  // hidden
         // Audio
@@ -149,6 +150,9 @@ namespace settings
     // Upscaling: FSR 1 is used only where the picture is enlarged; frames
     // shown at their size or smaller take the bicubic pass
     // (video/upscale.h, whose Mode has the same values).
+    // Renderer: Metal is drawn directly (gpu/rhi/metal), Vulkan through MoltenVK
+    // (gpu/rhi/vulkan); the same renderer on both.
+    enum class RenderBackendMode : int32_t { Metal = 0, Vulkan = 1 };
     enum class ScalingMode : int32_t { Bicubic = 0, Linear = 1, Fsr1 = 2 };
     // Frame Rate: 60, 30, or Auto (video/frame_rate.h: 60, or 30 while the
     // device is hot or can't hold 60).

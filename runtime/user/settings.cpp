@@ -66,6 +66,18 @@ namespace settings
 #else
         constexpr bool kFsr1Offered = true;
 #endif
+        // Settings > Graphics > Renderer: where the build can draw with Metal (Apple, -DSB_METAL=ON); elsewhere Vulkan only.
+#if defined(__APPLE__) && defined(SB_METAL)
+        constexpr bool kBackendHidden = false;
+        constexpr double kBackendDefault = double(RenderBackendMode::Metal);
+#else
+        constexpr bool kBackendHidden = true;
+        constexpr double kBackendDefault = double(RenderBackendMode::Vulkan);
+#endif
+        constexpr EnumEntry kBackendEntries[] = {
+            { int32_t(RenderBackendMode::Metal), "metal", "Metal" },
+            { int32_t(RenderBackendMode::Vulkan), "vulkan", "Vulkan (MoltenVK)" },
+        };
         constexpr EnumEntry kScalingEntries[] = {
             { int32_t(ScalingMode::Bicubic), "bicubic", "Bicubic" },
             { int32_t(ScalingMode::Linear), "linear", "Bilinear" },
@@ -282,6 +294,10 @@ namespace settings
               .table = "video", .key = "internal_resolution", .label = "Internal Resolution",
               .description = "Render the 3D scene above the 360's 720p. 1.5x is 1080p, a little over half the pixels of 2x. On a screen of another shape filled by Fill Screen, each step renders that shape: 1x on a Steam Deck is its own 1280x800. Auto: from the screen (1440p: 2x; a Steam Deck: its 1280x800).",
               .env = "NFSMW_RESOLUTION", .defaultValue = kResolutionAuto, .entries = kResolutionEntries },
+            { .id = Id::RenderBackend, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Restart, .hidden = kBackendHidden,
+              .table = "video", .key = "renderer", .label = "Renderer",
+              .description = "Metal draws the game directly on the GPU. Vulkan goes through MoltenVK, Apple's translation layer, the way v0.1.x did. Takes effect when the game starts again.",
+              .env = "NFSMW_BACKEND", .defaultValue = kBackendDefault, .entries = kBackendEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
               .description = "The window's width when the game starts.",

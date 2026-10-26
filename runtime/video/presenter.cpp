@@ -316,21 +316,14 @@ namespace video
         Backend s_backend = Backend::Vulkan;
         SDL_MetalView s_metalView = nullptr;
 
+        // Settings > Graphics > Renderer (NFSMW_BACKEND=metal|vulkan): Metal by default where the
+        // build has it, Vulkan elsewhere.
         Backend ChooseBackend()
         {
-            const char* v = std::getenv("NFSMW_BACKEND");
-            if (!v || !*v || !strcmp(v, "vulkan"))
-                return Backend::Vulkan;
-            if (!strcmp(v, "metal"))
-            {
 #ifdef SB_METAL
+            if (settings::GetInt(settings::Id::RenderBackend) == int(settings::RenderBackendMode::Metal))
                 return Backend::Metal;
-#else
-                fprintf(stderr, "[video] NFSMW_BACKEND=metal: this build has no Metal backend (-DSB_METAL=ON); using Vulkan\n");
-                return Backend::Vulkan;
 #endif
-            }
-            fprintf(stderr, "[video] NFSMW_BACKEND=%s: not a backend (vulkan, metal); using Vulkan\n", v);
             return Backend::Vulkan;
         }
 
@@ -1607,10 +1600,13 @@ namespace video
                 s_policy.occlusionCounting = occlusion && occlusion[0] == '1' && caps.occlusionQueries;
             }
             s_rhiReady = true;
-            fprintf(stderr, "[video] Metal: the renderer runs on the RHI; no UI yet (Dear ImGui's Vulkan backend)\n");
+            s_uiReady = ui::InitializeRhi(s_window, *s_rhi);
             ReportScreen(std::format("{}, Metal", caps.deviceName));
             if (!s_resolutionHint.empty())
+            {
                 fprintf(stderr, "[video] %s\n", s_resolutionHint.c_str());
+                ui::Toast(s_resolutionHint, 15.0);
+            }
             return true;
 #else
             return false;
@@ -3049,6 +3045,8 @@ namespace video
             f.pass = pass;
             if (scaleInput && pass == upscale::Pass::Fsr1)
                 postProcessor.RecordEasu(*f.list, *scaleInput, w, h, dw, dh, band, bandOn);
+            if (uiFrame)
+                ui::Prepare(list, dst.Desc().format);
             Move(list, dst, gpu::rhi::State::Undefined, gpu::rhi::State::RenderTarget);
             gpu::rhi::RenderingDesc rendering;
             rendering.color[0].image = &dst;
@@ -3084,7 +3082,7 @@ namespace video
                 resume();
             }
             if (uiFrame)
-                ui::Draw(gpu::rhi::vulkan::NativeCommandBuffer(list));
+                ui::Draw(list);
             list.EndRendering();
             if (f.timed)
                 list.WriteTimestamp(*s_timestamps, s_frameIndex * 3 + 2, true);
@@ -3147,13 +3145,14 @@ namespace video
                 gameCapture = RecordHostCopy(list, dst, gpu::rhi::State::CopyDst, pictureRect);
             if (uiFrame)
             {
+                ui::Prepare(list, dst.Desc().format);
                 Move(list, dst, gpu::rhi::State::CopyDst, gpu::rhi::State::RenderTarget);
                 gpu::rhi::RenderingDesc rendering;
                 rendering.color[0].image = &dst;
                 rendering.color[0].load = gpu::rhi::LoadOp::Load;
                 rendering.area = { 0, 0, s_swapExtent.width, s_swapExtent.height };
                 list.BeginRendering(rendering);
-                ui::Draw(gpu::rhi::vulkan::NativeCommandBuffer(list));
+                ui::Draw(list);
                 list.EndRendering();
                 Move(list, dst, gpu::rhi::State::RenderTarget, gpu::rhi::State::Present);
             }

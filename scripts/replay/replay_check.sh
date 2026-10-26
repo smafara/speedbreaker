@@ -17,7 +17,7 @@
 # machine's settings and display: re-record when they change).
 # Run from the repository root, with build/main built. Exit status 0 if all
 # passed.
-#   SB_REPLAY_ENV="NAME=value ..."  extra environment for the replay (a backend)
+#   SB_REPLAY_ENV="NAME=value ..."  extra environment for the replay (NFSMW_BACKEND=metal for Metal; Vulkan is the default here)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -51,7 +51,7 @@ for name in "${names[@]}"; do
     out="$work/$name"
     mkdir -p "$out"
     # No timeout(1) on macOS: perl's alarm.
-    env ${SB_REPLAY_ENV:-} NFSMW_REPLAY="$capture" NFSMW_REPLAY_EXIT=1 NFSMW_DUMP_FRAMES="$out" NFSMW_DUMP_EVERY=1 \
+    env NFSMW_BACKEND=vulkan ${SB_REPLAY_ENV:-} NFSMW_REPLAY="$capture" NFSMW_REPLAY_EXIT=1 NFSMW_DUMP_FRAMES="$out" NFSMW_DUMP_EVERY=1 \
         NFSMW_DUMP_PRESENTED="$out/presented.ppm" \
         perl -e 'alarm 300; exec @ARGV' "$binary" >"$work/$name.log" 2>&1 || {
         echo "$name: the replay failed (log: $work/$name.log)"; trap - EXIT; status=1; continue; }

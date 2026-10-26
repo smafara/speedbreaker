@@ -660,7 +660,7 @@ static int RendererChecks(const std::string& source, bool quiet)
     CHECK(Count(all, apply) == 2, "the vignette's posScale applied on both paths: %zu", Count(all, apply));
     const size_t lastApply = all.rfind(apply);
     const size_t push = lastApply == std::string::npos ? lastApply : all.find("pushConstants(pc);", lastApply);
-    const size_t draw = lastApply == std::string::npos ? lastApply : all.find("vkCmdDraw", lastApply);
+    const size_t draw = lastApply == std::string::npos ? lastApply : all.find("Cmd().Draw", lastApply);
     CHECK(push != std::string::npos && draw != std::string::npos && push < draw,
         "the posScale is set before the draw's constants are pushed and it is drawn");
     // Both behind the A/B switch, as every edge fill.
