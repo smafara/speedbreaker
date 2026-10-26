@@ -445,3 +445,17 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   and, as before, never destroys the device or instance (the process exits). Gate: replay
   check passes on both captures (frames and presented picture), `rhi_vulkan_test` passes.
   Next (2b): the swapchain, its images and the present timing behind an `rhi::Swapchain`.
+- 2026-10-26: backend graphics half done (before the swapchain, which needs it): images
+  (`CreateImage`: dedicated device-local allocation each, one view over all of it; the renderer's
+  block suballocation comes with its migration), image states -> layout + stage + access
+  (D9), image copies, blits, clears, `BeginRendering`/`EndRendering` (dynamic rendering;
+  the headless device enables it with the extensions MoltenVK needs), `ClearAttachments`, image
+  bindings (sampled with the layout's immutable sampler or one given at bind time; storage),
+  `CreateGraphicsPipeline` (blend, depth, stencil, raster state; viewport, scissor, stencil
+  values, depth bias and blend constants dynamic, as the renderer has them). Nothing in the
+  interface is unimplemented now. `rhi_vulkan_test` gained: depth test rejection, alpha blend,
+  a partial `ClearAttachments` in a pass, a sampled 4x4 texture through a pushed binding with an
+  immutable sampler (texel for texel), image clear + blit + copy round trip: all pass on the M5
+  Max. Replay check unchanged (the game doesn't use these yet).
+  Next: `rhi::Swapchain` (images, acquire/present, present timing) and the presenter's
+  post passes on top.

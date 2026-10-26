@@ -18,12 +18,6 @@ namespace gpu::rhi::vulkan
 {
     namespace
     {
-        [[noreturn]] void NotImplemented(const char* what)
-        {
-            fprintf(stderr, "[rhi/vulkan] %s: not implemented yet\n", what);
-            abort();
-        }
-
         void Check(VkResult r, const char* what)
         {
             if (r != VK_SUCCESS)
@@ -49,6 +43,8 @@ namespace gpu::rhi::vulkan
             bool preciseOcclusion = false;
             PFN_vkCmdPushDescriptorSetKHR pushDescriptor = nullptr;
             PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties = nullptr;
+            PFN_vkCmdBeginRenderingKHR beginRendering = nullptr;
+            PFN_vkCmdEndRenderingKHR endRendering = nullptr;
             std::string deviceName;
             Capabilities caps;
             Native native;
@@ -109,6 +105,173 @@ namespace gpu::rhi::vulkan
             }
         }
 
+
+        VkFormat ToVk(Format f)
+        {
+            switch (f)
+            {
+            case Format::R8: return VK_FORMAT_R8_UNORM;
+            case Format::RG8: return VK_FORMAT_R8G8_UNORM;
+            case Format::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
+            case Format::BGRA8: return VK_FORMAT_B8G8R8A8_UNORM;
+            case Format::RGBA8_sRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+            case Format::BGRA8_sRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+            case Format::R16: return VK_FORMAT_R16_UNORM;
+            case Format::RG16: return VK_FORMAT_R16G16_UNORM;
+            case Format::RGBA16: return VK_FORMAT_R16G16B16A16_UNORM;
+            case Format::RG16_SNORM: return VK_FORMAT_R16G16_SNORM;
+            case Format::RGBA16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+            case Format::R16F: return VK_FORMAT_R16_SFLOAT;
+            case Format::RG16F: return VK_FORMAT_R16G16_SFLOAT;
+            case Format::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
+            case Format::R32F: return VK_FORMAT_R32_SFLOAT;
+            case Format::RG32F: return VK_FORMAT_R32G32_SFLOAT;
+            case Format::RGBA32F: return VK_FORMAT_R32G32B32A32_SFLOAT;
+            case Format::R32_UINT: return VK_FORMAT_R32_UINT;
+            case Format::A2B10G10R10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            case Format::D32F_S8: return VK_FORMAT_D32_SFLOAT_S8_UINT;
+            case Format::BC1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+            case Format::BC2: return VK_FORMAT_BC2_UNORM_BLOCK;
+            case Format::BC3: return VK_FORMAT_BC3_UNORM_BLOCK;
+            case Format::BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+            case Format::Undefined: break;
+            }
+            return VK_FORMAT_UNDEFINED;
+        }
+
+        bool HasDepth(Format f) { return f == Format::D32F_S8; }
+
+        VkImageAspectFlags Aspect(Format f)
+        {
+            return HasDepth(f) ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+        }
+
+        VkImageUsageFlags ToVk(ImageUsage usage)
+        {
+            return VkImageUsageFlags(
+                ((usage & kImageSampled) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) |
+                ((usage & kImageStorage) ? VK_IMAGE_USAGE_STORAGE_BIT : 0) |
+                ((usage & kImageRenderTarget) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
+                ((usage & kImageDepthStencil) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0) |
+                ((usage & kImageCopySrc) ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) |
+                ((usage & kImageCopyDst) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0));
+        }
+
+        // What an image in `state` is: its layout, and the stages and accesses that use it (D9).
+        void ImageUse(State state, VkImageLayout& layout, VkPipelineStageFlags& stages, VkAccessFlags& access)
+        {
+            constexpr VkPipelineStageFlags kShaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            constexpr VkPipelineStageFlags kDepth = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            switch (state)
+            {
+            case State::ShaderRead:
+                layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; stages = kShaders; access = VK_ACCESS_SHADER_READ_BIT; break;
+            case State::ShaderWrite:
+                layout = VK_IMAGE_LAYOUT_GENERAL; stages = kShaders; access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT; break;
+            case State::RenderTarget:
+                layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; break;
+            case State::DepthRead:
+                layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL; stages = kDepth | kShaders;
+                access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT; break;
+            case State::DepthWrite:
+                layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; stages = kDepth;
+                access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT; break;
+            case State::CopySrc:
+                layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; stages = VK_PIPELINE_STAGE_TRANSFER_BIT; access = VK_ACCESS_TRANSFER_READ_BIT; break;
+            case State::CopyDst:
+                layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; stages = VK_PIPELINE_STAGE_TRANSFER_BIT; access = VK_ACCESS_TRANSFER_WRITE_BIT; break;
+            case State::Present:
+                layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR; stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; access = 0; break;
+            default:
+                layout = VK_IMAGE_LAYOUT_UNDEFINED; stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT; access = 0; break;
+            }
+        }
+
+        VkBlendFactor ToVk(BlendFactor f)
+        {
+            switch (f)
+            {
+            case BlendFactor::Zero: return VK_BLEND_FACTOR_ZERO;
+            case BlendFactor::One: return VK_BLEND_FACTOR_ONE;
+            case BlendFactor::SrcColor: return VK_BLEND_FACTOR_SRC_COLOR;
+            case BlendFactor::OneMinusSrcColor: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+            case BlendFactor::DstColor: return VK_BLEND_FACTOR_DST_COLOR;
+            case BlendFactor::OneMinusDstColor: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+            case BlendFactor::SrcAlpha: return VK_BLEND_FACTOR_SRC_ALPHA;
+            case BlendFactor::OneMinusSrcAlpha: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            case BlendFactor::DstAlpha: return VK_BLEND_FACTOR_DST_ALPHA;
+            case BlendFactor::OneMinusDstAlpha: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+            case BlendFactor::ConstantColor: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+            case BlendFactor::OneMinusConstantColor: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+            case BlendFactor::ConstantAlpha: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+            case BlendFactor::OneMinusConstantAlpha: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+            case BlendFactor::SrcAlphaSaturate: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+            }
+            return VK_BLEND_FACTOR_ONE;
+        }
+
+        VkBlendOp ToVk(BlendOp op)
+        {
+            switch (op)
+            {
+            case BlendOp::Add: return VK_BLEND_OP_ADD;
+            case BlendOp::Subtract: return VK_BLEND_OP_SUBTRACT;
+            case BlendOp::ReverseSubtract: return VK_BLEND_OP_REVERSE_SUBTRACT;
+            case BlendOp::Min: return VK_BLEND_OP_MIN;
+            case BlendOp::Max: return VK_BLEND_OP_MAX;
+            }
+            return VK_BLEND_OP_ADD;
+        }
+
+        VkCompareOp ToVk(CompareOp op)
+        {
+            switch (op)
+            {
+            case CompareOp::Never: return VK_COMPARE_OP_NEVER;
+            case CompareOp::Less: return VK_COMPARE_OP_LESS;
+            case CompareOp::Equal: return VK_COMPARE_OP_EQUAL;
+            case CompareOp::LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+            case CompareOp::Greater: return VK_COMPARE_OP_GREATER;
+            case CompareOp::NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+            case CompareOp::GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+            case CompareOp::Always: return VK_COMPARE_OP_ALWAYS;
+            }
+            return VK_COMPARE_OP_ALWAYS;
+        }
+
+        VkStencilOp ToVk(StencilOp op)
+        {
+            switch (op)
+            {
+            case StencilOp::Keep: return VK_STENCIL_OP_KEEP;
+            case StencilOp::Zero: return VK_STENCIL_OP_ZERO;
+            case StencilOp::Replace: return VK_STENCIL_OP_REPLACE;
+            case StencilOp::IncrementClamp: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+            case StencilOp::DecrementClamp: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+            case StencilOp::Invert: return VK_STENCIL_OP_INVERT;
+            case StencilOp::IncrementWrap: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+            case StencilOp::DecrementWrap: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+            }
+            return VK_STENCIL_OP_KEEP;
+        }
+
+        VkPrimitiveTopology ToVk(Topology t)
+        {
+            switch (t)
+            {
+            case Topology::PointList: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+            case Topology::LineList: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+            case Topology::LineStrip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+            case Topology::TriangleList: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            case Topology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+            }
+            return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        }
+
+        VkFilter ToVk(Filter f) { return f == Filter::Nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR; }
+
         // ---- resources -------------------------------------------------------
 
         class VkBufferObject final : public Buffer
@@ -158,6 +321,32 @@ namespace gpu::rhi::vulkan
         private:
             Context& m_c;
             VkSampler m_sampler;
+        };
+
+
+        class VkImageObject final : public Image
+        {
+        public:
+            VkImageObject(Context& c, const ImageDesc& desc, VkImage image, VkDeviceMemory memory, VkImageView view, uint64_t bytes)
+                : m_c(c), m_desc(desc), m_image(image), m_memory(memory), m_view(view), m_bytes(bytes) {}
+            ~VkImageObject() override
+            {
+                vkDestroyImageView(m_c.device, m_view, nullptr);
+                vkDestroyImage(m_c.device, m_image, nullptr);
+                vkFreeMemory(m_c.device, m_memory, nullptr);
+            }
+            const ImageDesc& Desc() const override { return m_desc; }
+            uint64_t Bytes() const override { return m_bytes; }
+            VkImage Handle() const { return m_image; }
+            VkImageView View() const { return m_view; }
+
+        private:
+            Context& m_c;
+            ImageDesc m_desc;
+            VkImage m_image;
+            VkDeviceMemory m_memory;
+            VkImageView m_view;
+            uint64_t m_bytes;
         };
 
         // ---- bindings (D10) ------------------------------------------------------
@@ -229,10 +418,12 @@ namespace gpu::rhi::vulkan
         {
             std::vector<VkWriteDescriptorSet> writes;
             std::vector<VkDescriptorBufferInfo> buffers;
+            std::vector<VkDescriptorImageInfo> images;
 
             Writes(const VkBindingLayout& layout, uint32_t table, const BindingEntry* entries, size_t count)
             {
-                buffers.reserve(count);  // (the writes point into it)
+                buffers.reserve(count);  // (the writes point into these)
+                images.reserve(count);
                 for (size_t i = 0; i < count; i++)
                 {
                     const BindingSlot* slot = layout.Find(table, entries[i].slot);
@@ -241,15 +432,24 @@ namespace gpu::rhi::vulkan
                         fprintf(stderr, "[rhi/vulkan] binding table %u has no slot %u\n", table, entries[i].slot);
                         abort();
                     }
-                    if (slot->kind == BindingKind::CombinedImageSampler || slot->kind == BindingKind::StorageImage)
-                        NotImplemented("image bindings");
-                    const BufferBinding& b = entries[i].buffer;
-                    buffers.push_back({ static_cast<VkBufferObject*>(b.buffer)->Handle(), b.offset, b.size == ~0ull ? VK_WHOLE_SIZE : b.size });
                     VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                     w.dstBinding = slot->index;
                     w.descriptorCount = 1;
                     w.descriptorType = ToVk(slot->kind);
-                    w.pBufferInfo = &buffers.back();
+                    if (slot->kind == BindingKind::CombinedImageSampler || slot->kind == BindingKind::StorageImage)
+                    {
+                        const ImageBinding& b = entries[i].image;
+                        VkSampler sampler = b.sampler && !slot->immutableSampler ? static_cast<VkSamplerObject*>(b.sampler)->Handle() : VK_NULL_HANDLE;
+                        images.push_back({ sampler, static_cast<VkImageObject*>(b.image)->View(),
+                            slot->kind == BindingKind::StorageImage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                        w.pImageInfo = &images.back();
+                    }
+                    else
+                    {
+                        const BufferBinding& b = entries[i].buffer;
+                        buffers.push_back({ static_cast<VkBufferObject*>(b.buffer)->Handle(), b.offset, b.size == ~0ull ? VK_WHOLE_SIZE : b.size });
+                        w.pBufferInfo = &buffers.back();
+                    }
                     writes.push_back(w);
                 }
             }
@@ -409,11 +609,69 @@ namespace gpu::rhi::vulkan
             }
             void End() override { Check(vkEndCommandBuffer(m_cmd), "vkEndCommandBuffer"); }
 
-            void BeginRendering(const RenderingDesc&) override { NotImplemented("BeginRendering"); }
-            void EndRendering() override { NotImplemented("EndRendering"); }
-            void ClearAttachments(const Rect2D&, const ClearColor*, uint32_t, const ClearDepthStencil*, bool, bool) override
+            void BeginRendering(const RenderingDesc& desc) override
             {
-                NotImplemented("ClearAttachments");
+                auto loadOp = [](LoadOp op) {
+                    return op == LoadOp::Clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : op == LoadOp::Load ? VK_ATTACHMENT_LOAD_OP_LOAD
+                                                                                                   : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                };
+                auto storeOp = [](StoreOp op) { return op == StoreOp::Store ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE; };
+                VkRenderingAttachmentInfo colors[4]{};
+                uint32_t colorCount = 0;
+                for (const ColorAttachment& a : desc.color)
+                {
+                    if (!a.image)
+                        break;  // attachments are packed from 0
+                    VkRenderingAttachmentInfo& info = colors[colorCount++];
+                    info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    info.imageView = static_cast<VkImageObject*>(a.image)->View();
+                    info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    info.loadOp = loadOp(a.load);
+                    info.storeOp = storeOp(a.store);
+                    memcpy(info.clearValue.color.float32, a.clear.rgba, sizeof(a.clear.rgba));
+                }
+                VkRenderingAttachmentInfo depth{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+                if (desc.depth.image)
+                {
+                    depth.imageView = static_cast<VkImageObject*>(desc.depth.image)->View();
+                    depth.imageLayout = desc.depth.readOnly ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    depth.loadOp = loadOp(desc.depth.load);
+                    depth.storeOp = storeOp(desc.depth.store);
+                    depth.clearValue.depthStencil = { desc.depth.clear.depth, desc.depth.clear.stencil };
+                }
+                VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+                ri.renderArea = { { desc.area.x, desc.area.y }, { desc.area.width, desc.area.height } };
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = colorCount;
+                ri.pColorAttachments = colors;
+                ri.pDepthAttachment = desc.depth.image ? &depth : nullptr;
+                ri.pStencilAttachment = desc.depth.image ? &depth : nullptr;  // (the one depth + stencil format)
+                m_c.beginRendering(m_cmd, &ri);
+            }
+            void EndRendering() override { m_c.endRendering(m_cmd); }
+            void ClearAttachments(const Rect2D& area, const ClearColor* color, uint32_t colorMask, const ClearDepthStencil* depthStencil,
+                bool clearDepth, bool clearStencil) override
+            {
+                VkClearAttachment attachments[5]{};
+                uint32_t count = 0;
+                for (uint32_t i = 0; i < 4; i++)
+                    if (color && (colorMask & (1u << i)))
+                    {
+                        attachments[count].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        attachments[count].colorAttachment = i;
+                        memcpy(attachments[count].clearValue.color.float32, color->rgba, sizeof(color->rgba));
+                        count++;
+                    }
+                if (depthStencil && (clearDepth || clearStencil))
+                {
+                    attachments[count].aspectMask = (clearDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (clearStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+                    attachments[count].clearValue.depthStencil = { depthStencil->depth, depthStencil->stencil };
+                    count++;
+                }
+                VkClearRect rect{ { { area.x, area.y }, { area.width, area.height } }, 0, 1 };
+                if (count)
+                    vkCmdClearAttachments(m_cmd, count, attachments, 1, &rect);
             }
 
             void SetPipeline(const Pipeline& pipeline) override
@@ -481,9 +739,34 @@ namespace gpu::rhi::vulkan
                 VkBufferCopy region{ srcOffset, dstOffset, size };
                 vkCmdCopyBuffer(m_cmd, static_cast<VkBufferObject&>(src).Handle(), static_cast<VkBufferObject&>(dst).Handle(), 1, &region);
             }
-            void CopyBufferToImage(Buffer&, Image&, const BufferImageCopy*, uint32_t) override { NotImplemented("CopyBufferToImage"); }
-            void CopyImageToBuffer(Image&, Buffer&, const BufferImageCopy*, uint32_t) override { NotImplemented("CopyImageToBuffer"); }
-            void BlitImage(Image&, const Rect2D&, Image&, const Rect2D&, Filter) override { NotImplemented("BlitImage"); }
+            void CopyBufferToImage(Buffer& src, Image& dst, const BufferImageCopy* regions, uint32_t count) override
+            {
+                auto& image = static_cast<VkImageObject&>(dst);
+                std::vector<VkBufferImageCopy> vk = CopyRegions(image, regions, count);
+                vkCmdCopyBufferToImage(m_cmd, static_cast<VkBufferObject&>(src).Handle(), image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    uint32_t(vk.size()), vk.data());
+            }
+            void CopyImageToBuffer(Image& src, Buffer& dst, const BufferImageCopy* regions, uint32_t count) override
+            {
+                auto& image = static_cast<VkImageObject&>(src);
+                std::vector<VkBufferImageCopy> vk = CopyRegions(image, regions, count);
+                vkCmdCopyImageToBuffer(m_cmd, image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, static_cast<VkBufferObject&>(dst).Handle(),
+                    uint32_t(vk.size()), vk.data());
+            }
+            void BlitImage(Image& src, const Rect2D& srcRect, Image& dst, const Rect2D& dstRect, Filter filter) override
+            {
+                auto& s = static_cast<VkImageObject&>(src);
+                auto& d = static_cast<VkImageObject&>(dst);
+                VkImageBlit blit{};
+                blit.srcSubresource = { Aspect(s.Desc().format), 0, 0, 1 };
+                blit.dstSubresource = { Aspect(d.Desc().format), 0, 0, 1 };
+                blit.srcOffsets[0] = { srcRect.x, srcRect.y, 0 };
+                blit.srcOffsets[1] = { srcRect.x + int32_t(srcRect.width), srcRect.y + int32_t(srcRect.height), 1 };
+                blit.dstOffsets[0] = { dstRect.x, dstRect.y, 0 };
+                blit.dstOffsets[1] = { dstRect.x + int32_t(dstRect.width), dstRect.y + int32_t(dstRect.height), 1 };
+                vkCmdBlitImage(m_cmd, s.Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                    ToVk(filter));
+            }
             void FillBuffer(Buffer& dst, uint64_t offset, uint64_t size, uint32_t value) override
             {
                 vkCmdFillBuffer(m_cmd, static_cast<VkBufferObject&>(dst).Handle(), offset, size, value);
@@ -492,15 +775,27 @@ namespace gpu::rhi::vulkan
             {
                 vkCmdUpdateBuffer(m_cmd, static_cast<VkBufferObject&>(dst).Handle(), offset, size, data);
             }
-            void ClearImage(Image&, const ClearColor&) override { NotImplemented("ClearImage"); }
-            void ClearImage(Image&, const ClearDepthStencil&) override { NotImplemented("ClearImage"); }
-
-            void Transition(const ImageTransition*, size_t imageCount, const BufferTransition* buffers, size_t bufferCount) override
+            // (An image to clear is in State::CopyDst.)
+            void ClearImage(Image& image, const ClearColor& color) override
             {
-                if (imageCount)
-                    NotImplemented("image transitions");
+                auto& i = static_cast<VkImageObject&>(image);
+                VkClearColorValue value;
+                memcpy(value.float32, color.rgba, sizeof(color.rgba));
+                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+                vkCmdClearColorImage(m_cmd, i.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+            }
+            void ClearImage(Image& image, const ClearDepthStencil& depthStencil) override
+            {
+                auto& i = static_cast<VkImageObject&>(image);
+                VkClearDepthStencilValue value{ depthStencil.depth, depthStencil.stencil };
+                VkImageSubresourceRange range{ Aspect(i.Desc().format), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+                vkCmdClearDepthStencilImage(m_cmd, i.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+            }
+
+            void Transition(const ImageTransition* images, size_t imageCount, const BufferTransition* buffers, size_t bufferCount) override
+            {
                 VkPipelineStageFlags srcStages = 0, dstStages = 0;
-                std::vector<VkBufferMemoryBarrier> barriers;
+                std::vector<VkBufferMemoryBarrier> bufferBarriers;
                 for (size_t i = 0; i < bufferCount; i++)
                 {
                     VkPipelineStageFlags s, d;
@@ -515,10 +810,32 @@ namespace gpu::rhi::vulkan
                     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                     b.buffer = static_cast<VkBufferObject*>(buffers[i].buffer)->Handle();
                     b.size = VK_WHOLE_SIZE;
-                    barriers.push_back(b);
+                    bufferBarriers.push_back(b);
                 }
-                if (!barriers.empty())
-                    vkCmdPipelineBarrier(m_cmd, srcStages, dstStages, 0, 0, nullptr, uint32_t(barriers.size()), barriers.data(), 0, nullptr);
+                std::vector<VkImageMemoryBarrier> imageBarriers;
+                for (size_t i = 0; i < imageCount; i++)
+                {
+                    auto* image = static_cast<VkImageObject*>(images[i].image);
+                    VkPipelineStageFlags s, d;
+                    VkAccessFlags sa, da;
+                    VkImageLayout from, to;
+                    ImageUse(images[i].before, from, s, sa);
+                    ImageUse(images[i].after, to, d, da);
+                    srcStages |= s;
+                    dstStages |= d;
+                    VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                    b.srcAccessMask = sa;
+                    b.dstAccessMask = da;
+                    b.oldLayout = from;
+                    b.newLayout = to;
+                    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    b.image = image->Handle();
+                    b.subresourceRange = { Aspect(image->Desc().format), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS };
+                    imageBarriers.push_back(b);
+                }
+                if (!bufferBarriers.empty() || !imageBarriers.empty())
+                    vkCmdPipelineBarrier(m_cmd, srcStages, dstStages, 0, 0, nullptr, uint32_t(bufferBarriers.size()), bufferBarriers.data(),
+                        uint32_t(imageBarriers.size()), imageBarriers.data());
             }
             void SignalEvent(Event& event) override
             {
@@ -545,6 +862,23 @@ namespace gpu::rhi::vulkan
             }
 
         private:
+            static std::vector<VkBufferImageCopy> CopyRegions(const VkImageObject& image, const BufferImageCopy* regions, uint32_t count)
+            {
+                std::vector<VkBufferImageCopy> out;
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    const BufferImageCopy& r = regions[i];
+                    VkBufferImageCopy c{};
+                    c.bufferOffset = r.bufferOffset;
+                    c.bufferRowLength = r.bufferRowLength;
+                    c.imageSubresource = { Aspect(image.Desc().format), r.level, r.layer, r.layerCount };
+                    c.imageOffset = { r.region.x, r.region.y, int32_t(r.z) };
+                    c.imageExtent = { r.region.width, r.region.height, r.depth };
+                    out.push_back(c);
+                }
+                return out;
+            }
+
             Context& m_c;
             VkCommandPool m_pool = VK_NULL_HANDLE;
             VkCommandBuffer m_cmd = VK_NULL_HANDLE;
@@ -654,7 +988,53 @@ namespace gpu::rhi::vulkan
                 return result;
             }
 
-            std::unique_ptr<Image> CreateImage(const ImageDesc&) override { NotImplemented("CreateImage"); }
+            std::unique_ptr<Image> CreateImage(const ImageDesc& desc) override
+            {
+                const VkFormat format = ToVk(desc.format);
+                const bool cube = desc.kind == ImageKind::Cube;
+                VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                ici.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+                ici.imageType = desc.kind == ImageKind::Image3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+                ici.format = format;
+                ici.extent = { desc.extent.width, desc.extent.height, desc.extent.depth };
+                ici.mipLevels = desc.levels;
+                ici.arrayLayers = cube ? 6 : desc.layers;
+                ici.samples = VK_SAMPLE_COUNT_1_BIT;
+                ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ici.usage = ToVk(ImageUsage(desc.usage));
+                ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                VkImage image;
+                if (vkCreateImage(m_c->device, &ici, nullptr, &image) != VK_SUCCESS)
+                    return nullptr;
+                VkMemoryRequirements req;
+                vkGetImageMemoryRequirements(m_c->device, image, &req);
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = req.size;
+                mai.memoryTypeIndex = m_c->FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VkDeviceMemory memory = VK_NULL_HANDLE;
+                if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(m_c->device, &mai, nullptr, &memory) != VK_SUCCESS ||
+                    vkBindImageMemory(m_c->device, image, memory, 0) != VK_SUCCESS)
+                {
+                    vkDestroyImage(m_c->device, image, nullptr);
+                    if (memory)
+                        vkFreeMemory(m_c->device, memory, nullptr);
+                    return nullptr;
+                }
+                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                vci.image = image;
+                vci.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : desc.kind == ImageKind::Image3D ? VK_IMAGE_VIEW_TYPE_3D
+                    : desc.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                vci.format = format;
+                vci.subresourceRange = { Aspect(desc.format), 0, desc.levels, 0, cube ? 6 : desc.layers };
+                VkImageView view;
+                if (vkCreateImageView(m_c->device, &vci, nullptr, &view) != VK_SUCCESS)
+                {
+                    vkDestroyImage(m_c->device, image, nullptr);
+                    vkFreeMemory(m_c->device, memory, nullptr);
+                    return nullptr;
+                }
+                return std::make_unique<VkImageObject>(*m_c, desc, image, memory, view, req.size);
+            }
 
             std::unique_ptr<Sampler> CreateSampler(const SamplerDesc& desc) override
             {
@@ -687,7 +1067,111 @@ namespace gpu::rhi::vulkan
                 return std::make_unique<VkBindingSet>(*m_c, static_cast<const VkBindingLayout&>(layout), table);
             }
 
-            std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override { NotImplemented("CreateGraphicsPipeline"); }
+            std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) override
+            {
+                VkShaderModule modules[2] = {};
+                const ShaderCode* codes[2] = { &desc.vertex, &desc.fragment };
+                VkPipelineShaderStageCreateInfo stages[2]{};
+                for (int i = 0; i < 2; i++)
+                {
+                    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                    smci.codeSize = codes[i]->words * 4;
+                    smci.pCode = codes[i]->spirv;
+                    if (vkCreateShaderModule(m_c->device, &smci, nullptr, &modules[i]) != VK_SUCCESS)
+                    {
+                        for (VkShaderModule m : modules)
+                            if (m)
+                                vkDestroyShaderModule(m_c->device, m, nullptr);
+                        return nullptr;
+                    }
+                    stages[i] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                        i == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT, modules[i], "main", nullptr };
+                }
+                VkPipelineVertexInputStateCreateInfo vertexInput{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };  // (vertices come from buffers in the shader)
+                VkPipelineInputAssemblyStateCreateInfo assembly{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+                assembly.topology = ToVk(desc.topology);
+                assembly.primitiveRestartEnable = desc.primitiveRestart ? VK_TRUE : VK_FALSE;
+                VkPipelineViewportStateCreateInfo viewport{ VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+                viewport.viewportCount = viewport.scissorCount = 1;
+                VkPipelineRasterizationStateCreateInfo raster{ VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+                raster.depthClampEnable = desc.depthClamp ? VK_TRUE : VK_FALSE;
+                raster.polygonMode = VK_POLYGON_MODE_FILL;
+                raster.cullMode = desc.cull == CullMode::Front ? VK_CULL_MODE_FRONT_BIT : desc.cull == CullMode::Back ? VK_CULL_MODE_BACK_BIT
+                                                                                                                       : VK_CULL_MODE_NONE;
+                raster.frontFace = desc.frontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+                raster.depthBiasEnable = desc.depthBias ? VK_TRUE : VK_FALSE;
+                raster.lineWidth = 1.0f;
+                VkPipelineMultisampleStateCreateInfo multisample{ VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+                multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+                VkPipelineDepthStencilStateCreateInfo depth{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+                depth.depthTestEnable = desc.depthTest ? VK_TRUE : VK_FALSE;
+                depth.depthWriteEnable = desc.depthWrite ? VK_TRUE : VK_FALSE;
+                depth.depthCompareOp = ToVk(desc.depthCompare);
+                depth.stencilTestEnable = desc.stencilTest ? VK_TRUE : VK_FALSE;
+                auto face = [](const StencilFace& f) {
+                    VkStencilOpState s{};
+                    s.failOp = ToVk(f.fail);
+                    s.passOp = ToVk(f.pass);
+                    s.depthFailOp = ToVk(f.depthFail);
+                    s.compareOp = ToVk(f.compare);
+                    return s;
+                };
+                depth.front = face(desc.stencilFront);
+                depth.back = face(desc.stencilBack);
+                VkPipelineColorBlendAttachmentState attachments[4]{};
+                VkFormat colorFormats[4];
+                uint32_t colorCount = 0;
+                for (uint32_t i = 0; i < 4 && desc.colorFormats[i] != Format::Undefined; i++, colorCount++)
+                {
+                    const BlendAttachment& b = desc.blend[i];
+                    colorFormats[i] = ToVk(desc.colorFormats[i]);
+                    attachments[i].blendEnable = b.enable ? VK_TRUE : VK_FALSE;
+                    attachments[i].srcColorBlendFactor = ToVk(b.srcColor);
+                    attachments[i].dstColorBlendFactor = ToVk(b.dstColor);
+                    attachments[i].colorBlendOp = ToVk(b.colorOp);
+                    attachments[i].srcAlphaBlendFactor = ToVk(b.srcAlpha);
+                    attachments[i].dstAlphaBlendFactor = ToVk(b.dstAlpha);
+                    attachments[i].alphaBlendOp = ToVk(b.alphaOp);
+                    attachments[i].colorWriteMask = b.writeMask;  // (R, G, B, A are the low four bits in both)
+                }
+                VkPipelineColorBlendStateCreateInfo blend{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+                blend.attachmentCount = colorCount;
+                blend.pAttachments = attachments;
+                const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                    VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+                VkPipelineDynamicStateCreateInfo dynamicState{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+                dynamicState.dynamicStateCount = uint32_t(sizeof(dynamic) / sizeof(dynamic[0]));
+                dynamicState.pDynamicStates = dynamic;
+                VkPipelineRenderingCreateInfo rendering{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+                rendering.colorAttachmentCount = colorCount;
+                rendering.pColorAttachmentFormats = colorFormats;
+                if (desc.depthFormat != Format::Undefined)
+                {
+                    rendering.depthAttachmentFormat = ToVk(desc.depthFormat);
+                    rendering.stencilAttachmentFormat = HasDepth(desc.depthFormat) ? ToVk(desc.depthFormat) : VK_FORMAT_UNDEFINED;
+                }
+                VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+                gpci.pNext = &rendering;
+                gpci.stageCount = 2;
+                gpci.pStages = stages;
+                gpci.pVertexInputState = &vertexInput;
+                gpci.pInputAssemblyState = &assembly;
+                gpci.pViewportState = &viewport;
+                gpci.pRasterizationState = &raster;
+                gpci.pMultisampleState = &multisample;
+                gpci.pDepthStencilState = &depth;
+                gpci.pColorBlendState = &blend;
+                gpci.pDynamicState = &dynamicState;
+                gpci.layout = static_cast<const VkBindingLayout*>(desc.layout)->Handle();
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                VkResult r = vkCreateGraphicsPipelines(m_c->device, m_c->pipelineCache, 1, &gpci, nullptr, &pipeline);
+                for (VkShaderModule m : modules)
+                    vkDestroyShaderModule(m_c->device, m, nullptr);
+                if (r != VK_SUCCESS)
+                    return nullptr;
+                return std::make_unique<VkPipelineObject>(*m_c, pipeline, VK_PIPELINE_BIND_POINT_GRAPHICS);
+            }
 
             std::unique_ptr<Pipeline> CreateComputePipeline(const ComputePipelineDesc& desc) override
             {
@@ -836,6 +1320,13 @@ namespace gpu::rhi::vulkan
             devExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         if (HasExtension(avail, "VK_KHR_portability_subset"))
             devExts.push_back("VK_KHR_portability_subset");
+        // Dynamic rendering, and what MoltenVK needs it to bring along.
+        for (const char* name : { VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+                 VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MAINTENANCE_2_EXTENSION_NAME })
+            if (HasExtension(avail, name))
+                devExts.push_back(name);
+        VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRendering{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR };
+        dynamicRendering.dynamicRendering = VK_TRUE;
 
         VkPhysicalDeviceFeatures supported;
         vkGetPhysicalDeviceFeatures(c->physical, &supported);
@@ -854,6 +1345,7 @@ namespace gpu::rhi::vulkan
         config.queueFamily = c->family;
         config.extensions = devExts;
         config.features = &features;
+        config.next = &dynamicRendering;
         std::unique_ptr<Device> device = CreateDevice(config);
         if (!device)
             vkDestroyInstance(c->instance, nullptr);
@@ -902,6 +1394,8 @@ namespace gpu::rhi::vulkan
             vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR")) : nullptr;
         c->hostPointerProperties = hostImport ? reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
             vkGetDeviceProcAddr(c->device, "vkGetMemoryHostPointerPropertiesEXT")) : nullptr;
+        c->beginRendering = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(vkGetDeviceProcAddr(c->device, "vkCmdBeginRenderingKHR"));
+        c->endRendering = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(vkGetDeviceProcAddr(c->device, "vkCmdEndRenderingKHR"));
         VkPipelineCacheCreateInfo pcci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
         Check(vkCreatePipelineCache(c->device, &pcci, nullptr, &c->pipelineCache), "vkCreatePipelineCache");
 

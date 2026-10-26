@@ -2,13 +2,12 @@
 //
 // The Vulkan implementation of the RHI (gpu/rhi/device.h).
 //
-// STATE (DECISIONS.md, presenter refactor step 1): buffers, imported host
-// memory, samplers, binding layouts and sets, compute pipelines, command
-// lists (buffer work, compute, state, queries, events), fences and the
-// queue are implemented and tested (tests/rhi_vulkan_test.cpp). Images,
-// graphics pipelines and rendering passes, which the presenter's post-
-// processing needs next, abort with "not implemented yet" until they are
-// written; so does anything else the draft interface has and no caller needs.
+// STATE (DECISIONS.md, presenter refactor): everything in the draft interface
+// is implemented and tested (tests/rhi_vulkan_test.cpp): buffers, imported
+// host memory, images, samplers, binding layouts and sets, compute and
+// graphics pipelines, command lists, fences, events and queries. Not yet:
+// the swapchain (next), and the renderer's own needs beyond the draft (image
+// views in other formats, memory block suballocation: see device.h).
 #pragma once
 #include <memory>
 

@@ -3,7 +3,10 @@
 // the renderer will lean on (DECISIONS.md, presenter refactor step 1): copies
 // and barriers on buffers, importing host memory without a copy, a binding
 // set with a dynamic uniform offset, pushed bindings, push constants, events
-// signalled from inside a command list, and timestamps. No Vulkan device
+// signalled from inside a command list, timestamps, and the graphics half:
+// images, rendering with a depth test, blending and a partial clear in a
+// pass, a sampled texture through a pushed binding with an immutable
+// sampler, and clears and copies of images. No Vulkan device
 // (CI without one) is a skip, not a failure. Build with the tests (-DSB_TESTS=ON).
 #include <gpu/rhi/command_list.h>
 #include <gpu/rhi/vulkan/vulkan_device.h>
@@ -333,6 +336,195 @@ namespace
         CHECK(pool->Read(0, 2, t), "results ready after the fence");
         CHECK(t[1] >= t[0], "the end is not before the start (%llu, %llu)", (unsigned long long)t[0], (unsigned long long)t[1]);
     }
+
+    // ---- the graphics half ---------------------------------------------------
+
+    struct DrawConstants { float color[4]; float z; };
+
+    std::unique_ptr<Image> MakeImage(Format format, uint32_t w, uint32_t h, uint32_t usage)
+    {
+        ImageDesc desc;
+        desc.format = format;
+        desc.extent = { w, h, 1 };
+        desc.usage = usage;
+        return g_device->CreateImage(desc);
+    }
+
+    // Reads an 8x8 RGBA8 image back as bytes (the image is in `state`).
+    std::vector<uint8_t> Readback(CommandList& cmd, Image& image, Buffer& buffer, State state, uint32_t w, uint32_t h)
+    {
+        ImageTransition t[] = { { &image, state, State::CopySrc } };
+        cmd.Transition(t, 1);
+        BufferImageCopy copy;
+        copy.region = { 0, 0, w, h };
+        cmd.CopyImageToBuffer(image, buffer, &copy, 1);
+        BufferTransition b[] = { { &buffer, State::CopyDst, State::HostRead } };
+        cmd.Transition(nullptr, 0, b, 1);
+        return {};
+    }
+
+    GraphicsPipelineDesc FullscreenDesc(const BindingLayout& layout, Format color, ShaderCode fragment)
+    {
+        GraphicsPipelineDesc d;
+        d.vertex = Code(k_tri_vert, sizeof(k_tri_vert) / 4);
+        d.fragment = fragment;
+        d.layout = &layout;
+        d.colorFormats[0] = color;
+        return d;
+    }
+
+    void Rendering()
+    {
+        BindingLayoutDesc ld;
+        ld.pushConstantBytes = sizeof(DrawConstants);
+        auto layout = g_device->CreateBindingLayout(ld);
+        ShaderCode fs = Code(k_color_frag, sizeof(k_color_frag) / 4);
+
+        GraphicsPipelineDesc depthDesc = FullscreenDesc(*layout, Format::RGBA8, fs);
+        depthDesc.depthFormat = Format::D32F_S8;
+        depthDesc.depthTest = depthDesc.depthWrite = true;
+        depthDesc.depthCompare = CompareOp::Less;
+        GraphicsPipelineDesc blendDesc = FullscreenDesc(*layout, Format::RGBA8, fs);
+        blendDesc.depthFormat = Format::D32F_S8;  // (attached, tested off: the pass has one)
+        blendDesc.blend[0] = { true, BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha, BlendOp::Add, BlendFactor::One, BlendFactor::Zero,
+            BlendOp::Add, 0xF };
+        auto depthPipeline = g_device->CreateGraphicsPipeline(depthDesc);
+        auto blendPipeline = g_device->CreateGraphicsPipeline(blendDesc);
+        CHECK(depthPipeline && blendPipeline, "graphics pipelines");
+        if (!depthPipeline || !blendPipeline)
+            return;
+
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget | kImageCopySrc);
+        auto depth = MakeImage(Format::D32F_S8, 8, 8, kImageDepthStencil);
+        CHECK(target && depth, "images");
+        CHECK(target->Bytes() >= 8 * 8 * 4, "the image's memory is accounted (%llu)", (unsigned long long)target->Bytes());
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+
+        Run([&](CommandList& cmd) {
+            ImageTransition begin[] = { { target.get(), State::Undefined, State::RenderTarget }, { depth.get(), State::Undefined, State::DepthWrite } };
+            cmd.Transition(begin, 2);
+            RenderingDesc rd;
+            rd.color[0] = { target.get(), LoadOp::Clear, StoreOp::Store, { { 0, 0, 1, 1 } } };
+            rd.depth = { depth.get(), LoadOp::Clear, StoreOp::DontCare, { 1.0f, 0 }, false };
+            rd.area = { 0, 0, 8, 8 };
+            cmd.BeginRendering(rd);
+            cmd.SetViewport(0, 0, 8, 8, 0, 1);
+            cmd.SetScissor({ 0, 0, 8, 8 });
+            cmd.SetPipeline(*depthPipeline);
+            auto draw = [&](float r, float g, float b, float a, float z) {
+                DrawConstants c = { { r, g, b, a }, z };
+                cmd.PushConstants(*layout, &c, sizeof(c));
+                cmd.Draw(3, 1, 0, 0);
+            };
+            draw(1, 1, 0, 1, 0.3f);   // yellow, nearest
+            draw(1, 0, 0, 1, 0.5f);   // red, behind it: the depth test rejects it
+            cmd.SetPipeline(*blendPipeline);
+            draw(1, 0, 0, 0.5f, 0.0f);  // red at half alpha over the yellow
+            ClearColor magenta = { { 1, 0, 1, 1 } };
+            cmd.ClearAttachments({ 0, 0, 4, 8 }, &magenta, 1, nullptr, false, false);  // the left half, mid-pass
+            cmd.EndRendering();
+            Readback(cmd, *target, *back, State::RenderTarget, 8, 8);
+        });
+        back->Invalidate(0, 8 * 8 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        auto near = [](int a, int b) { return a - b <= 2 && b - a <= 2; };
+        bool ok = true;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                const uint8_t* p = px + (y * 8 + x) * 4;
+                if (x < 4)
+                    ok &= p[0] == 255 && p[1] == 0 && p[2] == 255;                 // the cleared half: magenta
+                else
+                    ok &= near(p[0], 255) && near(p[1], 128) && p[2] == 0;          // yellow blended with red at 0.5: orange
+            }
+        CHECK(ok, "depth rejection, alpha blending and the mid-pass clear (pixel 0,0 = %u,%u,%u; 7,7 = %u,%u,%u)", px[0], px[1], px[2],
+            px[(7 * 8 + 7) * 4], px[(7 * 8 + 7) * 4 + 1], px[(7 * 8 + 7) * 4 + 2]);
+    }
+
+    void Textures()
+    {
+        auto sampler = g_device->CreateSampler({ Filter::Nearest, Filter::Nearest, Filter::Nearest, AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge, AddressMode::ClampToEdge, 1.0f });
+        BindingLayoutDesc ld;
+        ld.tables.push_back({ { { 0, BindingKind::CombinedImageSampler, uint8_t(ShaderStage::Fragment), sampler.get() } }, true });
+        auto layout = g_device->CreateBindingLayout(ld);
+        auto pipeline = g_device->CreateGraphicsPipeline(FullscreenDesc(*layout, Format::RGBA8, Code(k_tex_frag, sizeof(k_tex_frag) / 4)));
+        CHECK(pipeline != nullptr, "textured pipeline");
+        if (!pipeline)
+            return;
+
+        // A 4x4 texture, texel (x, y) = (x * 60, y * 60, 7, 255), uploaded by a copy.
+        auto up = Make(4 * 4 * 4, MemoryKind::Upload, kBufferCopySrc);
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++)
+            {
+                uint8_t* t = static_cast<uint8_t*>(up->Map()) + (y * 4 + x) * 4;
+                t[0] = uint8_t(x * 60);
+                t[1] = uint8_t(y * 60);
+                t[2] = 7;
+                t[3] = 255;
+            }
+        auto texture = MakeImage(Format::RGBA8, 4, 4, kImageSampled | kImageCopyDst);
+        auto target = MakeImage(Format::RGBA8, 8, 8, kImageRenderTarget | kImageCopySrc);
+        auto back = Make(8 * 8 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        Run([&](CommandList& cmd) {
+            ImageTransition up1[] = { { texture.get(), State::Undefined, State::CopyDst } };
+            cmd.Transition(up1, 1);
+            BufferImageCopy copy;
+            copy.region = { 0, 0, 4, 4 };
+            cmd.CopyBufferToImage(*up, *texture, &copy, 1);
+            ImageTransition up2[] = { { texture.get(), State::CopyDst, State::ShaderRead }, { target.get(), State::Undefined, State::RenderTarget } };
+            cmd.Transition(up2, 2);
+            RenderingDesc rd;
+            rd.color[0] = { target.get(), LoadOp::DontCare, StoreOp::Store, {} };
+            rd.area = { 0, 0, 8, 8 };
+            cmd.BeginRendering(rd);
+            cmd.SetViewport(0, 0, 8, 8, 0, 1);
+            cmd.SetScissor({ 0, 0, 8, 8 });
+            cmd.SetPipeline(*pipeline);
+            BindingEntry e;
+            e.slot = 0;
+            e.image = { texture.get(), nullptr };  // (the layout's sampler)
+            cmd.PushBindings(*layout, 0, &e, 1);
+            cmd.Draw(3, 1, 0, 0);
+            cmd.EndRendering();
+            Readback(cmd, *target, *back, State::RenderTarget, 8, 8);
+        });
+        back->Invalidate(0, 8 * 8 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        bool ok = true;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                const uint8_t* p = px + (y * 8 + x) * 4;  // each texel covers 2x2 pixels, nearest
+                ok &= p[0] == (x / 2) * 60 && p[1] == (y / 2) * 60 && p[2] == 7 && p[3] == 255;
+            }
+        CHECK(ok, "the texture was sampled texel for texel (pixel 5,3 = %u,%u,%u)", px[(3 * 8 + 5) * 4], px[(3 * 8 + 5) * 4 + 1],
+            px[(3 * 8 + 5) * 4 + 2]);
+    }
+
+    void ImageClearsAndBlit()
+    {
+        auto a = MakeImage(Format::RGBA8, 8, 8, kImageCopySrc | kImageCopyDst);
+        auto b = MakeImage(Format::RGBA8, 4, 4, kImageCopySrc | kImageCopyDst);
+        auto back = Make(4 * 4 * 4, MemoryKind::UploadCached, kBufferCopyDst);
+        Run([&](CommandList& cmd) {
+            ImageTransition t1[] = { { a.get(), State::Undefined, State::CopyDst }, { b.get(), State::Undefined, State::CopyDst } };
+            cmd.Transition(t1, 2);
+            cmd.ClearImage(*a, ClearColor{ { 0.0f, 1.0f, 0.0f, 1.0f } });
+            ImageTransition t2[] = { { a.get(), State::CopyDst, State::CopySrc } };
+            cmd.Transition(t2, 1);
+            cmd.BlitImage(*a, { 0, 0, 8, 8 }, *b, { 0, 0, 4, 4 }, Filter::Linear);  // 8x8 -> 4x4
+            Readback(cmd, *b, *back, State::CopyDst, 4, 4);
+        });
+        back->Invalidate(0, 4 * 4 * 4);
+        const uint8_t* px = static_cast<const uint8_t*>(back->Map());
+        bool ok = true;
+        for (int i = 0; i < 16; i++)
+            ok &= px[i * 4] == 0 && px[i * 4 + 1] == 255 && px[i * 4 + 2] == 0 && px[i * 4 + 3] == 255;
+        CHECK(ok, "cleared green, blitted down, read back (%u,%u,%u,%u)", px[0], px[1], px[2], px[3]);
+    }
 }
 
 int main()
@@ -357,6 +549,12 @@ int main()
     Events();
     printf("timestamps\n");
     Timestamps();
+    printf("rendering: depth, blend, partial clear\n");
+    Rendering();
+    printf("sampled texture, pushed binding, immutable sampler\n");
+    Textures();
+    printf("image clear, blit, copy\n");
+    ImageClearsAndBlit();
     g_device.reset();
     printf(g_failures ? "%d FAILED\n" : "all passed\n", g_failures);
     return g_failures ? 1 : 0;
