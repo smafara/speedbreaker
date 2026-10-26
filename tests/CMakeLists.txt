@@ -376,3 +376,8 @@ if(NOT IOS)
         set_tests_properties(rhi_vulkan_test PROPERTIES ENVIRONMENT "VK_DRIVER_FILES=${_sb_icd}")
     endif()
 endif()
+# The same tests on the Metal backend (-DSB_METAL=ON; runtime/CMakeLists.txt).
+if(SB_METAL)
+    sb_test(rhi_metal_test SOURCES ${RT}/gpu/rhi/metal/metal_device.cpp ${RT}/gpu/rhi/metal/metal_cpp.cpp)
+    target_link_libraries(rhi_metal_test PRIVATE SbMetalBackend)
+endif()

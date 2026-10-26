@@ -1,6 +1,6 @@
 // SpeedBreaker tests. GPL-3.0-or-later (see COPYING).
 //
-// The shaders of rhi_vulkan_test.cpp as SPIR-V, so the test needs no shader
+// The shaders of rhi_test_body.h as SPIR-V, so the test needs no shader
 // compiler. Each array is the GLSL above it, compiled with
 //   glslangValidator -V --target-env vulkan1.2 --vn <array name> -o <file>.h <file>
 // (and the header's comment and pragma dropped).

@@ -21,6 +21,32 @@ endif()
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/thirdparty/")
+# The RHI's Metal backend (gpu/rhi/metal, DECISIONS.md D13): Apple only, and
+# opt-in while it is built up (-DSB_METAL=ON). It calls Metal through metal-cpp
+# (thirdparty/metal-cpp, vendored) and turns the SPIR-V of the game's shaders
+# into MSL with SPIRV-Cross: -DSB_SPIRV_CROSS_ROOT=<prefix> names a folder with
+# include/spirv_cross and lib/libspirv-cross-{msl,glsl,core}.a (the Vulkan
+# SDK's macOS folder has both).
+option(SB_METAL "Build the RHI's Metal backend" OFF)
+set(SB_SPIRV_CROSS_ROOT "" CACHE PATH "Prefix with SPIRV-Cross's headers and static libraries (for SB_METAL)")
+if(SB_METAL AND NOT APPLE)
+    message(FATAL_ERROR "SB_METAL is for Apple platforms")
+endif()
+if(NOT SB_METAL)
+    list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/gpu/rhi/metal/")
+else()
+    if(NOT SB_SPIRV_CROSS_ROOT OR NOT EXISTS "${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-msl.a")
+        message(FATAL_ERROR "SB_METAL needs -DSB_SPIRV_CROSS_ROOT=<prefix with lib/libspirv-cross-msl.a>")
+    endif()
+    add_library(SbMetalBackend INTERFACE)
+    target_include_directories(SbMetalBackend SYSTEM INTERFACE
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/metal-cpp ${SB_SPIRV_CROSS_ROOT}/include)
+    target_link_libraries(SbMetalBackend INTERFACE
+        ${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-msl.a ${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-glsl.a
+        ${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-core.a
+        "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+    target_compile_definitions(SbMetalBackend INTERFACE SB_METAL=1)
+endif()
 # The platform layer (platform/*.h): Windows' implementation in
 # platform/win32, everyone else's in platform/posix.
 if(WIN32)
@@ -184,6 +210,9 @@ if(APPLE AND NOT IOS)
     target_link_libraries(SpeedBreaker PRIVATE "-framework Foundation" "-framework AppKit" "-framework CoreFoundation")
 endif()
 target_include_directories(SpeedBreaker SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIR} ${XR}/thirdparty/tomlplusplus/include)
+if(SB_METAL)
+    target_link_libraries(SpeedBreaker PRIVATE SbMetalBackend)
+endif()
 # Assertions stay on in every build type: ported code marks its unhandled
 # cases with assert(), and those must fail loudly, never fall through.
 target_compile_options(SpeedBreaker PRIVATE -Wno-unused-label -Wno-unused-variable -fno-strict-aliasing -UNDEBUG)
