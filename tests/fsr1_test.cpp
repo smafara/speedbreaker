@@ -209,7 +209,7 @@ namespace
             "ChoosePass");
         CHECK(post.find("ToneVariant(fsr1::RcasGlsl().c_str())") != std::string::npos, "RCAS's tone variant");
         const size_t easuAt = frame.find("postProcessor.RecordEasu(*f.list, *scaleInput, w, h, dw, dh, band, bandOn);");
-        const size_t passAt = frame.find("color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars");
+        const size_t passAt = frame.find("rendering.color[0].load = gpu::rhi::LoadOp::Clear;  // black bars");
         CHECK(easuAt != std::string::npos && passAt != std::string::npos && easuAt < passAt, "EASU before the swapchain image's pass");
         // No FSR 1 shader or pipeline unless a frame's pass is FSR 1: the
         // GLSL is compiled only in EnsureFsr and RcasPipeline, and every

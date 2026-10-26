@@ -121,17 +121,15 @@ namespace video
         {
             std::unique_ptr<gpu::rhi::CommandList> list;  // the frame's recording
             std::unique_ptr<gpu::rhi::Fence> done;  // its submission finished (starts signalled)
-            VkBuffer staging = VK_NULL_HANDLE;
-            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-            void* stagingMapped = nullptr;
-            VkDeviceSize stagingSize = 0;
+            std::unique_ptr<gpu::rhi::Buffer> staging;  // the CPU path's frame, on its way to s_source
+            uint64_t stagingSize = 0;
             std::unique_ptr<gpu::rhi::Image> source;  // the frame's input to post-processing (wraps the renderer's or s_source)
             bool timed = false;                       // wrote its post-processing timestamps
             upscale::Pass pass = upscale::Pass::Bicubic;  // the pass it drew with (NFSMW_UPSCALE_AB)
         } s_frames[FRAMES_IN_FLIGHT];
         // NFSMW_GPU_TIMING=1: 3 timestamps per frame slot around the
         // post-processing (before, after AA, after the scale and UI pass).
-        VkQueryPool s_timestamps = VK_NULL_HANDLE;
+        std::unique_ptr<gpu::rhi::QueryPool> s_timestamps;
         double s_timestampPeriod = 1.0;
         std::atomic<uint64_t> s_postFrames{ 0 }, s_postAaNs{ 0 }, s_postNs{ 0 };
         // NFSMW_UPSCALE_AB=1 (a diagnostic, with NFSMW_GPU_TIMING=1): frames
@@ -153,8 +151,7 @@ namespace video
         uint32_t s_frameIndex = 0;
 
         // The source image the front buffer is copied into before scaling.
-        VkImage s_source = VK_NULL_HANDLE;
-        VkDeviceMemory s_sourceMemory = VK_NULL_HANDLE;
+        std::unique_ptr<gpu::rhi::Image> s_source;  // left in CopySrc between frames
         uint32_t s_sourceWidth = 0, s_sourceHeight = 0;
 
         // Latest front buffer from the command processor, as BGRA8.
@@ -826,148 +823,97 @@ namespace video
             if (s_source && s_sourceWidth == width && s_sourceHeight == height)
                 return true;
             WaitIdle();
-            if (s_source)
-            {
-                vkDestroyImage(s_device, s_source, nullptr);
-                vkFreeMemory(s_device, s_sourceMemory, nullptr);
-            }
-            VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-            ii.imageType = VK_IMAGE_TYPE_2D;
-            ii.format = VK_FORMAT_B8G8R8A8_UNORM;
-            ii.extent = { width, height, 1 };
-            ii.mipLevels = 1;
-            ii.arrayLayers = 1;
-            ii.samples = VK_SAMPLE_COUNT_1_BIT;
-            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            if (!Check(vkCreateImage(s_device, &ii, nullptr, &s_source), "vkCreateImage"))
+            gpu::rhi::ImageDesc desc;
+            desc.format = gpu::rhi::Format::BGRA8;
+            desc.extent = { width, height, 1 };
+            desc.usage = gpu::rhi::kImageCopyDst | gpu::rhi::kImageCopySrc | gpu::rhi::kImageSampled;
+            desc.name = "front buffer (CPU path)";
+            s_source = s_rhi->CreateImage(desc);
+            if (!s_source)
                 return false;
-            VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, s_source, &req);
-            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &s_sourceMemory);
-            vkBindImageMemory(s_device, s_source, s_sourceMemory, 0);
             s_sourceWidth = width;
             s_sourceHeight = height;
             return true;
         }
 
-        bool EnsureStaging(Frame& f, VkDeviceSize size)
+        bool EnsureStaging(Frame& f, uint64_t size)
         {
             if (f.staging && f.stagingSize >= size)
                 return true;
-            if (f.staging)
-            {
-                vkDestroyBuffer(s_device, f.staging, nullptr);
-                vkFreeMemory(s_device, f.stagingMemory, nullptr);
-            }
-            VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bi.size = size;
-            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            vkCreateBuffer(s_device, &bi, nullptr, &f.staging);
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_device, f.staging, &req);
-            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &f.stagingMemory);
-            vkBindBufferMemory(s_device, f.staging, f.stagingMemory, 0);
-            vkMapMemory(s_device, f.stagingMemory, 0, size, 0, &f.stagingMapped);
-            f.stagingSize = size;
-            return true;
+            gpu::rhi::BufferDesc desc;
+            desc.size = size;
+            desc.usage = gpu::rhi::kBufferCopySrc;
+            desc.memory = gpu::rhi::MemoryKind::Upload;
+            desc.name = "front buffer staging";
+            f.staging = s_rhi->CreateBuffer(desc);
+            f.stagingSize = f.staging ? size : 0;
+            return f.staging != nullptr;
         }
 
-        void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to,
-            VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+        void Move(gpu::rhi::CommandList& list, gpu::rhi::Image& image, gpu::rhi::State before, gpu::rhi::State after)
         {
-            VkImageMemoryBarrier b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-            b.oldLayout = from;
-            b.newLayout = to;
-            b.srcAccessMask = srcAccess;
-            b.dstAccessMask = dstAccess;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = image;
-            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+            const gpu::rhi::ImageTransition transition{ &image, before, after };
+            list.Transition(&transition, 1);
         }
 
-        // A copy of part of a swapchain image on its way to the host.
-        struct RegionCapture
+        // A copy of part of an image on its way to the host.
+        struct HostCopy
         {
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
+            std::unique_ptr<gpu::rhi::Buffer> buffer;
             uint32_t width = 0, height = 0;
+            explicit operator bool() const { return buffer != nullptr; }
+
+            // After the submission's fence: the pixels (4 bytes each, in the image's format).
+            const uint8_t* Pixels()
+            {
+                buffer->Invalidate(0, uint64_t(width) * height * 4);
+                return static_cast<const uint8_t*>(buffer->Map());
+            }
         };
 
-        // Records a copy of `rect` of `image` (in `layout`, last written at
-        // `stage` with `access`) into a host-visible buffer, and puts the
-        // image back in `layout` for the writes that follow.
-        RegionCapture RecordRegionCapture(VkCommandBuffer cmd, VkImage image, VkImageLayout layout, VkAccessFlags access,
-            VkPipelineStageFlags stage, VkRect2D rect)
+        // Records a copy of `rect` of `image` (in `state`) into a host-readable
+        // buffer, and puts the image back in `state` for the writes that follow.
+        HostCopy RecordHostCopy(gpu::rhi::CommandList& list, gpu::rhi::Image& image, gpu::rhi::State state, const gpu::rhi::Rect2D& rect)
         {
-            RegionCapture c;
-            c.width = rect.extent.width;
-            c.height = rect.extent.height;
-            VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-            bci.size = VkDeviceSize(c.width) * c.height * 4;
-            bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            if (bci.size == 0 || vkCreateBuffer(s_device, &bci, nullptr, &c.buffer) != VK_SUCCESS)
+            HostCopy c;
+            if (!rect.width || !rect.height)
                 return {};
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(s_device, c.buffer, &req);
-            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-            ai.allocationSize = req.size;
-            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            if (vkAllocateMemory(s_device, &ai, nullptr, &c.memory) != VK_SUCCESS)
-            {
-                vkDestroyBuffer(s_device, c.buffer, nullptr);
+            gpu::rhi::BufferDesc desc;
+            desc.size = uint64_t(rect.width) * rect.height * 4;
+            desc.usage = gpu::rhi::kBufferCopyDst;
+            desc.memory = gpu::rhi::MemoryKind::UploadCached;
+            desc.name = "readback";
+            c.buffer = s_rhi->CreateBuffer(desc);
+            if (!c.buffer)
                 return {};
-            }
-            vkBindBufferMemory(s_device, c.buffer, c.memory, 0);
-            Barrier(cmd, image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, access, VK_ACCESS_TRANSFER_READ_BIT, stage,
-                VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkBufferImageCopy region{};
-            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.imageOffset = { rect.offset.x, rect.offset.y, 0 };
-            region.imageExtent = { c.width, c.height, 1 };
-            vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.buffer, 1, &region);
-            VkBufferMemoryBarrier hostRead{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-            hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            hostRead.srcQueueFamilyIndex = hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostRead.buffer = c.buffer;
-            hostRead.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
-            Barrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout, VK_ACCESS_TRANSFER_READ_BIT, access,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, stage);
+            c.width = rect.width;
+            c.height = rect.height;
+            Move(list, image, state, gpu::rhi::State::CopySrc);
+            gpu::rhi::BufferImageCopy copy;
+            copy.region = rect;
+            list.CopyImageToBuffer(image, *c.buffer, &copy, 1);
+            const gpu::rhi::BufferTransition toHost{ c.buffer.get(), gpu::rhi::State::CopyDst, gpu::rhi::State::HostRead };
+            list.Transition(nullptr, 0, &toHost, 1);
+            Move(list, image, gpu::rhi::State::CopySrc, state);
             return c;
         }
 
-        // After the frame's fence: the pixels as RGB, then the buffer freed.
-        CapturedFrame FinishRegionCapture(RegionCapture& c)
+        // The pixels as RGB, then the buffer freed.
+        CapturedFrame FinishHostCopy(HostCopy& c)
         {
             CapturedFrame frame;
             const bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
             const bool rgb = s_swapFormat == VK_FORMAT_R8G8B8A8_UNORM || s_swapFormat == VK_FORMAT_R8G8B8A8_SRGB;
-            void* mapped = nullptr;
-            if ((bgr || rgb) && vkMapMemory(s_device, c.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS)
+            if ((bgr || rgb) && c)
             {
-                const uint8_t* px = static_cast<const uint8_t*>(mapped);
+                const uint8_t* px = c.Pixels();
                 frame.width = c.width;
                 frame.height = c.height;
                 frame.rgb.resize(size_t(c.width) * c.height * 3);
                 for (size_t i = 0, n = size_t(c.width) * c.height; i < n; i++)
                     for (int k = 0; k < 3; k++)
                         frame.rgb[i * 3 + k] = px[i * 4 + (bgr ? 2 - k : k)];
-                vkUnmapMemory(s_device, c.memory);
             }
-            vkDestroyBuffer(s_device, c.buffer, nullptr);
-            vkFreeMemory(s_device, c.memory, nullptr);
             c = {};
             return frame;
         }
@@ -1021,11 +967,8 @@ namespace video
         struct CompareShot
         {
             std::string name;
-            VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            VkImageView view = VK_NULL_HANDLE;
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
+            std::unique_ptr<gpu::rhi::Image> image;
+            HostCopy copy;
             uint32_t width = 0, height = 0;
         };
 
@@ -1034,7 +977,6 @@ namespace video
         std::vector<CompareShot> RecordCompare(gpu::rhi::CommandList& list, PostProcessor& postProcessor, bool tone, gpu::rhi::Image& scaleInput,
             uint32_t w, uint32_t h, const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh)
         {
-            VkCommandBuffer cmd = gpu::rhi::vulkan::NativeCommandBuffer(list);
             std::vector<CompareShot> shots;
             for (const CompareEntry& entry : CompareList())
             {
@@ -1045,75 +987,29 @@ namespace video
                 shot.height = entry.source ? h : s_swapExtent.height;
                 const int32_t x = entry.source ? 0 : dx, y = entry.source ? 0 : dy;
                 const int32_t width = entry.source ? int32_t(w) : dw, height = entry.source ? int32_t(h) : dh;
-                VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-                ii.imageType = VK_IMAGE_TYPE_2D;
-                ii.format = s_swapFormat;
-                ii.extent = { shot.width, shot.height, 1 };
-                ii.mipLevels = 1;
-                ii.arrayLayers = 1;
-                ii.samples = VK_SAMPLE_COUNT_1_BIT;
-                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-                ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-                if (vkCreateImage(s_device, &ii, nullptr, &shot.image) != VK_SUCCESS)
+                gpu::rhi::ImageDesc desc;
+                desc.format = s_swapchain->GetFormat();
+                desc.extent = { shot.width, shot.height, 1 };
+                desc.usage = gpu::rhi::kImageRenderTarget | gpu::rhi::kImageCopySrc;
+                desc.name = "upscale compare";
+                shot.image = s_rhi->CreateImage(desc);
+                if (!shot.image)
                     break;
-                VkMemoryRequirements req;
-                vkGetImageMemoryRequirements(s_device, shot.image, &req);
-                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                vkAllocateMemory(s_device, &ai, nullptr, &shot.memory);
-                vkBindImageMemory(s_device, shot.image, shot.memory, 0);
-                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-                vci.image = shot.image;
-                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-                vci.format = s_swapFormat;
-                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                vkCreateImageView(s_device, &vci, nullptr, &shot.view);
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = VkDeviceSize(shot.width) * shot.height * 4;
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-                vkCreateBuffer(s_device, &bci, nullptr, &shot.buffer);
-                vkGetBufferMemoryRequirements(s_device, shot.buffer, &req);
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(s_device, &ai, nullptr, &shot.bufferMemory);
-                vkBindBufferMemory(s_device, shot.buffer, shot.bufferMemory, 0);
-
                 const upscale::Pass pass = postProcessor.PassFor(entry.mode, tone, w, h, width, height);
                 if (pass == upscale::Pass::Fsr1)
                     postProcessor.RecordEasu(list, scaleInput, w, h, width, height, band, bandOn);
-                Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-                VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
-                color.imageView = shot.view;
-                color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                VkRenderingInfoKHR ri{ VK_STRUCTURE_TYPE_RENDERING_INFO_KHR };
-                ri.renderArea = { { 0, 0 }, { shot.width, shot.height } };
-                ri.layerCount = 1;
-                ri.colorAttachmentCount = 1;
-                ri.pColorAttachments = &color;
-                s_context.cmdBeginRendering(cmd, &ri);
+                Move(list, *shot.image, gpu::rhi::State::Undefined, gpu::rhi::State::RenderTarget);
+                gpu::rhi::RenderingDesc rendering;
+                rendering.color[0].image = shot.image.get();
+                rendering.color[0].load = gpu::rhi::LoadOp::Clear;
+                rendering.area = { 0, 0, shot.width, shot.height };
+                list.BeginRendering(rendering);
                 postProcessor.DrawPicture(list, pass, tone, scaleInput, w, h, band, bandOn, x, y, width, height,
                     entry.sharpen >= 0.0f ? std::min(entry.sharpen, 1.0f) : PostProcessor::Sharpen());
-                s_context.cmdEndRendering(cmd);
-                Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-                VkBufferImageCopy region{};
-                region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.imageExtent = { shot.width, shot.height, 1 };
-                vkCmdCopyImageToBuffer(cmd, shot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shot.buffer, 1, &region);
-                VkBufferMemoryBarrier hostRead{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-                hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                hostRead.srcQueueFamilyIndex = hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                hostRead.buffer = shot.buffer;
-                hostRead.size = VK_WHOLE_SIZE;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+                list.EndRendering();
+                shot.copy = RecordHostCopy(list, *shot.image, gpu::rhi::State::RenderTarget, { 0, 0, shot.width, shot.height });
                 fprintf(stderr, "[video] NFSMW_UPSCALE_COMPARE: %s drawn by %s\n", entry.name.c_str(), upscale::PassName(pass));
-                shots.push_back(shot);
+                shots.push_back(std::move(shot));
             }
             return shots;
         }
@@ -1128,11 +1024,8 @@ namespace video
         // the present's number and time; the lines are counted (PictureCoverHits).
         struct CoverCheck
         {
-            VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory imageMemory = VK_NULL_HANDLE;
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
-            void* mapped = nullptr;
+            std::unique_ptr<gpu::rhi::Image> image;
+            HostCopy copy;
             uint32_t w = 0, h = 0;  // the scaled picture
             uint32_t srcW = 0, srcH = 0;
             bool pending = false;
@@ -1144,7 +1037,8 @@ namespace video
         std::atomic<uint64_t> s_pictureCoverHits{ 0 };
         constexpr uint32_t kCoverCheckDiv = 8;
 
-        void CoverCheckRecord(VkCommandBuffer cmd, VkImage dst, uint32_t slotIndex, float between)
+        // `dst` is in RenderTarget; the UI is drawn after it.
+        void CoverCheckRecord(gpu::rhi::CommandList& list, gpu::rhi::Image& dst, uint32_t slotIndex, float between)
         {
             static uint64_t presents = 0;
             static const auto launch = std::chrono::steady_clock::now();
@@ -1157,72 +1051,38 @@ namespace video
                 return;
             if (c.w != w || c.h != h)
             {
-                vkDeviceWaitIdle(s_device);
-                if (c.buffer)
-                {
-                    vkUnmapMemory(s_device, c.bufferMemory);
-                    vkDestroyBuffer(s_device, c.buffer, nullptr);
-                    vkFreeMemory(s_device, c.bufferMemory, nullptr);
-                    vkDestroyImage(s_device, c.image, nullptr);
-                    vkFreeMemory(s_device, c.imageMemory, nullptr);
-                }
+                WaitIdle();
                 c = CoverCheck{};
                 c.w = w;
                 c.h = h;
-                VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-                ici.imageType = VK_IMAGE_TYPE_2D;
-                ici.format = s_swapFormat;
-                ici.extent = { w, h, 1 };
-                ici.mipLevels = ici.arrayLayers = 1;
-                ici.samples = VK_SAMPLE_COUNT_1_BIT;
-                ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-                ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-                vkCreateImage(s_device, &ici, nullptr, &c.image);
-                VkMemoryRequirements req;
-                vkGetImageMemoryRequirements(s_device, c.image, &req);
-                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                vkAllocateMemory(s_device, &ai, nullptr, &c.imageMemory);
-                vkBindImageMemory(s_device, c.image, c.imageMemory, 0);
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = VkDeviceSize(w) * h * 4;
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-                vkCreateBuffer(s_device, &bci, nullptr, &c.buffer);
-                vkGetBufferMemoryRequirements(s_device, c.buffer, &req);
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(s_device, &ai, nullptr, &c.bufferMemory);
-                vkBindBufferMemory(s_device, c.buffer, c.bufferMemory, 0);
-                vkMapMemory(s_device, c.bufferMemory, 0, VK_WHOLE_SIZE, 0, &c.mapped);
+                gpu::rhi::ImageDesc desc;
+                desc.format = s_swapchain->GetFormat();
+                desc.extent = { w, h, 1 };
+                desc.usage = gpu::rhi::kImageCopyDst | gpu::rhi::kImageCopySrc;
+                desc.name = "cover check";
+                c.image = s_rhi->CreateImage(desc);
+                gpu::rhi::BufferDesc bd;
+                bd.size = uint64_t(w) * h * 4;
+                bd.usage = gpu::rhi::kBufferCopyDst;
+                bd.memory = gpu::rhi::MemoryKind::UploadCached;
+                bd.name = "cover check readback";
+                c.copy.buffer = s_rhi->CreateBuffer(bd);
+                c.copy.width = w;
+                c.copy.height = h;
             }
-            Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            Barrier(cmd, c.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImageBlit blit{};
-            blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blit.srcOffsets[1] = { int32_t(s_swapExtent.width), int32_t(s_swapExtent.height), 1 };
-            blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blit.dstOffsets[1] = { int32_t(w), int32_t(h), 1 };
-            vkCmdBlitImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-            Barrier(cmd, c.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkBufferImageCopy region{};
-            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.imageExtent = { w, h, 1 };
-            vkCmdCopyImageToBuffer(cmd, c.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c.buffer, 1, &region);
-            VkBufferMemoryBarrier hostRead{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-            hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            hostRead.srcQueueFamilyIndex = hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostRead.buffer = c.buffer;
-            hostRead.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
-            // Back to the pass's layout: the UI is drawn after it.
-            Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            if (!c.image || !c.copy.buffer)
+                return;
+            Move(list, dst, gpu::rhi::State::RenderTarget, gpu::rhi::State::CopySrc);
+            Move(list, *c.image, gpu::rhi::State::Undefined, gpu::rhi::State::CopyDst);
+            list.BlitImage(dst, { 0, 0, s_swapExtent.width, s_swapExtent.height }, *c.image, { 0, 0, w, h }, gpu::rhi::Filter::Linear);
+            Move(list, *c.image, gpu::rhi::State::CopyDst, gpu::rhi::State::CopySrc);
+            gpu::rhi::BufferImageCopy copy;
+            copy.region = { 0, 0, w, h };
+            list.CopyImageToBuffer(*c.image, *c.copy.buffer, &copy, 1);
+            const gpu::rhi::BufferTransition toHost{ c.copy.buffer.get(), gpu::rhi::State::CopyDst, gpu::rhi::State::HostRead };
+            list.Transition(nullptr, 0, &toHost, 1);
+            // Back to the pass's state: the UI is drawn after it.
+            Move(list, dst, gpu::rhi::State::CopySrc, gpu::rhi::State::RenderTarget);
             c.pending = true;
             c.srcW = s_swapExtent.width;
             c.srcH = s_swapExtent.height;
@@ -1241,7 +1101,7 @@ namespace video
             const bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
             static std::vector<uint8_t> luma;
             luma.resize(size_t(c.w) * c.h);
-            const uint8_t* px = static_cast<const uint8_t*>(c.mapped);
+            const uint8_t* px = c.copy.Pixels();
             for (size_t i = 0; i < luma.size(); i++)
             {
                 const uint32_t r = px[i * 4 + (bgr ? 2 : 0)], g = px[i * 4 + 1], b = px[i * 4 + (bgr ? 0 : 2)];
@@ -1276,15 +1136,14 @@ namespace video
             const bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
             for (CompareShot& shot : shots)
             {
-                void* mapped = nullptr;
                 const size_t pixels = size_t(shot.width) * shot.height;
-                if (vkMapMemory(s_device, shot.bufferMemory, 0, VkDeviceSize(pixels) * 4, 0, &mapped) == VK_SUCCESS)
+                if (shot.copy)
                 {
                     std::string path = std::format("build/present_check_{}_{}.ppm", captureIndex, shot.name);
                     if (FILE* out = fopen(path.c_str(), "wb"))
                     {
                         fprintf(out, "P6\n%u %u\n255\n", shot.width, shot.height);
-                        const uint8_t* px = static_cast<const uint8_t*>(mapped);
+                        const uint8_t* px = shot.copy.Pixels();
                         std::vector<uint8_t> rgb(pixels * 3);
                         for (size_t i = 0; i < pixels; i++)
                             for (int k = 0; k < 3; k++)
@@ -1293,13 +1152,7 @@ namespace video
                         fclose(out);
                         fprintf(stderr, "[video] NFSMW_UPSCALE_COMPARE: saved %s\n", path.c_str());
                     }
-                    vkUnmapMemory(s_device, shot.bufferMemory);
                 }
-                vkDestroyImageView(s_device, shot.view, nullptr);
-                vkDestroyImage(s_device, shot.image, nullptr);
-                vkFreeMemory(s_device, shot.memory, nullptr);
-                vkDestroyBuffer(s_device, shot.buffer, nullptr);
-                vkFreeMemory(s_device, shot.bufferMemory, nullptr);
             }
             shots.clear();
         }
@@ -1924,17 +1777,9 @@ namespace video
         }
         if (const char* v = std::getenv("NFSMW_GPU_TIMING"); v && v[0] == '1')
         {
-            uint32_t familyCount = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(s_physical, &familyCount, nullptr);
-            std::vector<VkQueueFamilyProperties> families(familyCount);
-            vkGetPhysicalDeviceQueueFamilyProperties(s_physical, &familyCount, families.data());
-            VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qpci.queryCount = FRAMES_IN_FLIGHT * 3;
-            if (families[s_queueFamily].timestampValidBits == 0 ||
-                vkCreateQueryPool(s_device, &qpci, nullptr, &s_timestamps) != VK_SUCCESS)
-                s_timestamps = VK_NULL_HANDLE;
-            s_timestampPeriod = props.limits.timestampPeriod;
+            if (s_rhi->GetCapabilities().timestampQueries)
+                s_timestamps = s_rhi->CreateQueryPool(gpu::rhi::QueryKind::Timestamp, FRAMES_IN_FLIGHT * 3);
+            s_timestampPeriod = s_rhi->GetCapabilities().timestampPeriodNs;
         }
         CreateSwapchain();
         s_context = { s_instance, s_physical, s_device, s_queueFamily, s_queue, s_queueMutexPtr,
@@ -2876,7 +2721,7 @@ namespace video
                 promise.set_value({});
             captures.clear();
         }
-        RegionCapture gameCapture;
+        HostCopy gameCapture;
 
         Frame& f = s_frames[s_frameIndex];
         f.done->Wait();
@@ -2885,8 +2730,7 @@ namespace video
         if (f.timed)
         {
             uint64_t ts[3];
-            if (vkGetQueryPoolResults(s_device, s_timestamps, s_frameIndex * 3, 3, sizeof(ts), ts, sizeof(uint64_t),
-                    VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[2] >= ts[1] && ts[1] >= ts[0])
+            if (s_timestamps->Read(s_frameIndex * 3, 3, ts) && ts[2] >= ts[1] && ts[1] >= ts[0])
             {
                 s_postFrames++;
                 s_postAaNs += uint64_t(double(ts[1] - ts[0]) * s_timestampPeriod);
@@ -2934,51 +2778,43 @@ namespace video
         if (upload)
         {
             EnsureSource(w, h);
-            EnsureStaging(f, VkDeviceSize(w) * h * 4);
-            memcpy(f.stagingMapped, pixels.data(), size_t(w) * h * 4);
+            EnsureStaging(f, uint64_t(w) * h * 4);
+            memcpy(f.staging->Map(), pixels.data(), size_t(w) * h * 4);
         }
 
-        f.list->Begin();
-        VkCommandBuffer cmd = gpu::rhi::vulkan::NativeCommandBuffer(*f.list);
+        gpu::rhi::CommandList& list = *f.list;
+        list.Begin();
 
-        VkImage source = gpuImage;
-        VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_GENERAL;
+        // The frame the post-processing or the plain blit reads: the renderer's
+        // (written by its earlier submission, and left in ShaderWrite = GENERAL, which
+        // it expects back at the end of the frame), wrapped for this frame, or the
+        // CPU path's in s_source (uploaded now or, a redraw, still there from an
+        // earlier frame; it is left in CopySrc between frames).
+        gpu::rhi::Image* source = nullptr;
+        gpu::rhi::State sourceState = gpu::rhi::State::CopySrc;
         if (gpuImage)
         {
-            // Written by the renderer's earlier submission: a memory barrier
-            // orders this read after it (and its next write after this read).
-            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-            mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            f.source = gpu::rhi::vulkan::WrapImage(*s_rhi, gpuImage, gpu::rhi::Format::RGBA8, w, h,
+                gpu::rhi::kImageSampled | gpu::rhi::kImageCopySrc);
+            source = f.source.get();
+            sourceState = gpu::rhi::State::ShaderWrite;
         }
         else if (haveSource)
         {
-            // The CPU path's frame, uploaded now or (a redraw) still there
-            // from an earlier frame; it is left in TRANSFER_SRC between frames.
-            source = s_source;
-            sourceLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            source = s_source.get();
             if (upload)
             {
                 // After the other frame in flight's reads (blit, AA, scaling).
-                Barrier(cmd, s_source, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
-                VkBufferImageCopy copy{};
-                copy.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                copy.imageExtent = { w, h, 1 };
-                vkCmdCopyBufferToImage(cmd, f.staging, s_source, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-                Barrier(cmd, s_source, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                Move(list, *source, gpu::rhi::State::Undefined, gpu::rhi::State::CopyDst);
+                gpu::rhi::BufferImageCopy copy;
+                copy.region = { 0, 0, w, h };
+                list.CopyBufferToImage(*f.staging, *source, &copy, 1);
+                Move(list, *source, gpu::rhi::State::CopyDst, gpu::rhi::State::CopySrc);
             }
         }
 
-        VkImage dst = gpu::rhi::vulkan::NativeImage(*s_acquired);
-        const VkImageView dstView = gpu::rhi::vulkan::NativeView(*s_acquired);
-        VkBuffer captureBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory captureMemory = VK_NULL_HANDLE;
-        VkDeviceSize captureSize = 0;
+        gpu::rhi::Image& dst = *s_acquired;
+        HostCopy screenshot;
         int captureIndex = -1;
         std::vector<CompareShot> compareShots;  // NFSMW_UPSCALE_COMPARE
         // Letterbox to the source aspect ratio; or, on a screen of another
@@ -3028,12 +2864,12 @@ namespace video
         const bool bandOn = s_bandFilter && (band.x0 > 0 || band.x1 < int32_t(w) || band.y0 > 0 || band.y1 < int32_t(h));
         int32_t dx = (int32_t(s_swapExtent.width) - dw) / 2, dy = (int32_t(s_swapExtent.height) - dh) / 2;
         // The picture without its letterbox bars, for a screenshot.
-        VkRect2D pictureRect{};
+        gpu::rhi::Rect2D pictureRect{};
         {
             int32_t x0 = std::max(dx, 0), y0 = std::max(dy, 0);
             int32_t x1 = std::min(dx + dw, int32_t(s_swapExtent.width)), y1 = std::min(dy + dh, int32_t(s_swapExtent.height));
             if (x1 > x0 && y1 > y0)
-                pictureRect = { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
+                pictureRect = { x0, y0, uint32_t(x1 - x0), uint32_t(y1 - y0) };
         }
         if (!s_postProcessor)
             s_postProcessor = std::make_unique<PostProcessor>(*s_rhi, [] { WaitIdle(); });
@@ -3046,32 +2882,20 @@ namespace video
             gpu::rhi::Image* scaleInput = nullptr;
             if (post)
             {
-                if (!gpuImage)
-                    Barrier(cmd, s_source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-                else
-                    // Written by the renderer's earlier submission (and left in GENERAL, which
-                    // it expects back at the end of the frame).
-                    Barrier(cmd, source, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-                // The renderer's front image / s_source.
-                f.source = gpu::rhi::vulkan::WrapImage(*s_rhi, source, gpuImage ? gpu::rhi::Format::RGBA8 : gpu::rhi::Format::BGRA8, w, h,
-                    gpu::rhi::kImageSampled);
-                scaleInput = f.source.get();
+                Move(list, *source, sourceState, gpu::rhi::State::ShaderRead);
+                scaleInput = source;
                 if (s_timestamps)
                 {
                     // From when the work before it is done (the renderer's frame).
-                    vkCmdResetQueryPool(cmd, s_timestamps, s_frameIndex * 3, 3);
-                    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3);
+                    list.ResetQueries(*s_timestamps, s_frameIndex * 3, 3);
+                    list.WriteTimestamp(*s_timestamps, s_frameIndex * 3, true);
                     f.timed = true;
                 }
 
                 if (PostProcessor::AntiAliasing())
                     scaleInput = &postProcessor.RecordAntiAliasing(*f.list, *scaleInput, w, h, band, bandOn);
                 if (f.timed)
-                    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 1);
+                    list.WriteTimestamp(*s_timestamps, s_frameIndex * 3 + 1, true);
             }
 
             // Brightness and the 360's display gamma: false at Brightness 0
@@ -3087,37 +2911,29 @@ namespace video
             f.pass = pass;
             if (scaleInput && pass == upscale::Pass::Fsr1)
                 postProcessor.RecordEasu(*f.list, *scaleInput, w, h, dw, dh, band, bandOn);
-            Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
-                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-            VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
-            color.imageView = dstView;
-            color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // black bars
-            color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            Move(list, dst, gpu::rhi::State::Undefined, gpu::rhi::State::RenderTarget);
+            gpu::rhi::RenderingDesc rendering;
+            rendering.color[0].image = &dst;
+            rendering.color[0].load = gpu::rhi::LoadOp::Clear;  // black bars
             if (!haveSource)  // the installer, before the game: a dark backdrop
-                color.clearValue.color = { { 0.02f, 0.025f, 0.035f, 1.0f } };
-            VkRenderingInfoKHR ri{ VK_STRUCTURE_TYPE_RENDERING_INFO_KHR };
-            ri.renderArea = { { 0, 0 }, s_swapExtent };
-            ri.layerCount = 1;
-            ri.colorAttachmentCount = 1;
-            ri.pColorAttachments = &color;
-            s_context.cmdBeginRendering(cmd, &ri);
+                rendering.color[0].clear = { { 0.02f, 0.025f, 0.035f, 1.0f } };
+            rendering.area = { 0, 0, s_swapExtent.width, s_swapExtent.height };
+            list.BeginRendering(rendering);
+            // After a pause for a copy, the pass carries on with what it drew.
+            auto resume = [&] {
+                rendering.color[0].load = gpu::rhi::LoadOp::Load;
+                list.BeginRendering(rendering);
+            };
             if (scaleInput)
             {
-                postProcessor.DrawPicture(*f.list, pass, tone, *scaleInput, w, h, band, bandOn, dx, dy, dw, dh, PostProcessor::Sharpen());
-                if (!captures.empty() && pictureRect.extent.width)
+                postProcessor.DrawPicture(list, pass, tone, *scaleInput, w, h, band, bandOn, dx, dy, dw, dh, PostProcessor::Sharpen());
+                if (!captures.empty() && pictureRect.width)
                 {
                     // The game's picture alone: pause the pass, copy it out,
                     // and carry on with the UI over it.
-                    s_context.cmdEndRendering(cmd);
-                    gameCapture = RecordRegionCapture(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
-                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, pictureRect);
-                    VkRenderingAttachmentInfoKHR resume = color;
-                    resume.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                    VkRenderingInfoKHR again = ri;
-                    again.pColorAttachments = &resume;
-                    s_context.cmdBeginRendering(cmd, &again);
+                    list.EndRendering();
+                    gameCapture = RecordHostCopy(list, dst, gpu::rhi::State::RenderTarget, pictureRect);
+                    resume();
                 }
             }
             // NFSMW_LOG_COVERS=1: the picture as drawn, before the UI (the
@@ -3125,19 +2941,15 @@ namespace video
             // inside it (CoverCheckRecord, read back a frame later).
             if (game::covers::Enabled() && haveSource)
             {
-                s_context.cmdEndRendering(cmd);
-                CoverCheckRecord(cmd, dst, s_frameIndex, 0.0f);
-                VkRenderingAttachmentInfoKHR resume = color;
-                resume.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                VkRenderingInfoKHR again = ri;
-                again.pColorAttachments = &resume;
-                s_context.cmdBeginRendering(cmd, &again);
+                list.EndRendering();
+                CoverCheckRecord(list, dst, s_frameIndex, 0.0f);
+                resume();
             }
             if (uiFrame)
-                ui::Draw(cmd);
-            s_context.cmdEndRendering(cmd);
+                ui::Draw(gpu::rhi::vulkan::NativeCommandBuffer(list));
+            list.EndRendering();
             if (f.timed)
-                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 2);
+                list.WriteTimestamp(*s_timestamps, s_frameIndex * 3 + 2, true);
             // NFSMW_CHECK_PRESENT_SEC=<s>: from s seconds after the first
             // frame, save 3 presented frames 30 apart as
             // build/present_check_<k>.ppm (what the window shows, after
@@ -3174,97 +2986,44 @@ namespace video
             }
             if ((check || shot) && s_swapReadable)
             {
-                captureSize = VkDeviceSize(s_swapExtent.width) * s_swapExtent.height * 4;
-                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-                bci.size = captureSize;
-                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-                vkCreateBuffer(s_device, &bci, nullptr, &captureBuffer);
-                VkMemoryRequirements req;
-                vkGetBufferMemoryRequirements(s_device, captureBuffer, &req);
-                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-                ai.allocationSize = req.size;
-                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(s_device, &ai, nullptr, &captureMemory);
-                vkBindBufferMemory(s_device, captureBuffer, captureMemory, 0);
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                VkBufferImageCopy region{};
-                region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-                region.imageExtent = { s_swapExtent.width, s_swapExtent.height, 1 };
-                vkCmdCopyImageToBuffer(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, captureBuffer, 1, &region);
-                VkBufferMemoryBarrier hostRead{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-                hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-                hostRead.srcQueueFamilyIndex = hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                hostRead.buffer = captureBuffer;
-                hostRead.size = VK_WHOLE_SIZE;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_ACCESS_TRANSFER_READ_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                screenshot = RecordHostCopy(list, dst, gpu::rhi::State::RenderTarget, { 0, 0, s_swapExtent.width, s_swapExtent.height });
                 captureIndex = shot ? -2 - shots++ : taken++;
             }
-            else
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            Move(list, dst, gpu::rhi::State::RenderTarget, gpu::rhi::State::Present);
             if (captureIndex >= 0 && scaleInput)
                 compareShots = RecordCompare(*f.list, postProcessor, tone, *scaleInput, w, h, band, bandOn, dx, dy, dw, dh);
-            if (post && !gpuImage)
-                Barrier(cmd, s_source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            else if (post)
-                // Back to the layout the renderer writes it in.
-                Barrier(cmd, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            if (post)
+                Move(list, *source, gpu::rhi::State::ShaderRead, sourceState);  // (the renderer's: back to the state it writes it in)
         }
         else
         {
             // No post-processing pipeline: a linear blit, then the UI in a pass
-            // of its own. (The transition waits at the acquire's wait stage.)
-            Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkClearColorValue black{};
-            VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCmdClearColorImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-            Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);  // the blit after the clear
-            VkImageBlit blit{};
-            blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blit.srcOffsets[1] = { int32_t(w), int32_t(h), 1 };
-            blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            blit.dstOffsets[0] = { dx, dy, 0 };
-            blit.dstOffsets[1] = { dx + dw, dy + dh, 1 };
-            vkCmdBlitImage(cmd, source, sourceLayout, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &blit, VK_FILTER_LINEAR);
-            if (!captures.empty() && pictureRect.extent.width)
-                gameCapture = RecordRegionCapture(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, pictureRect);
+            // of its own.
+            Move(list, dst, gpu::rhi::State::Undefined, gpu::rhi::State::CopyDst);
+            list.ClearImage(dst, gpu::rhi::ClearColor{});
+            Move(list, dst, gpu::rhi::State::CopyDst, gpu::rhi::State::CopyDst);  // the blit after the clear
+            Move(list, *source, sourceState, gpu::rhi::State::CopySrc);
+            list.BlitImage(*source, { 0, 0, w, h }, dst, { dx, dy, uint32_t(dw), uint32_t(dh) }, gpu::rhi::Filter::Linear);
+            Move(list, *source, gpu::rhi::State::CopySrc, sourceState);
+            if (!captures.empty() && pictureRect.width)
+                gameCapture = RecordHostCopy(list, dst, gpu::rhi::State::CopyDst, pictureRect);
             if (uiFrame)
             {
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-                VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
-                color.imageView = dstView;
-                color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                VkRenderingInfoKHR ri{ VK_STRUCTURE_TYPE_RENDERING_INFO_KHR };
-                ri.renderArea = { { 0, 0 }, s_swapExtent };
-                ri.layerCount = 1;
-                ri.colorAttachmentCount = 1;
-                ri.pColorAttachments = &color;
-                s_context.cmdBeginRendering(cmd, &ri);
-                ui::Draw(cmd);
-                s_context.cmdEndRendering(cmd);
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                Move(list, dst, gpu::rhi::State::CopyDst, gpu::rhi::State::RenderTarget);
+                gpu::rhi::RenderingDesc rendering;
+                rendering.color[0].image = &dst;
+                rendering.color[0].load = gpu::rhi::LoadOp::Load;
+                rendering.area = { 0, 0, s_swapExtent.width, s_swapExtent.height };
+                list.BeginRendering(rendering);
+                ui::Draw(gpu::rhi::vulkan::NativeCommandBuffer(list));
+                list.EndRendering();
+                Move(list, dst, gpu::rhi::State::RenderTarget, gpu::rhi::State::Present);
             }
             else
-                Barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                Move(list, dst, gpu::rhi::State::CopyDst, gpu::rhi::State::Present);
         }
-        f.list->End();
-        s_rhi->SubmitToSwapchain(*f.list, *f.done, *s_swapchain);
+        list.End();
+        s_rhi->SubmitToSwapchain(list, *f.done, *s_swapchain);
         frontLock.unlock();
 
         const uint64_t presentId = ++s_presentId;
@@ -3382,22 +3141,20 @@ namespace video
             if (gameCapture.buffer)
             {
                 f.done->Wait();
-                frame = FinishRegionCapture(gameCapture);
+                frame = FinishHostCopy(gameCapture);
             }
             for (auto& promise : captures)
                 promise.set_value(frame);
         }
-        if (captureBuffer)
+        if (screenshot)
         {
             f.done->Wait();
-            void* mapped = nullptr;
-            vkMapMemory(s_device, captureMemory, 0, captureSize, 0, &mapped);
             std::string path = captureIndex >= 0 ? std::format("build/present_check_{}.ppm", captureIndex)
                                                  : std::format("build/ui_shot_{}.ppm", -2 - captureIndex);
             if (FILE* out = fopen(path.c_str(), "wb"))
             {
                 fprintf(out, "P6\n%u %u\n255\n", s_swapExtent.width, s_swapExtent.height);
-                const uint8_t* px = static_cast<const uint8_t*>(mapped);
+                const uint8_t* px = screenshot.Pixels();
                 std::vector<uint8_t> rgb(size_t(s_swapExtent.width) * s_swapExtent.height * 3);
                 bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
                 for (size_t i = 0; i < rgb.size() / 3; i++)
@@ -3410,9 +3167,6 @@ namespace video
             }
             else
                 fprintf(stderr, "[video] can't save a presented frame to %s: %s\n", path.c_str(), strerror(errno));
-            vkUnmapMemory(s_device, captureMemory);
-            vkDestroyBuffer(s_device, captureBuffer, nullptr);
-            vkFreeMemory(s_device, captureMemory, nullptr);
         }
         if (!compareShots.empty())
         {

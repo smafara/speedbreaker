@@ -525,4 +525,19 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   source (`s_source`, no renderer image) and the compare tool. ctest 71/71 (fsr1_test and
   display_tone_test read the new file now); a 30 s live run shows FSR 1 at 60 fps.
   Next: readbacks (screenshots, cover check, region capture, compare shots), then slim RunFrame.
+- 2026-10-26: presenter step 4 done: every command the frame records is on the RHI now. The
+  frame's `CommandList` records the source's state changes, the swapchain image's states
+  (Undefined -> RenderTarget -> Present), the pass (`BeginRendering`/`EndRendering`, paused
+  for copies), the plain-blit fallback (`ClearImage`, `BlitImage`), the CPU path's upload
+  (`CopyBufferToImage` from an Upload buffer into `s_source`, an RHI image), timestamps (an RHI
+  `QueryPool`; `Capabilities::timestampPeriodNs` added) and every readback (`HostCopy`: one
+  helper for screenshots, the game picture capture, the cover check and the compare shots:
+  image -> CopySrc -> `CopyImageToBuffer` -> `HostRead`, then `Invalidate` and `Map`). What is
+  left of raw Vulkan in the presenter: instance/device/surface choice (policy), two
+  `vkQueueWaitIdle`s, the `VulkanContext` handed to the renderer and the UI, and
+  `ui::Draw(NativeCommandBuffer)`. Not done: splitting RunFrame (still one long function) into
+  policy and recording; that is tidying, not needed for Metal. Checks: replay_check and all 12
+  post_check pictures bit-identical, ctest 71/71, a 35 s live run with
+  NFSMW_CHECK_PRESENT_SEC, NFSMW_UPSCALE_COMPARE and NFSMW_LOG_COVERS saved the presented frame
+  and the three compare pictures (5120x2880, not black).
 

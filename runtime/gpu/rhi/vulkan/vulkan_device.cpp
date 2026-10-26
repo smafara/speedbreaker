@@ -1830,6 +1830,7 @@ namespace gpu::rhi::vulkan
         caps.textureCompressionBC = config.features && config.features->textureCompressionBC;
         caps.occlusionQueries = c->preciseOcclusion;
         caps.timestampQueries = props.limits.timestampComputeAndGraphics;
+        caps.timestampPeriodNs = props.limits.timestampPeriod;
         caps.presentTiming = c->waitForPresent != nullptr;
 #if defined(__APPLE__) && !TARGET_OS_IOS
         caps.scheduledPresent = c->pastTiming != nullptr;

@@ -262,6 +262,7 @@ namespace gpu::rhi
         bool textureCompressionBC = true;
         bool occlusionQueries = false;       // precise counting
         bool timestampQueries = false;
+        double timestampPeriodNs = 1.0;      // nanoseconds per timestamp tick
         bool fragmentShadingRate = false;
         bool presentTiming = false;          // PresentShown is delivered (VK_KHR_present_wait; Metal always)
         bool scheduledPresent = false;       // PresentRequest::notBefore is honoured (display timing; Metal)
