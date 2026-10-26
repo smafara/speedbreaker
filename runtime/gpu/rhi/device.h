@@ -46,7 +46,9 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "swapchain.h"
@@ -224,7 +226,8 @@ namespace gpu::rhi
     public:
         virtual ~Fence() = default;
         virtual bool Signaled() = 0;
-        virtual void Wait() = 0;
+        // True once signalled; false when `timeoutNs` passed first.
+        virtual bool Wait(uint64_t timeoutNs = UINT64_MAX) = 0;
         virtual void Reset() = 0;
     };
 
@@ -247,6 +250,10 @@ namespace gpu::rhi
         virtual ~QueryPool() = default;
         // The results of [first, first + count) once their submission is done.
         virtual bool Read(uint32_t first, uint32_t count, uint64_t* out) = 0;
+        // Reset [first, first + count) from the CPU, when no submission in
+        // flight uses them. False where the device can't (record
+        // CommandList::ResetQueries instead).
+        virtual bool Reset(uint32_t first, uint32_t count) = 0;
     };
 
     // ---- the device ----------------------------------------------------------
@@ -308,5 +315,10 @@ namespace gpu::rhi
         // semaphore) and what Present shows waits for it (the render-done one).
         virtual void SubmitToSwapchain(CommandList& list, Fence& fence, Swapchain& swapchain) = 0;
         virtual void WaitIdle() = 0;
+        // Called by every Submit with the queue's lock held, before the work
+        // goes to the queue: it may wait on the lock (a condition variable)
+        // while the app is in the background, where no GPU work may start
+        // (iOS; the presenter's WaitForeground). Set once, before use.
+        virtual void SetSubmitGate(std::function<void(std::unique_lock<std::mutex>&)> gate) = 0;
     };
 }

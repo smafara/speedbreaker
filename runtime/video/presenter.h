@@ -12,6 +12,8 @@
 
 #include <vulkan/vulkan.h>
 
+namespace gpu::rhi { class Device; }
+
 namespace video
 {
     // NFSMW_LOG_COVERS=1 (gpu/covers.h): the picture lines logged so far
@@ -143,6 +145,8 @@ namespace video
 
     // nullptr when running headless.
     const VulkanContext* GetVulkan();
+    // The device behind it (the renderer's RHI), nullptr when running headless.
+    gpu::rhi::Device* GetRhi();
 
     // Any thread, holding queueMutex (`queueLock`), before a vkQueueSubmit or
     // vkQueuePresentKHR: waits while the app is in the background. iOS lets

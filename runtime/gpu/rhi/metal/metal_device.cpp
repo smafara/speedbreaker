@@ -562,10 +562,15 @@ namespace gpu::rhi::metal
                 std::lock_guard lock(m_state->mutex);
                 return m_state->signaled;
             }
-            void Wait() override
+            bool Wait(uint64_t timeoutNs) override
             {
                 std::unique_lock lock(m_state->mutex);
-                m_state->cv.wait(lock, [&] { return m_state->signaled; });
+                if (timeoutNs == UINT64_MAX)
+                {
+                    m_state->cv.wait(lock, [&] { return m_state->signaled; });
+                    return true;
+                }
+                return m_state->cv.wait_for(lock, std::chrono::nanoseconds(timeoutNs), [&] { return m_state->signaled; });
             }
             void Reset() override
             {
@@ -658,6 +663,15 @@ namespace gpu::rhi::metal
                     out[i] = ticks[i];
                 }
                 return true;
+            }
+
+            bool Reset(uint32_t first, uint32_t count) override
+            {
+                if (first + count > m_count)
+                    return false;
+                if (m_kind == QueryKind::Occlusion)  // (the counts are in a shared buffer)
+                    memset(static_cast<uint64_t*>(m_c.visibility->contents()) + m_first + first, 0, size_t(count) * sizeof(uint64_t));
+                return true;  // (a timestamp is overwritten by its next sample)
             }
 
             QueryKind Kind() const { return m_kind; }
@@ -1795,8 +1809,12 @@ namespace gpu::rhi::metal
 
             void Submit(CommandList& list, Fence& fence) override
             {
+                std::unique_lock lock(m_submitMutex);
+                if (m_submitGate)
+                    m_submitGate(lock);
                 static_cast<MetalCommandList&>(list).Commit(static_cast<MetalFence&>(fence));
             }
+            void SetSubmitGate(std::function<void(std::unique_lock<std::mutex>&)> gate) override { m_submitGate = std::move(gate); }
             // The drawable needs nothing from the list: the present that follows waits for it on the queue.
             void SubmitToSwapchain(CommandList& list, Fence& fence, Swapchain&) override { Submit(list, fence); }
 
@@ -1818,6 +1836,8 @@ namespace gpu::rhi::metal
 
             std::unique_ptr<Context> m_c;
             InternalPipelines m_internal;
+            std::mutex m_submitMutex;  // commits come one at a time, so a gate can hold the next
+            std::function<void(std::unique_lock<std::mutex>&)> m_submitGate;
         };
     }
 

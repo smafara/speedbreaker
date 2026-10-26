@@ -46,10 +46,12 @@ namespace gpu::rhi::vulkan
             uint32_t family = 0;
             VkQueue queue = VK_NULL_HANDLE;
             std::mutex queueMutex;  // every vkQueueSubmit
+            std::function<void(std::unique_lock<std::mutex>&)> submitGate;  // Device::SetSubmitGate
             VkPhysicalDeviceMemoryProperties memory{};
             VkDeviceSize nonCoherentAtom = 1;
             VkPipelineCache pipelineCache = VK_NULL_HANDLE;
             bool preciseOcclusion = false;
+            PFN_vkResetQueryPool hostResetQueries = nullptr;  // VK_EXT_host_query_reset enabled (QueryPool::Reset)
             PFN_vkCmdPushDescriptorSetKHR pushDescriptor = nullptr;
             PFN_vkGetMemoryHostPointerPropertiesEXT hostPointerProperties = nullptr;
             PFN_vkCmdBeginRenderingKHR beginRendering = nullptr;
@@ -562,7 +564,13 @@ namespace gpu::rhi::vulkan
             }
             ~VkFenceObject() override { vkDestroyFence(m_c.device, m_fence, nullptr); }
             bool Signaled() override { return vkGetFenceStatus(m_c.device, m_fence) == VK_SUCCESS; }
-            void Wait() override { Check(vkWaitForFences(m_c.device, 1, &m_fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"); }
+            bool Wait(uint64_t timeoutNs) override
+            {
+                const VkResult r = vkWaitForFences(m_c.device, 1, &m_fence, VK_TRUE, timeoutNs);
+                if (r != VK_TIMEOUT)
+                    Check(r, "vkWaitForFences");
+                return r == VK_SUCCESS;
+            }
             void Reset() override { Check(vkResetFences(m_c.device, 1, &m_fence), "vkResetFences"); }
             VkFence Handle() const { return m_fence; }
 
@@ -604,6 +612,13 @@ namespace gpu::rhi::vulkan
             {
                 return vkGetQueryPoolResults(m_c.device, m_pool, first, count, count * sizeof(uint64_t), out, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+            }
+            bool Reset(uint32_t first, uint32_t count) override
+            {
+                if (!m_c.hostResetQueries)
+                    return false;
+                m_c.hostResetQueries(m_c.device, m_pool, first, count);
+                return true;
             }
             VkQueryPool Handle() const { return m_pool; }
             QueryKind Kind() const { return m_kind; }
@@ -1611,9 +1626,12 @@ namespace gpu::rhi::vulkan
                 VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
                 si.commandBufferCount = 1;
                 si.pCommandBuffers = &cmd;
-                std::lock_guard lock(m_c->queueMutex);
+                std::unique_lock lock(m_c->queueMutex);
+                if (m_c->submitGate)
+                    m_c->submitGate(lock);
                 Check(vkQueueSubmit(m_c->queue, 1, &si, static_cast<VkFenceObject&>(fence).Handle()), "vkQueueSubmit");
             }
+            void SetSubmitGate(std::function<void(std::unique_lock<std::mutex>&)> gate) override { m_c->submitGate = std::move(gate); }
             std::unique_ptr<Swapchain> CreateSwapchain(Surface& surface, const SwapchainDesc& desc) override
             {
                 auto swapchain = std::make_unique<VkSwapchainObject>(*m_c, static_cast<VkSurfaceObject&>(surface), desc);
@@ -1633,7 +1651,9 @@ namespace gpu::rhi::vulkan
                 si.pCommandBuffers = &cmd;
                 si.signalSemaphoreCount = 1;
                 si.pSignalSemaphores = &signal;
-                std::lock_guard lock(m_c->queueMutex);
+                std::unique_lock lock(m_c->queueMutex);
+                if (m_c->submitGate)
+                    m_c->submitGate(lock);
                 Check(vkQueueSubmit(m_c->queue, 1, &si, static_cast<VkFenceObject&>(fence).Handle()), "vkQueueSubmit");
             }
             void WaitIdle() override
@@ -1775,6 +1795,10 @@ namespace gpu::rhi::vulkan
         VkPhysicalDeviceFeatures supported;
         vkGetPhysicalDeviceFeatures(c->physical, &supported);
         c->preciseOcclusion = config.features && config.features->occlusionQueryPrecise;
+        bool hostQueryReset = false;
+        for (auto* in = static_cast<const VkBaseInStructure*>(config.next); in; in = in->pNext)
+            if (in->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES)
+                hostQueryReset |= reinterpret_cast<const VkPhysicalDeviceHostQueryResetFeatures*>(in)->hostQueryReset == VK_TRUE;
 
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
@@ -1794,6 +1818,8 @@ namespace gpu::rhi::vulkan
             return nullptr;
         }
         vkGetDeviceQueue(c->device, c->family, 0, &c->queue);
+        if (hostQueryReset)
+            c->hostResetQueries = reinterpret_cast<PFN_vkResetQueryPool>(vkGetDeviceProcAddr(c->device, "vkResetQueryPool"));
         c->native = { c->instance, c->physical, c->device, c->family, c->queue, &c->queueMutex };
         c->pushDescriptor = pushDescriptor ? reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
             vkGetDeviceProcAddr(c->device, "vkCmdPushDescriptorSetKHR")) : nullptr;

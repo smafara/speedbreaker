@@ -14,6 +14,9 @@
 #include "edge_bars.h"
 #include "memory_plan.h"
 #include "pipeline_cache_header.h"
+#include "rhi/command_list.h"
+#include "rhi/device.h"
+#include "rhi/vulkan/vulkan_native.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
 #include "depth24_glsl.h"
@@ -123,11 +126,14 @@
 
 namespace gpu::renderer
 {
+    namespace rhi = gpu::rhi;
+
     namespace
     {
         using namespace xe::gpu;
 
         const video::VulkanContext* s_vk = nullptr;
+        rhi::Device* s_rhi = nullptr;
         VkDevice s_dev = VK_NULL_HANDLE;
         const uint32_t* s_regs = nullptr;
         PFN_vkCmdPushDescriptorSetKHR s_pushDescriptorSet = nullptr;
@@ -687,15 +693,15 @@ namespace gpu::renderer
         struct ZpdEnd { uint32_t address; uint64_t s0, s1, frame; std::chrono::steady_clock::time_point queued; };
         struct Submission
         {
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            VkFence fence = VK_NULL_HANDLE;
+            std::unique_ptr<rhi::CommandList> list;
+            std::unique_ptr<rhi::Fence> fence;
             bool inFlight = false;
             // A write whose `event` is set runs as soon as the GPU passes that
             // point of the command buffer (vkCmdSetEvent after the work it
             // follows); the rest run when the whole submission completes.
-            struct Write { std::function<void()> fn; VkEvent event = VK_NULL_HANDLE; std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(); };
+            struct Write { std::function<void()> fn; rhi::Event* event = nullptr; std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now(); };
             std::vector<Write> writes;
-            std::vector<VkEvent> events;  // returned to the pool on completion
+            std::vector<rhi::Event*> events;  // returned to the pool on completion
             uint64_t number = 0;           // s_submissionCounter when submitted (write-watch guard)
             size_t unsignaled = 0;         // first write not yet covered by an event
             std::chrono::steady_clock::time_point submitted;
@@ -714,7 +720,8 @@ namespace gpu::renderer
         };
         // NFSMW_FENCE_EVENTS=0 disables mid-buffer fence publication.
         const bool s_fenceEvents = [] { const char* v = std::getenv("NFSMW_FENCE_EVENTS"); return !v || v[0] != '0'; }();
-        std::vector<VkEvent> s_eventPool;  // under s_submitMutex
+        std::vector<std::unique_ptr<rhi::Event>> s_eventStore;  // every event made (under s_submitMutex)
+        std::vector<rhi::Event*> s_eventPool;  // those free (under s_submitMutex)
         // NFSMW_LOG_LATENCY: queue -> publish delay of deferred writes, by
         // how they were published (0 event, 1 completion). Under s_submitMutex.
         double s_writeDelayUs[2] = {};
@@ -732,13 +739,13 @@ namespace gpu::renderer
         std::atomic<uint64_t> s_gpuBusyUs{ 0 };
         // True GPU execution time: timestamps at each command buffer's start
         // and end (2 queries per slot).
-        VkQueryPool s_timestamps = VK_NULL_HANDLE;  // NFSMW_GPU_TIMING=1 (each costs a blit encoder on MoltenVK)
+        std::unique_ptr<rhi::QueryPool> s_timestamps;  // NFSMW_GPU_TIMING=1 (each costs a blit encoder on MoltenVK)
         double s_timestampPeriod = 1.0;
 
         // NFSMW_PASS_PROFILE=<frame>: time every render pass of one frame and
         // print them (targets, area, draws, GPU us). 256 passes max.
         const int s_profileFrame = [] { const char* v = std::getenv("NFSMW_PASS_PROFILE"); return v ? std::atoi(v) : -1; }();
-        VkQueryPool s_passQueries = VK_NULL_HANDLE;
+        std::unique_ptr<rhi::QueryPool> s_passQueries;
         // Per profiled pass, also what was recorded in the gap before it:
         // resolves, texture uploads, submissions, guest memory synced to the
         // GPU copy (KB).
@@ -749,7 +756,6 @@ namespace gpu::renderer
         uint32_t s_passQueryNext = 0;
         std::atomic<uint64_t> s_gpuExecNs{ 0 };
         std::chrono::steady_clock::time_point s_lastCompletion;
-        VkCommandPool s_commandPool = VK_NULL_HANDLE;
         Submission s_submissions[kSlots];
         uint32_t s_slot = 0;
         uint64_t s_submissionCounter = 1;       // bumps on every submit
@@ -773,7 +779,7 @@ namespace gpu::renderer
         // the store statistics (under s_submitMutex). See ZpassDone.
         bool s_zpdOn = false;                  // constant after Initialize
         constexpr uint32_t kZpdQueries = 256;  // per slot
-        VkQueryPool s_zpdPool[kSlots] = {};
+        std::unique_ptr<rhi::QueryPool> s_zpdPool[kSlots];
         uint32_t s_zpdUsed[kSlots] = {};       // used by the slot's recording (reset at its next Begin)
         int32_t s_zpdQuery = -1;               // the active segment's query in s_zpdPool[s_slot], or -1
         uint32_t s_zpdNum = 0, s_zpdDen = 0;   // its weight (guest samples per host sample, num / den)
@@ -814,7 +820,7 @@ namespace gpu::renderer
         {
             if (s_zpdQuery < 0)
                 return;
-            vkCmdEndQuery(s_cmd, s_zpdPool[s_slot], uint32_t(s_zpdQuery));
+            s_submissions[s_slot].list->EndQuery(*s_zpdPool[s_slot], uint32_t(s_zpdQuery));
             s_zpdQuery = -1;
         }
 
@@ -873,15 +879,15 @@ namespace gpu::renderer
             if (!s_fenceEvents || !s_recording)
                 return;
             Submission& sub = s_submissions[s_slot];
-            VkEvent event;
+            rhi::Event* event;
             {
                 std::lock_guard lock(s_submitMutex);
                 if (sub.unsignaled == sub.writes.size())
                     return;
                 if (s_eventPool.empty())
                 {
-                    VkEventCreateInfo eci{ VK_STRUCTURE_TYPE_EVENT_CREATE_INFO };
-                    Check(vkCreateEvent(s_dev, &eci, nullptr, &event), "vkCreateEvent");
+                    s_eventStore.push_back(s_rhi->CreateEvent());
+                    event = s_eventStore.back().get();
                 }
                 else
                 {
@@ -893,7 +899,7 @@ namespace gpu::renderer
                 sub.unsignaled = sub.writes.size();
                 sub.events.push_back(event);
             }
-            vkCmdSetEvent(s_cmd, event, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            sub.list->SignalEvent(*event);
         }
 
         void Begin()
@@ -906,19 +912,16 @@ namespace gpu::renderer
                 std::unique_lock lock(s_submitMutex);
                 s_submitCv.wait(lock, [&] { return !sub.inFlight; });
             }
-            vkResetFences(s_dev, 1, &sub.fence);
-            vkResetCommandBuffer(sub.cmd, 0);
-            s_cmd = sub.cmd;
-            VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            Check(vkBeginCommandBuffer(s_cmd, &bi), "vkBeginCommandBuffer");
+            sub.fence->Reset();
+            sub.list->Begin();
+            s_cmd = rhi::vulkan::NativeCommandBuffer(*sub.list);
             s_recording = true;
             s_stateEpoch++;
             s_recordStart = std::chrono::steady_clock::now();
             if (s_timestamps)
             {
-                vkCmdResetQueryPool(s_cmd, s_timestamps, s_slot * 2, 2);
-                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_timestamps, s_slot * 2);
+                sub.list->ResetQueries(*s_timestamps, s_slot * 2, 2);
+                sub.list->WriteTimestamp(*s_timestamps, s_slot * 2, false);
             }
             // Occlusion queries: the slot's last submission has retired, its
             // results harvested; reset the queries it used (a host reset is a
@@ -927,10 +930,8 @@ namespace gpu::renderer
             // exercised on MoltenVK, RADV or Turnip).
             if (s_zpdOn && s_zpdUsed[s_slot])
             {
-                if (s_vk->resetQueryPool)
-                    s_vk->resetQueryPool(s_dev, s_zpdPool[s_slot], 0, s_zpdUsed[s_slot]);
-                else
-                    vkCmdResetQueryPool(s_cmd, s_zpdPool[s_slot], 0, s_zpdUsed[s_slot]);
+                if (!s_zpdPool[s_slot]->Reset(0, s_zpdUsed[s_slot]))
+                    sub.list->ResetQueries(*s_zpdPool[s_slot], 0, s_zpdUsed[s_slot]);
                 s_zpdUsed[s_slot] = 0;
             }
             s_ringOffset = 0;
@@ -947,7 +948,7 @@ namespace gpu::renderer
         std::string s_loggedTextureFetch;
         uint32_t s_drawsSinceCheck = 0;
         bool s_submitAfterDraw = false;  // mid-batch submit to a starving GPU (eager writes)
-        double s_queueLockUs = 0, s_queueSubmitUs = 0;  // waiting for the queue lock, in vkQueueSubmit
+        double s_queueSubmitUs = 0;  // in Device::Submit (the queue lock included)
 
         void SubmitRecorded(int why = 0)
         {
@@ -956,35 +957,27 @@ namespace gpu::renderer
             s_submitWhy[why]++;
             timeline::Mark(timeline::SubmitBegin, why);
             EndPass();
-            if (s_timestamps)
-                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_slot * 2 + 1);
-            Check(vkEndCommandBuffer(s_cmd), "vkEndCommandBuffer");
             Submission& sub = s_submissions[s_slot];
+            if (s_timestamps)
+                sub.list->WriteTimestamp(*s_timestamps, s_slot * 2 + 1, true);
+            sub.list->End();
             sub.number = s_submissionCounter;
-            VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &s_cmd;
             {
-                auto t0 = std::chrono::steady_clock::now();
-                std::unique_lock lock(*s_vk->queueMutex);
-                auto tl = std::chrono::steady_clock::now();
-                // The presenter's gate holds GPU work while the app is
-                // inactive (iOS). It closes only after guesttime::Suspend()
-                // and opens before Resume(), so a hold here is always the
-                // suspension's time, not this submit's or the queue lock's.
+                // The device's gate (the presenter's) holds GPU work while the
+                // app is inactive (iOS). It closes only after
+                // guesttime::Suspend() and opens before Resume(), so a hold
+                // here is always the suspension's time, not this submit's.
+                std::optional<CpWaitTimer> held;
                 if (guesttime::Suspended())
-                {
-                    CpWaitTimer held(CP_WAIT_SUSPENDED);
-                    video::WaitForeground(lock);
-                }
-                else
-                    video::WaitForeground(lock);
+                    held.emplace(CP_WAIT_SUSPENDED);
+                auto t0 = std::chrono::steady_clock::now();
+                s_rhi->Submit(*sub.list, *sub.fence);
                 auto t1 = std::chrono::steady_clock::now();
-                Check(vkQueueSubmit(s_vk->queue, 1, &si, sub.fence), "vkQueueSubmit");
-                auto t2 = std::chrono::steady_clock::now();
-                s_queueLockUs += std::chrono::duration<double, std::micro>(tl - t0).count();
-                s_queueSubmitUs += std::chrono::duration<double, std::micro>(t2 - t1).count();
-                s_hitch.submitMs += std::chrono::duration<double, std::milli>((t2 - t0) - (t1 - tl)).count();
+                if (!held)
+                {
+                    s_queueSubmitUs += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                    s_hitch.submitMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
             }
             {
                 std::lock_guard lock(s_submitMutex);
@@ -1009,18 +1002,12 @@ namespace gpu::renderer
         // hang elsewhere on a query never ended; one not available counts 0.
         void ZpdHarvest(uint32_t slot, const Submission& sub)
         {
-            static uint64_t results[kZpdQueries * 2];  // value, availability
-            uint32_t n = 0;
-            for (const ZpdSegment& s : sub.zpdSegments)
-                n = std::max(n, s.query + 1);
-            memset(results, 0, size_t(n) * 16);
-            VkResult r = vkGetQueryPoolResults(s_dev, s_zpdPool[slot], 0, n, size_t(n) * 16, results, 16,
-                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-            const bool read = r == VK_SUCCESS || r == VK_NOT_READY;
             for (const ZpdSegment& s : sub.zpdSegments)
             {
-                const bool available = read && results[s.query * 2 + 1] != 0;
-                uint64_t raw = available ? results[s.query * 2] : 0;
+                uint64_t raw = 0;
+                const bool available = s_zpdPool[slot]->Read(s.query, 1, &raw);  // (one not ready counts 0)
+                if (!available)
+                    raw = 0;
                 if (!available)
                     s_zpdUnavailable++;
                 uint64_t guest = zpd::Normalize(raw, s.num, s.den);
@@ -1146,12 +1133,12 @@ namespace gpu::renderer
                 size_t done = 0;
                 while (true)
                 {
-                    bool finished = vkGetFenceStatus(s_dev, sub.fence) == VK_SUCCESS;
+                    bool finished = sub.fence->Signaled();
                     bool watching = false;
                     {
                         std::lock_guard lock(s_submitMutex);
                         while (!finished && done < sub.writes.size() && sub.writes[done].event &&
-                            vkGetEventStatus(s_dev, sub.writes[done].event) == VK_EVENT_SET)
+                            sub.writes[done].event->Signaled())
                             { timeline::Mark(timeline::WriteByEvent); RunWrite(sub.writes[done++], 0); }
                         watching = done < sub.writes.size() && sub.writes[done].event;
                     }
@@ -1163,8 +1150,7 @@ namespace gpu::renderer
                     {
                         // Nothing mid-buffer to watch: wait for the fence, but
                         // wake now and then in case a write arrives with an event.
-                        VkResult r = vkWaitForFences(s_dev, 1, &sub.fence, VK_TRUE, 1'000'000);
-                        if (r == VK_SUCCESS)
+                        if (sub.fence->Wait(1'000'000))
                             break;
                     }
                 }
@@ -1196,11 +1182,11 @@ namespace gpu::renderer
                                 s_writeCount[0] = s_writeCount[1] = 0;
                             }
                             double windowUs = std::chrono::duration<double, std::micro>(now - window).count();
-                            fprintf(stderr, "[latency] %u submissions/s, submit->done avg %.0f us, max %.0f us, queue empty %.0f%% | by site ring %u submit %u ifidle %u ifdue %u flush %u write %u present %u draw %u copies %u%s | queue lock %.1f ms/s, vkQueueSubmit %.1f ms/s\n",
+                            fprintf(stderr, "[latency] %u submissions/s, submit->done avg %.0f us, max %.0f us, queue empty %.0f%% | by site ring %u submit %u ifidle %u ifdue %u flush %u write %u present %u draw %u copies %u%s | Submit %.1f ms/s\n",
                                 n, sumUs / n, maxUs, 100.0 * empty / windowUs, s_submitWhy[1], s_submitWhy[2], s_submitWhy[3],
                                 s_submitWhy[4], s_submitWhy[5], s_submitWhy[6], s_submitWhy[7], s_submitWhy[8], s_submitWhy[9], writes,
-                                s_queueLockUs / 1000, s_queueSubmitUs / 1000);
-                            s_queueLockUs = s_queueSubmitUs = 0;
+                                s_queueSubmitUs / 1000);
+                            s_queueSubmitUs = 0;
                             for (auto& w : s_submitWhy)
                                 w = 0;
                             sumUs = maxUs = 0;
@@ -1216,8 +1202,7 @@ namespace gpu::renderer
                 if (s_timestamps)
                 {
                     uint64_t ts[2];
-                    if (vkGetQueryPoolResults(s_dev, s_timestamps, slot * 2, 2, sizeof(ts), ts, sizeof(uint64_t),
-                            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && ts[1] > ts[0])
+                    if (s_timestamps->Read(slot * 2, 2, ts) && ts[1] > ts[0])
                         s_gpuExecNs += uint64_t(double(ts[1] - ts[0]) * s_timestampPeriod);
                 }
                 if (!sub.zpdSegments.empty())
@@ -1240,9 +1225,9 @@ namespace gpu::renderer
                     sub.zpdEnds.clear();
                     sub.zpdSegments.clear();
                     sub.unsignaled = 0;
-                    for (VkEvent event : sub.events)
+                    for (rhi::Event* event : sub.events)
                     {
-                        vkResetEvent(s_dev, event);
+                        event->Reset();
                         s_eventPool.push_back(event);
                     }
                     sub.events.clear();
@@ -2416,7 +2401,7 @@ namespace gpu::renderer
             s_vk->cmdEndRendering(s_cmd);
             s_passActive = false;
             if (s_profiling && !s_passInfos.empty() && s_passInfos.back().query + 1 < s_passQueryNext)
-                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
+                s_submissions[s_slot].list->WriteTimestamp(*s_passQueries, s_passInfos.back().query + 1, true);
             PassEndBarrier();
             SignalWrites();
         }
@@ -2642,8 +2627,8 @@ namespace gpu::renderer
                         n += snprintf(desc + n, sizeof(desc) - n, " C%d[b%u f%u p%u]", i, color[i]->base, color[i]->format, color[i]->pitch);
                 if (depth)
                     n += snprintf(desc + n, sizeof(desc) - n, " D[b%u p%u]", depth->base, depth->pitch);
-                vkCmdResetQueryPool(s_cmd, s_passQueries, s_passQueryNext, 2);
-                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_passQueries, s_passQueryNext);
+                s_submissions[s_slot].list->ResetQueries(*s_passQueries, s_passQueryNext, 2);
+                s_submissions[s_slot].list->WriteTimestamp(*s_passQueries, s_passQueryNext, false);
                 GapCounters now{ s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
                 s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
@@ -7866,7 +7851,7 @@ void main()
                 return;
             }
             uint32_t q = s_zpdUsed[s_slot]++;
-            vkCmdBeginQuery(s_cmd, s_zpdPool[s_slot], q, VK_QUERY_CONTROL_PRECISE_BIT);
+            s_submissions[s_slot].list->BeginQuery(*s_zpdPool[s_slot], q);
             s_zpdQuery = int32_t(q);
             s_zpdNum = num;
             s_zpdDen = den;
@@ -7946,7 +7931,8 @@ void main()
     bool Initialize(const uint32_t* regs)
     {
         s_vk = video::GetVulkan();
-        if (!s_vk)
+        s_rhi = video::GetRhi();
+        if (!s_vk || !s_rhi)
             return false;
         s_dev = s_vk->device;
         s_regs = regs;
@@ -7984,38 +7970,21 @@ void main()
         glslang_initialize_process();
         CreatePipelineCache();
 
-        VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        cpci.queueFamilyIndex = s_vk->queueFamily;
-        Check(vkCreateCommandPool(s_dev, &cpci, nullptr, &s_commandPool), "vkCreateCommandPool");
         for (Submission& sub : s_submissions)
         {
-            VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-            cbai.commandPool = s_commandPool;
-            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cbai.commandBufferCount = 1;
-            Check(vkAllocateCommandBuffers(s_dev, &cbai, &sub.cmd), "vkAllocateCommandBuffers");
-            VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-            Check(vkCreateFence(s_dev, &fci, nullptr, &sub.fence), "vkCreateFence");
+            sub.list = s_rhi->CreateCommandList();
+            sub.fence = s_rhi->CreateFence();
         }
         {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-            s_timestampPeriod = props.limits.timestampPeriod;
-            VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qpci.queryCount = kSlots * 2;
+            s_timestampPeriod = s_rhi->GetCapabilities().timestampPeriodNs;
             // HFR (game/hfr.h) needs the GPU's execution time for its load
             // check: the busy time (submit to seen done) counts the queue's
             // waits too, and read 9-12 ms a frame where execution took 5-8.
             if (const char* v = std::getenv("NFSMW_GPU_TIMING"); (v && v[0] == '1') || (!(v && v[0] == '0') && hfr::Enabled()))
-                if (vkCreateQueryPool(s_dev, &qpci, nullptr, &s_timestamps) != VK_SUCCESS)
-                    s_timestamps = VK_NULL_HANDLE;
+                if (s_rhi->GetCapabilities().timestampQueries)
+                    s_timestamps = s_rhi->CreateQueryPool(rhi::QueryKind::Timestamp, kSlots * 2);
             if (s_profileFrame >= 0)
-            {
-                qpci.queryCount = 512;
-                Check(vkCreateQueryPool(s_dev, &qpci, nullptr, &s_passQueries), "pass query pool");
-            }
+                s_passQueries = s_rhi->CreateQueryPool(rhi::QueryKind::Timestamp, 512);
         }
         // NFSMW_OCCLUSION=1: a pool of occlusion queries per slot, so a reset
         // never touches queries a submission in flight uses. Each is reset
@@ -8023,28 +7992,20 @@ void main()
         // first Begin.
         if (s_vk->occlusionCounting)
         {
-            VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-            qpci.queryType = VK_QUERY_TYPE_OCCLUSION;
-            qpci.queryCount = kZpdQueries;
             s_zpdOn = true;
             for (uint32_t k = 0; k < kSlots && s_zpdOn; k++)
             {
-                s_zpdOn = vkCreateQueryPool(s_dev, &qpci, nullptr, &s_zpdPool[k]) == VK_SUCCESS;
-                if (!s_zpdOn)
-                    s_zpdPool[k] = VK_NULL_HANDLE;
-                else if (s_vk->resetQueryPool)
-                    s_vk->resetQueryPool(s_dev, s_zpdPool[k], 0, kZpdQueries);
-                else
+                s_zpdPool[k] = s_rhi->GetCapabilities().occlusionQueries ? s_rhi->CreateQueryPool(rhi::QueryKind::Occlusion, kZpdQueries) : nullptr;
+                s_zpdOn = s_zpdPool[k] != nullptr;
+                if (s_zpdOn && !s_zpdPool[k]->Reset(0, kZpdQueries))
                     s_zpdUsed[k] = kZpdQueries;
             }
             if (s_zpdOn)
                 s_zpdResults = std::make_unique<zpd::ResultRing>();
             else
             {
-                for (VkQueryPool& pool : s_zpdPool)
-                    if (pool)
-                        vkDestroyQueryPool(s_dev, pool, nullptr);
-                std::fill(std::begin(s_zpdPool), std::end(s_zpdPool), VK_NULL_HANDLE);
+                for (auto& pool : s_zpdPool)
+                    pool.reset();
                 std::fill(std::begin(s_zpdUsed), std::end(s_zpdUsed), 0u);
             }
             fprintf(stderr, s_zpdOn ? "[renderer] occlusion queries counted: %u per command buffer, %u command buffers\n"
@@ -10781,7 +10742,7 @@ void main()
         for (const PassInfo& pi : s_passInfos)
         {
             uint64_t ts[2] = {};
-            vkGetQueryPoolResults(s_dev, s_passQueries, pi.query, 2, sizeof(ts), ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+            s_passQueries->Read(pi.query, 2, ts);
             double us = ts[1] > ts[0] ? double(ts[1] - ts[0]) * s_timestampPeriod / 1000.0 : 0.0;
             double gap = lastEnd && ts[0] > lastEnd ? double(ts[0] - lastEnd) * s_timestampPeriod / 1000.0 : 0.0;
             total += us;

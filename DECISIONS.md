@@ -616,3 +616,28 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   verified yet; that waits for a picture (renderer on the RHI) or a pass-level cross-backend
   test. `rhi_metal_swapchain_test` failed once under `ctest -j2` and not in 8 later runs (cause
   not found; a window test depends on the machine's state).
+
+## Renderer migration (2026-10-26 on)
+
+Plan: `renderer.cpp` (11k lines, ~1000 Vulkan references) moves onto the RHI in slices, each
+building, replay-checked bit-identical on Vulkan (`replay_check.sh`, also with
+`NFSMW_OCCLUSION=1 NFSMW_GPU_TIMING=1 NFSMW_PASS_PROFILE=3`) and committed. Until a slice's
+objects are on the RHI the renderer reaches Vulkan through `vulkan_native.h` (NativeImage,
+NativeCommandBuffer...), as the presenter did. Order: (1) submissions: command lists, fences,
+events, query pools; (2) buffers and guest memory; (3) images (block allocation into the Vulkan
+backend), render targets, textures; (4) pipelines, binding layouts and sets; (5) recording
+(passes, state, draws, copies, barriers); (6) drop Vulkan from renderer.cpp and the
+presenter's `VulkanContext`; (7) Metal bring-up of the renderer (shaders through SPIRV-Cross,
+replay on Metal).
+
+- Slice 1, submissions: `Submission` holds an `rhi::CommandList` and `rhi::Fence`; mid-buffer
+  write fences are `rhi::Event`s; timestamps, per-pass profile queries and the occlusion pools
+  (one per slot) are `rhi::QueryPool`s. RHI additions the renderer needed: `Fence::Wait` takes a
+  timeout (the completion thread polls events between waits), `QueryPool::Reset` (host-side
+  reset where the device has it: MoltenVK's is a memset, a command reset is an encoder; Metal
+  clears the visibility range), and `Device::SetSubmitGate` (the presenter's WaitForeground
+  runs inside Submit with the queue lock held, which the renderer used to take itself; set for
+  both backends). The `[latency]` line's queue-lock figure is gone (it is inside `Submit`).
+  Occlusion results are read one query at a time (a query not ready counts 0, as before).
+  `video::GetRhi()` gives the renderer the device. Replay: bit-identical, also with
+  occlusion, GPU timing and pass profiling on.

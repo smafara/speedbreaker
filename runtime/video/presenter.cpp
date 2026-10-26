@@ -1581,6 +1581,7 @@ namespace video
                 fprintf(stderr, "[video] no Metal device\n");
                 return false;
             }
+            s_rhi->SetSubmitGate([](std::unique_lock<std::mutex>& lock) { WaitForeground(lock); });
             s_metalView = SDL_Metal_CreateView(s_window);
             void* layer = s_metalView ? SDL_Metal_GetLayer(s_metalView) : nullptr;
             if (!layer)
@@ -1887,6 +1888,7 @@ namespace video
         s_rhi = gpu::rhi::vulkan::CreateDevice(deviceConfig);
         if (!s_rhi)
             return false;
+        s_rhi->SetSubmitGate([](std::unique_lock<std::mutex>& lock) { WaitForeground(lock); });
         {
             const gpu::rhi::vulkan::Native& native = gpu::rhi::vulkan::GetNative(*s_rhi);
             s_device = native.device;
@@ -3465,6 +3467,11 @@ namespace video
     const VulkanContext* GetVulkan()
     {
         return s_contextReady ? &s_context : nullptr;
+    }
+
+    gpu::rhi::Device* GetRhi()
+    {
+        return s_contextReady ? s_rhi.get() : nullptr;
     }
 
     bool WindowFullscreen()
