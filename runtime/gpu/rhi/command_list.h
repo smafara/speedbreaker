@@ -106,7 +106,9 @@ namespace gpu::rhi
 
         // ---- queries ----
         virtual void ResetQueries(QueryPool& pool, uint32_t first, uint32_t count) = 0;
-        virtual void WriteTimestamp(QueryPool& pool, uint32_t index) = 0;
+        // `end`: after all the work recorded before it (else before any of it
+        // starts, for the first of a pair). Metal can only stamp the edges of encoders.
+        virtual void WriteTimestamp(QueryPool& pool, uint32_t index, bool end) = 0;
         virtual void BeginQuery(QueryPool& pool, uint32_t index) = 0;
         virtual void EndQuery(QueryPool& pool, uint32_t index) = 0;
     };

@@ -366,3 +366,18 @@ target_compile_options(vblank_lock_sim PRIVATE -O2 -UNDEBUG)
 # Frame Rate 30, Windows' late vblank wake-ups, and planted faults (about 40 s;
 # the 60 Hz tables, a minute and a half, by hand).
 add_test(NAME vblank_lock_sim_multiples COMMAND vblank_lock_sim --multiples)
+
+# The RHI's Vulkan backend (runtime/gpu/rhi/vulkan) on the machine's own
+# Vulkan device, headless: buffers, host-memory import, binding sets with
+# dynamic offsets, pushed bindings, events, timestamps. A machine without a
+# Vulkan device skips it. On macOS the loader is pointed at the MoltenVK
+# manifest the game's build folder has, if it does.
+if(NOT IOS)
+    find_package(Vulkan REQUIRED)
+    sb_test(rhi_vulkan_test SOURCES ${RT}/gpu/rhi/vulkan/vulkan_device.cpp)
+    target_link_libraries(rhi_vulkan_test PRIVATE Vulkan::Vulkan)
+    set(_sb_icd ${CMAKE_BINARY_DIR}/runtime/vulkan/icd.d/MoltenVK_icd.json)
+    if(APPLE AND EXISTS ${_sb_icd})
+        set_tests_properties(rhi_vulkan_test PROPERTIES ENVIRONMENT "VK_DRIVER_FILES=${_sb_icd}")
+    endif()
+endif()

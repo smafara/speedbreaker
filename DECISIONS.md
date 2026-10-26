@@ -405,3 +405,28 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   The same 115 MSL files compile with the offline compiler (`xcrun metal -std=metal3.0 -c`):
   115 of 115, 7 s. Agrees with the runtime compiler. Environment note: offline `metal`/`metallib`
   now available for shader debugging and for precompiled shader libraries later.
+- 2026-10-26: presenter refactor STEP 1 done: the RHI's Vulkan backend exists for the
+  buffer/compute/sync slice. `runtime/gpu/rhi/vulkan/vulkan_device.{h,cpp}` (~700 lines;
+  built into the game by the runtime glob, used by nothing yet): `CreateHeadlessDevice()`
+  makes an instance + device of its own (portability enumeration, push descriptors, host
+  import, first discrete GPU else first device); implemented: buffers (Device / Upload /
+  UploadCached), `ImportHostMemory` (alignment checked against the device's), samplers,
+  `BindingLayout` / `BindingSet` (persistent, dynamic uniform offsets) / pushed tables,
+  compute pipelines, pipeline cache save/load, command lists (buffer copies, fills, updates,
+  compute, state, buffer transitions, events, queries), fences, events, query pools, `Submit`
+  under an internal queue lock. Not implemented (abort with "not implemented yet", filled in
+  when the presenter's post passes need them): images, graphics pipelines, rendering passes,
+  clears, blits, image copies and transitions. Draft interface refinement: `WriteTimestamp`
+  takes `end`.
+  `tests/rhi_vulkan_test.cpp` (+ `rhi_vulkan_test_shaders.h`, four compute shaders as SPIR-V):
+  real calls on the machine's device, headless, a skip without one. All pass on the M5 Max
+  via MoltenVK: buffer copies and barriers; host-memory import (needs 16 KB alignment on
+  Apple; a misaligned import is refused; the CPU's later writes are seen without re-import);
+  a persistent set with dynamic uniform offsets (0 and 256) and `Update` retargeting one
+  slot; a persistent + pushed table; push constants; an event signalled from inside a list
+  is seen by the CPU 0.43 ms in while the list runs 64 ms (so mid-submission write fences
+  work as the renderer needs, on MoltenVK at least); timestamps. Run: `ctest -R rhi_vulkan`
+  in `build/main` (configured with -DSB_TESTS=ON). Replay check still passes (nothing uses
+  the backend yet).
+  Next (step 2): move the presenter's instance/device creation and swapchain/present timing
+  onto the backend; the presenter then holds an `rhi::Device`.
