@@ -696,3 +696,17 @@ replay on Metal).
   (Windows only): the `_WIN32` branches (black check, slot sets, depth-clear map) were converted
   by hand. Replay and post checks bit-identical, also with occlusion, GPU timing and pass
   profiling on.
+- 2026-10-26: the renderer runs on Metal (`NFSMW_BACKEND=metal`; the presenter gives it the
+  Metal device, `GetRhi()`, and a policy). Intro replay frames are bit-identical to the Vulkan
+  baseline; world replay frames differ by float rounding only (up to 4% of pixels, largest
+  difference 37, mean 0.015): `SB_REPLAY_ENV="NFSMW_BACKEND=metal" scripts/replay/replay_check.sh
+  --tolerance 40 --max-bad-percent 6` passes the frames (the presented picture is the window's,
+  a different size on Metal here, so it fails by size: re-record a Metal set with `--set`).
+  The presented world frame, through tone and FSR1 on Metal, looks right. Metal bugs found with
+  `MTL_DEBUG_LAYER=1`: constant blocks must be given whole (rounded to 16 bytes, Vulkan takes a
+  prefix; also the internal clear pipeline's), bindings of tables a new pipeline doesn't share
+  are dropped as in Vulkan (stale graphics textures overwrote a compute shader's texture),
+  a stale pipeline isn't re-applied to a pass of other formats, and point size is declared only
+  for point lists. Not done: Dear ImGui's Metal backend (no UI in Metal mode), layer colour
+  space, a live (non-replay) run's timing and pipeline-compile cost on Metal, Windows branches
+  untested, `THIRD_PARTY_NOTICES.md` row for SPIRV-Cross.

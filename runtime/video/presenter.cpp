@@ -153,6 +153,7 @@ namespace video
         VulkanContext s_context{};
         bool s_contextReady = false;
         RendererPolicy s_policy;
+        bool s_rhiReady = false;  // the renderer may use s_rhi (either backend)
         uint32_t s_frameIndex = 0;
 
         // The source image the front buffer is copied into before scaling.
@@ -1601,7 +1602,12 @@ namespace video
             s_settingsGeneration = settings::Generation();
             fprintf(stderr, "[video] %s (Metal), swapchain %ux%u%s\n", caps.deviceName, s_swapExtent.width, s_swapExtent.height,
                 GeometryNote().c_str());
-            fprintf(stderr, "[video] Metal: no renderer or UI yet (they are Vulkan); the game runs without a GPU renderer\n");
+            {
+                const char* occlusion = std::getenv("NFSMW_OCCLUSION");
+                s_policy.occlusionCounting = occlusion && occlusion[0] == '1' && caps.occlusionQueries;
+            }
+            s_rhiReady = true;
+            fprintf(stderr, "[video] Metal: the renderer runs on the RHI; no UI yet (Dear ImGui's Vulkan backend)\n");
             ReportScreen(std::format("{}, Metal", caps.deviceName));
             if (!s_resolutionHint.empty())
                 fprintf(stderr, "[video] %s\n", s_resolutionHint.c_str());
@@ -1931,6 +1937,7 @@ namespace video
         s_policy.integratedGpuDefaults = integratedGpuDefaults;
 #endif
         s_contextReady = true;
+        s_rhiReady = true;
         s_settingsGeneration = settings::Generation();
         fprintf(stderr, "[video] %s, swapchain %ux%u%s\n", props.deviceName, s_swapExtent.width, s_swapExtent.height, GeometryNote().c_str());
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -3484,7 +3491,7 @@ namespace video
 
     gpu::rhi::Device* GetRhi()
     {
-        return s_contextReady ? s_rhi.get() : nullptr;
+        return s_rhiReady ? s_rhi.get() : nullptr;
     }
 
     bool WindowFullscreen()

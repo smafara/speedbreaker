@@ -423,13 +423,14 @@ namespace gpu::rhi::metal
 
         // MSL for `code` as stage `model` against `layout`; the entry point's
         // name and (compute) workgroup size come back in `entry`, `size`.
-        std::string ToMsl(const ShaderCode& code, spv::ExecutionModel model, const MetalBindingLayout& layout, std::string& entry, MTL::Size* size)
+        std::string ToMsl(const ShaderCode& code, spv::ExecutionModel model, const MetalBindingLayout& layout, std::string& entry, MTL::Size* size, bool pointSize = false)
         {
             spirv_cross::CompilerMSL compiler(code.spirv, code.words);
             spirv_cross::CompilerMSL::Options options;
             options.platform = spirv_cross::CompilerMSL::Options::macOS;
             options.set_msl_version(3, 0);
             options.argument_buffers = false;
+            options.enable_point_size_builtin = pointSize;  // (Metal rejects a point size unless it draws points)
             options.enable_decoration_binding = false;
             // Vulkan's clip space has Y down and Metal's up: the vertex shaders'
             // gl_Position.y is flipped, so a picture comes out the same way up.
@@ -491,6 +492,7 @@ namespace gpu::rhi::metal
         {
         public:
             virtual bool IsCompute() const = 0;
+            const MetalBindingLayout* layout = nullptr;  // what it was made against
         };
 
         class MetalComputePipeline final : public MetalPipeline
@@ -898,7 +900,7 @@ namespace gpu::rhi::metal
             void ClearAttachments(const Rect2D& area, const ClearColor* color, uint32_t colorMask, const ClearDepthStencil* depthStencil, bool clearDepth,
                 bool clearStencil) override
             {
-                float constants[17] = {};  // K: float4 c[4]; float d
+                float constants[20] = {};  // K: float4 c[4]; float d (a block is 16-byte aligned: 80 bytes)
                 for (int i = 0; i < 4; i++)
                     if (color && (colorMask >> i & 1))
                         memcpy(&constants[i * 4], color[i].rgba, 16);
@@ -940,9 +942,32 @@ namespace gpu::rhi::metal
             }
 
             // ---- state ----
+            // As in Vulkan, what was bound stays for the tables the new pipeline's layout shares (the
+            // same slots), and the others are gone.
+            void DropIncompatibleTables(const MetalBindingLayout& layout)
+            {
+                auto same = [&](const MetalBindingLayout* other, uint32_t t) {
+                    if (!other || t >= layout.Desc().tables.size() || t >= other->Desc().tables.size())
+                        return false;
+                    const auto& a = layout.Desc().tables[t].slots;
+                    const auto& b = other->Desc().tables[t].slots;
+                    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const BindingSlot& x, const BindingSlot& y) {
+                        return x.index == y.index && x.kind == y.kind && x.stages == y.stages;
+                    });
+                };
+                for (uint32_t t = 0; t < m_sets.size(); t++)
+                {
+                    if (m_sets[t].set && !same(m_sets[t].layout, t))
+                        m_sets[t].set = nullptr;
+                    if (m_pushed[t].layout && !same(m_pushed[t].layout, t))
+                        m_pushed[t].layout = nullptr;
+                }
+            }
             void SetPipeline(const Pipeline& pipeline) override
             {
                 const auto* p = &static_cast<const MetalPipeline&>(pipeline);
+                if (p->layout)
+                    DropIncompatibleTables(*p->layout);
                 if (p->IsCompute())
                 {
                     m_computePipeline = static_cast<const MetalComputePipeline*>(p);
@@ -1019,7 +1044,11 @@ namespace gpu::rhi::metal
                     Fail("push constants beyond 256 bytes");
                 m_constantsLayout = &static_cast<const MetalBindingLayout&>(layout);
                 memcpy(m_constants, data, size);
-                m_constantsSize = size;
+                // The shader's block is the layout's size; Vulkan lets a caller give a prefix (what the
+                // shader reads), Metal wants the whole block (the rest is whatever was there).
+                m_constantsSize = (std::max<uint32_t>(size, m_constantsLayout->Desc().pushConstantBytes) + 15) & ~15u;  // (a block is 16-byte aligned)
+                if (m_constantsSize > sizeof(m_constants))
+                    Fail("push constants beyond 256 bytes");
                 ApplyConstants();
             }
 
@@ -1335,9 +1364,19 @@ namespace gpu::rhi::metal
             }
 
             // A fresh render encoder gets everything the list has set so far.
+            // Whether the pipeline last set draws into the formats of this pass (Vulkan leaves a
+            // stale one bound across passes unused; Metal refuses it).
+            bool PipelineFitsPass() const
+            {
+                const GraphicsPipelineDesc& d = m_graphicsPipeline->desc;
+                for (int i = 0; i < 4; i++)
+                    if (d.colorFormats[i] != m_passFormats.color[i])
+                        return false;
+                return d.depthFormat == m_passFormats.depth;
+            }
             void ReapplyRender()
             {
-                if (m_graphicsPipeline)
+                if (m_graphicsPipeline && PipelineFitsPass())
                     ApplyGraphicsPipeline();
                 m_render->setStencilReferenceValues(m_rs.stencilFront.reference, m_rs.stencilBack.reference);
                 m_render->setBlendColor(m_rs.blend[0], m_rs.blend[1], m_rs.blend[2], m_rs.blend[3]);
@@ -1411,7 +1450,7 @@ namespace gpu::rhi::metal
                     {
                         MTL::Texture* texture = entries[i].image.view ? static_cast<const MetalImageView*>(entries[i].image.view)->Handle()
                                                                       : static_cast<MetalImage*>(entries[i].image.image)->Handle();
-                        MTL::SamplerState* sampler = nullptr;
+                                MTL::SamplerState* sampler = nullptr;
                         if (m->slot.kind == BindingKind::CombinedImageSampler)
                         {
                             const Sampler* s = m->slot.immutableSampler ? m->slot.immutableSampler : entries[i].image.sampler;
@@ -1824,7 +1863,7 @@ namespace gpu::rhi::metal
                 Pool pool;
                 const auto& layout = *static_cast<const MetalBindingLayout*>(desc.layout);
                 std::string vsEntry, fsEntry;
-                const std::string vsMsl = ToMsl(desc.vertex, spv::ExecutionModelVertex, layout, vsEntry, nullptr);
+                const std::string vsMsl = ToMsl(desc.vertex, spv::ExecutionModelVertex, layout, vsEntry, nullptr, desc.topology == Topology::PointList);
                 const std::string fsMsl = ToMsl(desc.fragment, spv::ExecutionModelFragment, layout, fsEntry, nullptr);
                 Ptr<MTL::Function> vs = MakeFunction(*m_c->device.get(), vsMsl, vsEntry), fs = MakeFunction(*m_c->device.get(), fsMsl, fsEntry);
                 if (!vs || !fs)
@@ -1870,6 +1909,7 @@ namespace gpu::rhi::metal
                 }
                 auto pipeline = std::make_unique<MetalGraphicsPipeline>();
                 pipeline->state = std::move(state);
+                pipeline->layout = &layout;
                 pipeline->desc = desc;
                 pipeline->desc.vertex = pipeline->desc.fragment = {};
                 pipeline->desc.layout = nullptr;
@@ -1899,7 +1939,9 @@ namespace gpu::rhi::metal
                     fprintf(stderr, "[rhi/metal] compute pipeline failed: %s\n", Describe(error).c_str());
                     return nullptr;
                 }
-                return std::make_unique<MetalComputePipeline>(std::move(state), group);
+                auto compute = std::make_unique<MetalComputePipeline>(std::move(state), group);
+                compute->layout = &layout;
+                return compute;
             }
 
             std::vector<uint8_t> SavePipelineCache() override { return {}; }  // (Metal's own cache keeps what it compiled)
