@@ -2,12 +2,10 @@
 //
 // The Vulkan implementation of the RHI (gpu/rhi/device.h).
 //
-// STATE (DECISIONS.md, presenter refactor): everything in the draft interface
-// is implemented and tested (tests/rhi_vulkan_test.cpp): buffers, imported
-// host memory, images, samplers, binding layouts and sets, compute and
-// graphics pipelines, command lists, fences, events and queries. Not yet:
-// the swapchain (next), and the renderer's own needs beyond the draft (image
-// views in other formats, memory block suballocation: see device.h).
+// The files: vulkan_device.cpp (the device and its creation), vulkan_commands.cpp
+// (the command list), vulkan_swapchain.cpp (the window's surface and the
+// swapchain), and vulkan_internal.h, the types they share. What the presenter
+// and renderer may reach into is vulkan_native.h.
 #pragma once
 #include <memory>
 
@@ -18,6 +16,6 @@ namespace gpu::rhi::vulkan
     // A device of its own, headless (no surface: nothing here presents): the
     // first discrete GPU, else the first device. nullptr when there is no
     // usable Vulkan device. For tests and tools; the game's presenter creates
-    // its device itself until it moves onto this backend (step 2).
+    // its device with CreateDevice (vulkan_native.h).
     std::unique_ptr<Device> CreateHeadlessDevice();
 }

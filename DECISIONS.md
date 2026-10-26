@@ -764,3 +764,22 @@ replay on Metal).
   validation errors. ctest 78/79: `region_manifest_test` fails here only because this checkout
   is reached through a symlink (/Users -> /Volumes; the test compares a canonical path with a
   lexical one) and passes with a scratch folder on a real path.
+- 2026-10-26 — **Renderer review and refactors** (only the renderer and the two RHI backends;
+  `renderer.cpp` itself left whole on purpose: it is upstream's file, which upstream keeps
+  editing — the v0.2.0 merge cost eight conflicts there — and ten tests read it as text).
+  (1) `HasDepth`, `IsBlock` and `BytesPerPixel` now live once in `rhi/types.h` (each backend had
+  its own copy). (2) Comments in `renderer.cpp` that still named Vulkan calls it no longer makes
+  (`vkCmdClearAttachments`, `vkCmdSetEvent`, `VulkanContext`, "the Vulkan handles") say what the
+  code does now, including one log line; hardware notes about MoltenVK stay. (3) New RHI test
+  `DepthView` (both backends): a depth image sampled in place through a depth-only view with the
+  R/zero/zero/one swizzle and linear filtering, which is what a lent shadow map does; checked to
+  fail when the expected value is wrong. (4) The two 2,000+ line backend files are split by their
+  own section banners into real translation units: `metal_device.cpp` (the device, its creation),
+  `metal_commands.cpp`, `metal_swapchain.cpp`, `metal_shaders.cpp` (the only one that includes
+  SPIRV-Cross's MSL header), `metal_internal.h` (the shared types, in `gpu::rhi::metal::impl`); and
+  `vulkan_device.cpp`, `vulkan_commands.cpp`, `vulkan_swapchain.cpp`, `vulkan_internal.h`
+  likewise. Upstream has no `gpu/rhi/`, so this cannot make merging it worse. The runtime picks the
+  files up by glob; the RHI tests glob too. Same code moved (free functions became `inline` in
+  the headers; the factories `MakeCommandList`, `MakeSwapchain`, `MakeSurface` etc. are how the
+  device reaches the other files). Checked: rhi_vulkan/metal/metal_swapchain tests, ctest 78/79
+  (the symlink one), Vulkan replays bit-identical, Metal replay frames unchanged.
