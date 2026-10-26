@@ -19,6 +19,7 @@
 #include "renderer.h"
 #include "gpu_clock.h"
 #include "zpd_report.h"
+#include "trace.h"
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <report/report.h>
@@ -1203,6 +1204,9 @@ namespace gpu
                     continue;
                 }
                 s_regs[REG_CP_RB_WPTR] = writeIndex;
+                if (trace::Enabled())
+                    trace::BeforeBatch({ s_regs, REGISTER_COUNT, Physical(0), primary, s_primarySize, s_readIndex, s_readWriteback,
+                        s_binMask, s_binSelect }, writeIndex, s_frames);
                 Reader r{ Physical(primary), s_primarySize, s_readIndex * 4, writeIndex * 4 };
                 timeline::Mark(timeline::BatchBegin, (writeIndex - s_readIndex) & (s_primarySize / 4 - 1));
                 s_busyFrom = std::chrono::steady_clock::now();

@@ -117,7 +117,7 @@ namespace writewatch
         }
         // NFSMW_LOG_UPLOADS: per guest page, what last bumped its write
         // sequence (kind << 60 | frame << 32 | tag), only allocated then.
-        const bool s_logWriters = std::getenv("NFSMW_LOG_UPLOADS") != nullptr;
+        const bool s_logWriters = std::getenv("NFSMW_LOG_UPLOADS") != nullptr || std::getenv("NFSMW_CAPTURE") != nullptr;  // (the capture, gpu/trace.h, leaves out what the GPU wrote)
         std::unique_ptr<std::atomic<uint64_t>[]> s_lastWriter;
         std::unique_ptr<std::atomic<uint32_t>[]> s_lastWriterPc;  // a fault's t_faultPc - s_imageBase
         std::atomic<uint64_t> s_writerFrame{ 0 };

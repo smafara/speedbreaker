@@ -272,3 +272,16 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   out of reach here. The capture and replay design (D7) stands as the verification plan.
   `NFSMW_HASH_STREAM` stays as a diagnostic (and will be reused to check that a replay
   reproduces the captured stream exactly).
+- 2026-10-26: capture implemented (`gpu/trace.{h,cpp}`, hooked in `Worker` before each batch;
+  `kernel/write_watch.cpp` tracks last writers when NFSMW_CAPTURE is set). Env:
+  `NFSMW_CAPTURE=<file>`, `NFSMW_CAPTURE_START=<swap>` (default 600),
+  `NFSMW_CAPTURE_FRAMES=<n>` (default 5). Format in `gpu/trace.h`. First capture (intro movie
+  scene, swaps 600-606, hands off): 89,180 non-zero pages (348 MB) snapshot, 13 batches,
+  285 CPU-delta pages in total, 350 MB file, capture took 0.6 s; the game was not slowed
+  noticeably. Captures live in `build/captures/` (git-ignored; they contain game memory,
+  never commit or share them). The CPU delta leaves out pages whose last writer is the GPU
+  (`kResolve` from resolves, `kGpuStore` from the command processor's own stores). Known
+  weakness: "last writer" is sticky, so a CPU write to a page the GPU wrote earlier, if it
+  never faulted, would be missed. The replay's stream-hash check will not catch this; a
+  visual check of replayed frames will. Not yet verified: that a replay reproduces the
+  frames. Next: replay (a mode of the main binary, `NFSMW_REPLAY=<file>`).
