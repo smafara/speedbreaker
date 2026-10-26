@@ -9,7 +9,7 @@
 
 namespace gpu::rhi::metal
 {
-    // The system's default Metal device, headless (nothing here presents yet).
+    // The system's default Metal device (a window is metal_native.h's CreateSurface).
     // nullptr when there is none.
     std::unique_ptr<Device> CreateDevice();
 }

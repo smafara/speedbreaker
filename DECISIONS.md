@@ -580,3 +580,21 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   ratio 1.0000). New backend-neutral `Occlusion` test (visible draw counts, depth-rejected draw
   counts zero, reset clears) passes on Metal and Vulkan. Contract note: a query that was never
   begun reads as not ready on Vulkan, so tests read only queries they ended.
+- 2026-10-26: Metal swapchain (M2 part 1). The window's layer comes from SDL (window made with
+  SDL_WINDOW_METAL, `SDL_Metal_CreateView` + `SDL_Metal_GetLayer`), handed over through
+  `gpu/rhi/metal/metal_native.h` `CreateSurface(device, layer)`; no AppKit glue of ours. Acquire
+  = `nextDrawable` (timeout off: blocks), image = the drawable's texture; a drawable of another
+  size than the swapchain's is OutOfDate (SDL resizes the layer's drawableSize; the policy then
+  rebuilds). Submit is the plain commit; Present is a command buffer of its own on the queue that
+  does `presentDrawable` / `presentDrawableAtTime`, so it follows the drawing list. The presented
+  handler feeds onShown/onReport (display's own time, `timed` always true; dropped = onScreen 0,
+  no onShown), delivered in present order and one at a time (handlers can run out of order on
+  different threads, so they are sequenced). Clock trap: Metal times are mach_absolute_time
+  (uptime), `std::chrono::steady_clock` on macOS is mach_continuous_time (counts sleep): the
+  swapchain converts with the difference of CLOCK_MONOTONIC_RAW and CLOCK_UPTIME_RAW. Caps
+  presentTiming and scheduledPresent are true. New `rhi_metal_swapchain_test` (opens a window for
+  ~2 s; skipped without a display): 120 frames, first 60 display-synced (gap 6.25 ms median, i.e.
+  the display ticks at 160 Hz units on this panel), last 60 asked for at 20 ms intervals: none
+  early, none dropped, spacing 19.8 ms. Frames presented before the window is up may go unseen
+  (dropped), so the test ignores the first five. Not done: colour space (layer default; Vulkan
+  path sets sRGB through MoltenVK, to compare), EDR, display-link refresh rate.

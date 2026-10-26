@@ -380,4 +380,8 @@ endif()
 if(SB_METAL)
     sb_test(rhi_metal_test SOURCES ${RT}/gpu/rhi/metal/metal_device.cpp ${RT}/gpu/rhi/metal/metal_cpp.cpp)
     target_link_libraries(rhi_metal_test PRIVATE SbMetalBackend)
+    # The swapchain on a real window (SDL3, as key_names_test above).
+    sb_test(rhi_metal_swapchain_test SOURCES ${RT}/gpu/rhi/metal/metal_device.cpp ${RT}/gpu/rhi/metal/metal_cpp.cpp)
+    target_link_libraries(rhi_metal_swapchain_test PRIVATE SbMetalBackend SDL3::SDL3)
+    set_target_properties(rhi_metal_swapchain_test PROPERTIES SKIP_BUILD_RPATH OFF)
 endif()
