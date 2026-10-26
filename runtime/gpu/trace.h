@@ -16,6 +16,7 @@
 // replay computes those itself, which is what it is there to test.
 #pragma once
 #include <cstdint>
+#include <vector>
 
 namespace gpu::trace
 {
@@ -40,4 +41,27 @@ namespace gpu::trace
     // the configured frame, records the batch while one is running, and ends
     // it after the configured frames.
     void BeforeBatch(const CpState& state, uint32_t writeIndex, uint64_t frame);
+
+    // Replay: NFSMW_REPLAY=<file> runs the renderer from a capture, without
+    // the game. The command processor thread loads it (ReplayLoad), then in
+    // place of the game's write pointer takes one batch after another
+    // (ReplayNext).
+    bool ReplayRequested();
+    const char* ReplayPath();
+
+    struct ReplayState
+    {
+        std::vector<uint32_t> regs;
+        uint32_t primary = 0, primarySize = 0, readIndex = 0, writeback = 0;
+        uint32_t startFrame = 0;  // the swap count the capture began at
+        uint64_t binMask = 0, binSelect = 0;
+    };
+    // Reads the header and loads the snapshot into guest physical memory.
+    bool ReplayLoad(const char* path, uint8_t* physical, ReplayState& state);
+
+    constexpr uint32_t kReplayEnd = ~0u;
+    // Command processor thread, with the previous batch consumed: waits for
+    // its work to finish, applies the next batch's CPU changes to guest
+    // memory and returns its write pointer (dwords), or kReplayEnd.
+    uint32_t ReplayNext(uint8_t* physical);
 }

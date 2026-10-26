@@ -17,6 +17,8 @@
 #include "cpu/guest_time.h"
 #include <video/presenter.h>
 #include <gpu/renderer.h>
+#include <gpu/command_processor.h>
+#include <gpu/trace.h>
 #include <game/hfr.h>
 #include <hid/input.h>
 #include <cpu/guest_thread.h>
@@ -592,7 +594,15 @@ int main(int argc, char** argv)
         params.stackSize = std::max<uint32_t>(*stack, DEFAULT_GUEST_STACK);
 
     platform::Thread thread{};
-    platform::StartThread(&thread, HOST_STACK, GuestMain, &params);
+    // NFSMW_REPLAY=<capture>: the command processor runs a capture of a
+    // game's GPU input in place of the game (gpu/trace.h).
+    if (gpu::trace::ReplayRequested())
+    {
+        if (!gpu::StartReplay(gpu::trace::ReplayPath()))
+            return 1;
+    }
+    else
+        platform::StartThread(&thread, HOST_STACK, GuestMain, &params);
     report::StartWatchdog();  // hang reports (and the NFSMW_TEST_* switches)
 
 #ifdef __linux__

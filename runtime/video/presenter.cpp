@@ -3257,10 +3257,15 @@ void main()
                 pixels[size_t(y) * width + x] = bgra;
             }
         }
-        // NFSMW_DUMP_FRAMES=<dir>: save every 60th front buffer as a PPM.
+        // NFSMW_DUMP_FRAMES=<dir>: save every 60th front buffer as a PPM
+        // (every NFSMW_DUMP_EVERY-th).
         static const char* dumpDir = std::getenv("NFSMW_DUMP_FRAMES");
+        static const uint32_t dumpEvery = [] {
+            const char* v = std::getenv("NFSMW_DUMP_EVERY");
+            return v && atoi(v) > 0 ? uint32_t(atoi(v)) : 60u;
+        }();
         static uint32_t frameNumber = 0;
-        if (dumpDir && (frameNumber++ % 60) == 0)
+        if (dumpDir && (frameNumber++ % dumpEvery) == 0)
         {
             char path[512];
             snprintf(path, sizeof(path), "%s/frame_%05u.ppm", dumpDir, frameNumber - 1);

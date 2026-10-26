@@ -199,4 +199,114 @@ namespace gpu::trace
         PutDelta(state);
         s_batches++;
     }
+
+    // Replay
+
+    namespace
+    {
+        const char* const s_replayPath = std::getenv("NFSMW_REPLAY");
+        FILE* s_replay = nullptr;
+        uint64_t s_replayBatches = 0;
+        std::chrono::steady_clock::time_point s_replayBegan;
+
+        bool Get(void* data, size_t size)
+        {
+            return fread(data, 1, size, s_replay) == size;
+        }
+
+        bool GetU32(uint32_t& v)
+        {
+            return Get(&v, 4);
+        }
+
+        bool ReadPages(uint8_t* physical, uint32_t count)
+        {
+            std::vector<uint8_t> page(kPage);
+            for (uint32_t n = 0; n < count; n++)
+            {
+                uint32_t index;
+                if (!GetU32(index) || index >= kPages || !Get(page.data(), kPage))
+                    return false;
+                uint8_t* dst = physical + size_t(index) * kPage;
+                writewatch::BeforeHostWrite(dst, kPage);
+                memcpy(dst, page.data(), kPage);
+            }
+            return true;
+        }
+    }
+
+    bool ReplayRequested()
+    {
+        return s_replayPath != nullptr && *s_replayPath;
+    }
+
+    const char* ReplayPath()
+    {
+        return s_replayPath;
+    }
+
+    bool ReplayLoad(const char* path, uint8_t* physical, ReplayState& state)
+    {
+        s_replay = fopen(path, "rb");
+        if (!s_replay)
+        {
+            fprintf(stderr, "[replay] can't read %s\n", path);
+            return false;
+        }
+        char magic[8];
+        uint32_t regCount = 0, snapshotPages = 0;
+        bool ok = Get(magic, 8) && memcmp(magic, "SBGTRC01", 8) == 0 && GetU32(regCount) && regCount <= 0x10000 &&
+            GetU32(state.primary) && GetU32(state.primarySize) && GetU32(state.readIndex) && GetU32(state.writeback) &&
+            GetU32(state.startFrame) && Get(&state.binMask, 8) && Get(&state.binSelect, 8);
+        if (ok)
+        {
+            state.regs.resize(regCount);
+            ok = Get(state.regs.data(), size_t(regCount) * 4) && GetU32(snapshotPages);
+        }
+        s_replayBegan = std::chrono::steady_clock::now();
+        if (ok)
+            ok = ReadPages(physical, snapshotPages);
+        if (!ok)
+        {
+            fprintf(stderr, "[replay] %s is not a usable capture\n", path);
+            fclose(s_replay);
+            s_replay = nullptr;
+            return false;
+        }
+        fprintf(stderr, "[replay] %s: from swap %u, %u pages of guest memory, ring 0x%08X (%u KB), read index %u (%.1f s)\n", path,
+            state.startFrame, snapshotPages, state.primary, state.primarySize / 1024, state.readIndex,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - s_replayBegan).count());
+        return true;
+    }
+
+    namespace
+    {
+        // The next batch record: its CPU changes go into guest memory, its
+        // write pointer to `writeIndex`. False at the end of the capture.
+        bool ReadRecord(uint8_t* physical, uint32_t& writeIndex)
+        {
+            // The previous batch's work done, so that what the next one reads from
+            // memory is what its resolves left.
+            renderer::Flush();
+            uint32_t tag = 0, frame = 0, pages = 0;
+            if (GetU32(tag) && tag == 1 && GetU32(writeIndex) && GetU32(frame) && GetU32(pages) && ReadPages(physical, pages))
+                return true;
+            if (tag != 2)
+                fprintf(stderr, "[replay] the capture ends early (batch %llu)\n", (unsigned long long)s_replayBatches);
+            fprintf(stderr, "[replay] done: %llu batches in %.1f s\n", (unsigned long long)s_replayBatches,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - s_replayBegan).count());
+            fclose(s_replay);
+            s_replay = nullptr;
+            return false;
+        }
+    }
+
+    uint32_t ReplayNext(uint8_t* physical)
+    {
+        uint32_t writeIndex;
+        if (!s_replay || !ReadRecord(physical, writeIndex))
+            return kReplayEnd;
+        s_replayBatches++;
+        return writeIndex;
+    }
 }

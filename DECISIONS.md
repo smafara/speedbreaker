@@ -285,3 +285,28 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   never faulted, would be missed. The replay's stream-hash check will not catch this; a
   visual check of replayed frames will. Not yet verified: that a replay reproduces the
   frames. Next: replay (a mode of the main binary, `NFSMW_REPLAY=<file>`).
+- 2026-10-26: replay implemented (`NFSMW_REPLAY=<capture>`, `NFSMW_REPLAY_EXIT=1` to quit at the
+  end). `main.cpp` starts `gpu::StartReplay` instead of the guest thread (window, presenter and
+  renderer start as usual; no guest code runs, no vblank thread). `gpu::trace::ReplayLoad`
+  puts the snapshot into guest memory (through `writewatch::BeforeHostWrite`), `StartReplay`
+  restores the registers (and their MMIO mirror), ring, bin mask and swap count, and the
+  command processor's `Worker` takes its write pointer from `trace::ReplayNext` (flush the GPU,
+  apply the next batch's CPU delta, return its wptr) instead of the MMIO page. The interrupt
+  callback stays 0, so interrupts are no-ops.
+  CPU stand-in: a `WAIT_REG_MEM` still unsatisfied once the GPU is idle waits on a value the
+  game's CPU would have set (D3D's fence handshake on `0x06449000/4`, cleared by the CPU
+  mid-batch). The capture holds CPU changes only at batch boundaries, so those handshakes
+  leave no trace (reading the next batches' deltas ahead did not work: there are fewer records
+  than handshakes). The replay writes a value that satisfies the wait (`ref`, else neighbours)
+  and logs the first few as `[replay] stood in for the CPU`.
+  RESULT on `intro.sbtrace` (swaps 600-606; correction: the scene is the profile-load dialog
+  "Loading NAME. Please don't turn off your console", not a movie): 13 batches replay in
+  0.1 s; with `NFSMW_HASH_STREAM=1` the stream hash of swaps 602-606 equals the captured run's
+  exactly (601 differs: the capture starts mid-frame, 1343 vs 1400 packets, as expected);
+  `NFSMW_DUMP_FRAMES=<dir> NFSMW_DUMP_EVERY=1` (new stride knob, default 60) dumps every swap,
+  and two separate replays give bit-identical PPMs (6 of 6). The image is right (dialog, text,
+  textures). So capture + replay works for this 2D UI scene on the Vulkan backend.
+  Not covered yet: a 3D in-world scene (needs a capture while driving), EDRAM carried across
+  the capture start (assumes clears), the scene's limited GPU variety. Next: capture
+  in-world, then the pass/fail tool (compare dumps against a stored baseline with a
+  tolerance, for cross-backend use), then the RHI refactor.

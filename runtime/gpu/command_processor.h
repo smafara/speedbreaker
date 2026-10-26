@@ -22,6 +22,10 @@ namespace gpu
     void EnableReadPointerWriteBack(uint32_t guestAddress, uint32_t blockSizeLog2);
     void SetInterruptCallback(uint32_t callback, uint32_t userData);
 
+    // NFSMW_REPLAY (gpu/trace.h): the command processor runs a capture instead
+    // of the game's ring. False if it can't be loaded.
+    bool StartReplay(const char* path);
+
     // Frames completed (XE_SWAP packets executed).
     uint64_t FrameCount();
 

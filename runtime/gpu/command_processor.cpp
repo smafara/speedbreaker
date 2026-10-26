@@ -23,6 +23,7 @@
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <report/report.h>
+#include <csignal>
 #include <unordered_set>
 
 namespace gpu
@@ -63,6 +64,7 @@ namespace gpu
         // of 0.94 instead of 1.28.
         alignas(4096) uint32_t s_regs[REGISTER_COUNT];
 
+        bool s_replaying = false;                    // NFSMW_REPLAY: a capture's batches, not the game's ring
         std::atomic<uint32_t> s_primaryBuffer{ 0 };  // physical
         uint32_t s_primarySize = 0;                  // bytes
         uint32_t s_readIndex = 0;                    // dwords
@@ -780,6 +782,7 @@ namespace gpu
                 bool memory = (info & 0x10) != 0;
                 std::optional<renderer::CpWaitTimer> waitTimer;  // from the first poll after the submit
                 auto waitStart = std::chrono::steady_clock::now();
+                bool replayFlushed = false;
                 // Suspensions so far: one that begins during the wait, even
                 // one spent parked in the GPU gate inside Submit() (it closes
                 // after the count moves), restarts the wait's clock.
@@ -852,6 +855,34 @@ namespace gpu
                         reported = false;
                         s_waitSince.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             waitStart.time_since_epoch()).count(), std::memory_order_release);
+                        continue;
+                    }
+                    if (s_replaying)
+                    {
+                        // What it waits for comes from the GPU (its store, once the
+                        // work before is done) or from the game's CPU, which the
+                        // capture holds only at batch boundaries (a handshake
+                        // within a batch leaves no trace). Once the GPU is idle the
+                        // CPU's part is stood in for: the value it waits for.
+                        if (!replayFlushed)
+                        {
+                            renderer::Flush();
+                            replayFlushed = true;
+                            continue;
+                        }
+                        for (uint32_t candidate : { ref, ref + 1, ref - 1, 0u, ~0u })
+                            if (compare(info, candidate & mask, ref))
+                            {
+                                if (memory)
+                                    StoreSwapped(poll, candidate);
+                                else
+                                    s_regs[poll % REGISTER_COUNT] = candidate;
+                                break;
+                            }
+                        static uint32_t forced = 0;
+                        if (forced++ < 8)
+                            fprintf(stderr, "[replay] stood in for the CPU: %s %08X func %u ref %08X mask %08X was %08X\n",
+                                memory ? "memory" : "register", poll, info & 7, ref, mask, value);
                         continue;
                     }
                     if (!reported && std::chrono::steady_clock::now() - waitStart > std::chrono::seconds(1))
@@ -1156,6 +1187,28 @@ namespace gpu
             }
         }
 
+        // Replay: the write pointer the capture's batches give in place of
+        // the game's. A batch is consumed when the read index reaches it.
+        bool s_replayDone = false;
+        uint32_t s_replayWrite = 0;
+
+        uint32_t ReplayWriteIndex()
+        {
+            if (!s_replayDone && s_readIndex == s_replayWrite)
+            {
+                uint32_t next = trace::ReplayNext(Physical(0));
+                if (next == trace::kReplayEnd)
+                {
+                    s_replayDone = true;
+                    if (const char* e = std::getenv("NFSMW_REPLAY_EXIT"); e && e[0] == '1')
+                        std::raise(SIGTERM);  // as the window's close button
+                }
+                else
+                    s_replayWrite = next;
+            }
+            return s_replayWrite;
+        }
+
         void Worker()
         {
 #ifdef __APPLE__
@@ -1178,7 +1231,7 @@ namespace gpu
             while (true)
             {
                 uint32_t primary = s_primaryBuffer;
-                uint32_t writeIndex = *MmioRegister(REG_CP_RB_WPTR);
+                uint32_t writeIndex = s_replaying ? ReplayWriteIndex() : uint32_t(*MmioRegister(REG_CP_RB_WPTR));
                 if (primary == 0 || writeIndex == s_readIndex || writeIndex * 4 >= s_primarySize)
                 {
                     // Kicks come in bursts and the game often waits on their
@@ -1357,6 +1410,30 @@ namespace gpu
         s_primaryBuffer = guestAddress & 0x1FFFFFFF;
         fprintf(stderr, "[gpu] ring buffer %08X, %u bytes\n", guestAddress, s_primarySize);
         StartOnce();
+    }
+
+    bool StartReplay(const char* path)
+    {
+        trace::ReplayState state;
+        if (!trace::ReplayLoad(path, Physical(0), state))
+            return false;
+        for (uint32_t i = 0; i < std::min<uint32_t>(uint32_t(state.regs.size()), REGISTER_COUNT); i++)
+        {
+            s_regs[i] = state.regs[i];
+            *MmioRegister(i) = state.regs[i];
+        }
+        renderer::g_constantsDirty.store(true, std::memory_order_relaxed);
+        s_binMask = state.binMask;
+        s_binSelect = state.binSelect;
+        s_primarySize = state.primarySize;
+        s_readIndex = s_replayWrite = state.readIndex;
+        s_readWriteback = state.writeback;
+        s_frames = state.startFrame;
+        s_primaryBuffer = state.primary;
+        s_replaying = true;
+        s_started = true;  // no vblank thread: the capture has its swaps
+        std::thread(Worker).detach();
+        return true;
     }
 
     void EnableReadPointerWriteBack(uint32_t guestAddress, uint32_t blockSizeLog2)
