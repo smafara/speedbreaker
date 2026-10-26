@@ -3,6 +3,7 @@
 // vulkan/vulkan_pipeline_cache.cc.
 #include <stdafx.h>
 #include "renderer.h"
+#include "trace.h"
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
 #include <cpu/guest_time.h>
@@ -2974,7 +2975,8 @@ namespace gpu::renderer
         // anything the game renders once, is drawn exactly.
         // NFSMW_PIPELINE_THREADS=<n> (default: a third of the cores, at most
         // 4; 0 compiles on the command processor). Settings > Advanced >
-        // Asynchronous Shaders off (NFSMW_ASYNC_PIPELINES=0): always wait.
+        // Asynchronous Shaders off (NFSMW_ASYNC_PIPELINES=0): always wait, as
+        // does a replay (NFSMW_REPLAY: a skipped draw would change the image).
         // NFSMW_PIPELINE_LOG=1 logs each pipeline's timing.
         struct PendingPipeline
         {
@@ -3097,7 +3099,7 @@ namespace gpu::renderer
                 // Waits share one budget a frame (cache hits make it); once it
                 // is spent, draws just check. A per-draw wait made a pipeline
                 // used by 13 draws cost 47 ms a frame while it compiled.
-                if (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil)
+                if (!settings::GetBool(settings::Id::AsyncShaders) || s_frame < s_waitPipelinesUntil || trace::ReplayRequested())
                     job->cv.wait(lock, [&] { return job->done; });
                 else
                 {

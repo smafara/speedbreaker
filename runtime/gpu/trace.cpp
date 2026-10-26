@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <unistd.h>
 
 namespace gpu::trace
 {
@@ -174,7 +175,9 @@ namespace gpu::trace
         static const uint64_t frames = EnvNumber("NFSMW_CAPTURE_FRAMES", 5);
         if (s_phase == Phase::Waiting)
         {
-            if (frame < start)
+            // NFSMW_CAPTURE_TRIGGER=<file>: from when that file exists, instead of a swap count.
+            static const char* const trigger = std::getenv("NFSMW_CAPTURE_TRIGGER");
+            if (trigger && *trigger ? access(trigger, F_OK) != 0 : frame < start)
                 return;
             Begin(state, frame);
             if (s_phase != Phase::Capturing)

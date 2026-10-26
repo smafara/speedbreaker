@@ -310,3 +310,16 @@ rate, present_id / present_wait, `GOOGLE_display_timing`, `EXT_memory_budget`.
   the capture start (assumes clears), the scene's limited GPU variety. Next: capture
   in-world, then the pass/fail tool (compare dumps against a stored baseline with a
   tolerance, for cross-backend use), then the RHI refactor.
+- 2026-10-26: in-world capture (`build/captures/world.sbtrace`, swaps 1675-1681, 395 MB, driving
+  scene; started with the new `NFSMW_CAPTURE_TRIGGER=<file>`: the capture begins when the file
+  exists, so a person can say "now"). Replay: stream hashes of swaps 1677-1681 equal the
+  captured run's (1676 is the partial first frame). FINDING: the first two replays of it gave
+  different images (A: HUD only, no 3D world; B: world but no car) because the renderer's
+  asynchronous pipeline compilation skips draws whose pipeline is not ready
+  (`[pipelines] frame N: 2282 draws skipped, 66 compiling`), so the image depended on compile
+  timing. A replay must wait for pipelines in full: the renderer now does so whenever
+  `NFSMW_REPLAY` is set (same as Asynchronous Shaders off). After that: 0 skipped draws and two
+  replays give bit-identical frames (6 of 6); the last frame is the complete scene (car, street,
+  houses, HUD). Lesson for the Metal backend: anything that makes output depend on timing
+  (async compiles, frame-budgeted waits) must be switchable off for comparison runs.
+  Replay of this scene takes ~6 s (the intro one 0.1 s), dominated by pipeline compiles.

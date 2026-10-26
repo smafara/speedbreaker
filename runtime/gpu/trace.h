@@ -5,7 +5,8 @@
 // without the game (replay), which the game itself can't do (its timing moves
 // every run). NFSMW_CAPTURE=<file> turns it on; NFSMW_CAPTURE_START=<swap>
 // (default 600) is the first swap count to capture from and
-// NFSMW_CAPTURE_FRAMES=<n> (default 5) the frames after the partial one that
+// NFSMW_CAPTURE_TRIGGER=<file> (instead of the swap count: from when the file
+// exists) and NFSMW_CAPTURE_FRAMES=<n> (default 5) the frames after the partial one that
 // starts it. The game runs much slower while capturing.
 //
 // File (host byte order): "SBGTRC01", the command processor's state at the
