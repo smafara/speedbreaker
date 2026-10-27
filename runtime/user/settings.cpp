@@ -116,7 +116,7 @@ namespace settings
 
         // Smooth Motion's description: the screens it draws for (video::HfrOffered).
 #if defined(__APPLE__)
-        constexpr const char* kSmoothMotionDescription = "Up to 120 fps on a 120 Hz screen (ProMotion): the game still runs at 60 steps a second, and a picture between each two is drawn from the poses either side. A little more delay and power. Heavy scenes drop to an even 60 for a while; off at 30 fps.";
+        constexpr const char* kSmoothMotionDescription = "Up to 120 fps on a 120 Hz screen (ProMotion), or on a monitor with adaptive sync that reaches 120 Hz: the game still runs at 60 steps a second, and a picture between each two is drawn from the poses either side. A little more delay and power. Heavy scenes drop to an even 60 for a while; off at 30 fps.";
 #else
         constexpr const char* kSmoothMotionDescription = "Up to 120 fps on a 120 Hz screen, or 90 on a 90 Hz one (not on a Steam Deck): the game still runs at 60 steps a second, and a picture between each two is drawn from the poses either side. A little more delay and power. Heavy scenes drop to an even 60 for a while; off at 30 fps and with variable refresh.";
 #endif

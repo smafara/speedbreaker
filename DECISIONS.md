@@ -818,3 +818,19 @@ replay on Metal).
   MoltenVK saves its conversions. Consequence: direct MSL emission would save ~270 ms once plus
   ~250 ms a run, the second of which a disk cache of the generated MSL (keyed by the SPIR-V, the
   layout and the SPIRV-Cross version) gets with far less code. Emitter not worth it for speed.
+- 2026-10-26 — **Smooth Motion on adaptive-sync monitors** (branch `feature/metal-vrr-smooth-motion`).
+  The README and `HfrOffered` took only a mode of 117-123 Hz, so a 48-160 Hz adaptive-sync
+  monitor (mode 160) ran at 60. `PresentSchedule::SetDisplay(hz, minHz, maxHz)` now also counts a
+  variable-refresh screen that reaches 120 Hz and goes down to 60 or less (NSScreen's refresh
+  intervals via `platform::macos::DisplayRefreshFixed`; fixed 144 Hz is not). First tries
+  (`NFSMW_HFR=1`, then the gate) showed 120 fps in menus and 60 in the game: the watchdog tripped
+  ("shown over 2 ms early" for 60 of 120 frames). The `.actual.csv` of `NFSMW_VBLANK_LOG` showed
+  presents 2.7 ms early to 5.5 ms late, 33-45% of them over 2 ms early even in the menu: the
+  monitor keeps times to its refresh grid (1/160 s), where ProMotion is never more than 1.2 ms
+  early. The early tolerance is now max(2 ms, 1/maxHz) on such a screen. Result on the M5 Max
+  with a 48-160 Hz monitor, Metal, `NFSMW_HFR=1`: 120 fps through menus and a race (224 of 286
+  windows at 120; the rest are loading screens), 600 of 600 frames with an in-between picture,
+  0 dropped, worst frame 16.8 ms, and the on-screen gaps 8.33 ms (5% to 99%: 8.33-8.34 ms).
+  Smooth Motion stays off by default. Not tested: other monitors, Vulkan/MoltenVK on this
+  display, macOS on a monitor whose adaptive sync is off (the fixed-grid case: min = max, so
+  not offered).

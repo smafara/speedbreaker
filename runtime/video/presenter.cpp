@@ -476,7 +476,7 @@ namespace video
         int64_t s_hfrLastDesired = 0;
         constexpr int64_t kHfrMinGapNs = 4'000'000;  // between two pictures asked for (order kept, never at once)
         float s_displayHz = 0.0f;  // the display mode's, for the log (main thread)
-        std::atomic<float> s_offeredHz{ 0.0f };  // the same, for HfrOffered (any thread)
+        std::atomic<bool> s_offeredFast{ false };  // the schedule's FastDisplay, for HfrOffered (any thread)
 #endif
         // NFSMW_VBLANK_LOG's <file>.actual.csv: the driver's own on-screen
         // time per present (Metal's presentedTime, mach_absolute_time ns, 0:
@@ -500,7 +500,7 @@ namespace video
                 fprintf(stderr, "[vblank] new frames shown when ready from now on: the time asked for wasn't kept for %u of the last %u "
                     "frames shown at a time (the driver's reports, VK_GOOGLE_display_timing: %llu shown over %lld ms early, %llu never "
                     "shown)\n", s_schedule.BadInWindow(), s_schedule.ReportedInWindow(), (unsigned long long)s_schedule.Early(),
-                    (long long)(PresentSchedule::kEarlyNs / 1'000'000), (unsigned long long)s_schedule.NotShown());
+                    (long long)(s_schedule.EarlyNs() / 1'000'000), (unsigned long long)s_schedule.NotShown());
         }
 
         // The backend's thread: the driver's report on a present shown at a
@@ -1567,6 +1567,16 @@ namespace video
         // and the display's own timing); `offered`: the backend can show a
         // present at a time (Vulkan: VK_GOOGLE_display_timing, to be enabled
         // with the device; Metal: presentDrawable:atTime:).
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        // The window's screen for the schedule: its mode's rate and its refresh range.
+        void SetScheduleDisplay(PresentSchedule& schedule, double hz)
+        {
+            double minHz = 0.0, maxHz = 0.0;
+            platform::macos::DisplayRefreshFixed(s_window, &minHz, &maxHz);
+            schedule.SetDisplay(hz, minHz, maxHz);
+        }
+#endif
+
         void ConfigureShowAtTime(bool offered)
         {
 #if defined(__APPLE__) && !TARGET_OS_IOS
@@ -1584,7 +1594,7 @@ namespace video
         // for again should the window move to a 120 Hz display later).
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
         PresentSchedule launch;
-        launch.SetDisplayHz(mode ? mode->refresh_rate : 0.0f);
+        SetScheduleDisplay(launch, mode ? mode->refresh_rate : 0.0f);
         const bool mayShowAtTime = s_schedule.GetMode() == PresentSchedule::Mode::On ||
             (s_schedule.GetMode() == PresentSchedule::Mode::Auto && launch.FastDisplay());
         s_displayTiming = offered && s_presentTiming && (mayShowAtTime || std::getenv("NFSMW_VBLANK_LOG"));
@@ -2112,10 +2122,10 @@ namespace video
             const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window));
 #if defined(__APPLE__) && !TARGET_OS_IOS
             s_displayHz = mode ? mode->refresh_rate : 0.0f;
-            s_offeredHz.store(s_displayHz, std::memory_order_relaxed);
             {
                 std::lock_guard lock(s_scheduleMutex);
-                s_schedule.SetDisplayHz(s_displayHz);
+                SetScheduleDisplay(s_schedule, s_displayHz);
+                s_offeredFast.store(s_schedule.FastDisplay(), std::memory_order_relaxed);
             }
 #endif
             UpdateRefreshMultiple(mode);
@@ -3606,12 +3616,12 @@ namespace video
     bool HfrOffered()
     {
 #if defined(__APPLE__) && !TARGET_OS_IOS
-        // A 120 Hz screen (present_schedule.h's FastDisplay: ProMotion, or a
-        // 120 Hz monitor): a Mac draws in-between pictures nowhere else yet
-        // (HfrPicturesPerStep; no refresh grid on a Mac: a 144 Hz monitor
-        // shows the game at 60).
-        const float hz = s_offeredHz.load(std::memory_order_relaxed);
-        return s_displayTiming && hz >= PresentSchedule::kMinFastHz && hz <= PresentSchedule::kMaxFastHz;
+        // A 120 Hz screen or a variable-refresh one that reaches 120 Hz
+        // (present_schedule.h's FastDisplay: ProMotion, a 120 Hz monitor, or
+        // adaptive sync): a Mac draws in-between pictures nowhere else yet
+        // (HfrPicturesPerStep; no refresh grid on a Mac: a fixed 144 Hz
+        // monitor shows the game at 60).
+        return s_displayTiming && s_offeredFast.load(std::memory_order_relaxed);
 #elif defined(__linux__) && !defined(__ANDROID__)
         // SteamOS and Linux: a mode the presenter shows in-between pictures
         // on evenly (refresh_multiple.h's SmoothMotionRate: 120 Hz, the guest

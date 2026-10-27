@@ -42,6 +42,7 @@
 // run, frames reported early (above); the freeze outlasted the trip, so the
 // trip must come before it.
 #pragma once
+#include <algorithm>
 #include <cstdint>
 
 namespace video
@@ -56,6 +57,7 @@ namespace video
             Off,   // NFSMW_PRESENT_AT=0
         };
         static constexpr double kMinFastHz = 117.0, kMaxFastHz = 123.0;
+        static constexpr double kMaxVariableFloorHz = 60.0;
         static constexpr uint32_t kWindow = 120;      // 2 s of frames
         static constexpr uint32_t kBadOfWindow = 60;
         static constexpr int64_t kEarlyNs = 2'000'000;
@@ -66,7 +68,24 @@ namespace video
 
         Mode GetMode() const { return m_mode; }
         // The display's mode, at each swapchain and display change (0: unknown).
-        void SetDisplayHz(double hz) { m_fastDisplay = hz >= kMinFastHz && hz <= kMaxFastHz; }
+        void SetDisplayHz(double hz) { SetDisplay(hz, 0.0, 0.0); }
+        // The same, with the screen's refresh range (macOS: NSScreen's refresh
+        // intervals; 0: unknown). A variable-refresh screen that reaches 120 Hz and
+        // waits 1/60 s between two pictures is as fast as a 120 Hz one: ProMotion,
+        // or a monitor with adaptive sync (48-160 Hz) when macOS applies it. A
+        // fixed 144 Hz one is not (min = max).
+        void SetDisplay(double hz, double minHz, double maxHz)
+        {
+            const bool variable = minHz > 0.0 && minHz <= kMaxVariableFloorHz && maxHz >= kMinFastHz;
+            m_fastDisplay = (hz >= kMinFastHz && hz <= kMaxFastHz) || variable;
+            // A monitor's adaptive sync (48-160 Hz) was measured showing frames
+            // 2.7 ms early to 5.5 ms late: on its refresh grid (1/160 s), where
+            // ProMotion's panel is never more than 1.2 ms early.
+            m_earlyNs = variable ? std::max(kEarlyNs, int64_t(1e9 / maxHz)) : kEarlyNs;
+        }
+        // How early a frame may be shown before it counts as one the time asked
+        // for wasn't kept for.
+        int64_t EarlyNs() const { return m_earlyNs; }
         bool FastDisplay() const { return m_fastDisplay; }
 
         // A new frame, just before its present: show it at its vblank's
@@ -99,8 +118,8 @@ namespace video
             m_unreported = 0;
             if (m_tripped)
                 return false;
-            const bool bad = !shown || lateNs < -kEarlyNs || lateNs > kLateNs;
-            m_early += shown && lateNs < -kEarlyNs;
+            const bool bad = !shown || lateNs < -m_earlyNs || lateNs > kLateNs;
+            m_early += shown && lateNs < -m_earlyNs;
             if (m_count == kWindow)
                 m_bad -= m_window[m_next];
             else
@@ -132,6 +151,7 @@ namespace video
     private:
         Mode m_mode;
         bool m_fastDisplay = false;
+        int64_t m_earlyNs = kEarlyNs;
         bool m_tripped = false;
         Reason m_reason = Reason::None;
         bool m_window[kWindow] = {};

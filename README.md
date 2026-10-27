@@ -68,8 +68,9 @@ and a settings menu you can open mid-race.
   own resolution: a Steam Deck renders 1280x800 at 1x, pixel for pixel.
 - **Up to 60 fps,** locked to your 60 Hz display. You can also pick a steady 30 at full game
   speed, or *Auto*, which drops to 30 only while a device is hot or can't hold 60. On a Mac with
-  a 120 Hz screen, and on a SteamOS or Linux PC with a 120 Hz or 90 Hz one, *Smooth Motion* draws
-  up to 120 fps (off by default; not on the Steam Deck).
+  a 120 Hz screen (or a monitor with adaptive sync that reaches 120 Hz), and on a SteamOS or Linux
+  PC with a 120 Hz or 90 Hz one, *Smooth Motion* draws up to 120 fps (off by default; not on the
+  Steam Deck).
 - **Two-player split screen** (Quick Race > Split Screen), with two controllers.
 - **USB steering wheels (experimental).** Tested with a Logitech G29 on a Mac, force feedback
   included; the steering feel is still being tuned.
@@ -144,7 +145,7 @@ should say OK. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
   **60 Hz** (or 120 Hz, 180 Hz or 240 Hz on SteamOS and Linux).
 - **Split screen:** two controllers.
 - **Smooth Motion** (up to 120 fps): a Mac with a 120 Hz screen (a ProMotion MacBook Pro or a
-  120 Hz monitor), or a SteamOS or Linux PC (such as a Steam Machine) with a 120 Hz or 90 Hz
+  120 Hz monitor) or a monitor whose adaptive sync (variable refresh) reaches 120 Hz, or a SteamOS or Linux PC (such as a Steam Machine) with a 120 Hz or 90 Hz
   screen. Not on the Steam Deck (it stays at a steady 60), nor yet on Windows, iPhone or iPad.
 - **Steering wheels (experimental):** a USB wheel on a Mac, SteamOS or Linux. The Logitech G29
   is the one tested (on a Mac). Force feedback works on a Mac with the G29 in its PS3 position,
@@ -450,7 +451,7 @@ switcher).
 | Fullscreen | On / Off | Off: a 1280x720 window you can resize. The game always starts as set here; on a Mac, the window's green button switches only until you quit, and the row then says NOW FULLSCREEN or NOW WINDOWED. Always on in SteamOS Game Mode. Not shown on iPhone and iPad, which are always full screen. |
 | V-Sync | On / Off | On. Off can tear, but shows frames sooner. |
 | Frame Rate | Auto / 60 fps / 30 fps | 60 fps on most devices. 30 fps keeps the game at full speed. Auto runs at 60, or at a steady 30 while the device is hot or can't hold 60. |
-| Smooth Motion | On / Off | Off. On a Mac with a 120 Hz screen: up to 120 fps; on a SteamOS or Linux PC, 120 fps at 120 Hz and 90 at 90 Hz (it drops to an even 60 whenever pictures can't be shown on time; not on the Steam Deck). The game still runs at 60 steps a second, as on the console, and draws one more picture between each two; the controls answer a few milliseconds later. Heavy scenes ease off, down to an even 60 for a while. Takes effect the next time the game starts. Shown only where it works. |
+| Smooth Motion | On / Off | Off. On a Mac with a 120 Hz screen, or an adaptive-sync monitor that reaches 120 Hz: up to 120 fps; on a SteamOS or Linux PC, 120 fps at 120 Hz and 90 at 90 Hz (it drops to an even 60 whenever pictures can't be shown on time; not on the Steam Deck). The game still runs at 60 steps a second, as on the console, and draws one more picture between each two; the controls answer a few milliseconds later. Heavy scenes ease off, down to an even 60 for a while. Takes effect the next time the game starts. Shown only where it works. |
 | Screen Resolution | Full / 75% | Full. iPhone and iPad only: 75% is slightly softer and saves graphics work. |
 | Aspect Ratio | Fill Screen / 16:9 | Fill Screen: wider screens get a wider view; 4:3, 3:2 and 16:10 screens (the Steam Deck, many Macs) a taller one. Since v0.1.9 the game renders the screen's own shape: a Steam Deck draws 1280x800 at 1x, a 1920x1200 screen 1920x1200 at 1.5x. 16:9 always shows the classic picture with bars. |
 | Brightness | -5 to +5 | 0, the picture as it is. Each step makes the shadows and mid-tones a little lighter or darker, like a TV's brightness; black and white stay put, and the menus never change. |

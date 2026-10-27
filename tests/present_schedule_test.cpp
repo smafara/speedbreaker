@@ -54,6 +54,26 @@ namespace
         CHECK(!s.Wanted(false), "moved to a 60 Hz monitor: when ready");
         s.SetDisplayHz(120.0);
         CHECK(s.Wanted(false), "and back: at a time");
+
+        // Variable refresh is told by its range: one that reaches 120 Hz and
+        // waits 1/60 s between pictures is as fast as a 120 Hz screen.
+        struct Range { const char* name; double hz, minHz, maxHz; bool fast; };
+        const Range ranges[] = {
+            { "adaptive sync 48-160 Hz, mode 160", 160.0, 48.0, 160.0, true },
+            { "ProMotion 24-120 Hz, mode 120", 120.0, 24.0, 120.0, true },
+            { "adaptive sync 48-144 Hz", 144.0, 48.0, 144.0, true },
+            { "adaptive sync 60-100 Hz (never 120)", 100.0, 60.0, 100.0, false },
+            { "adaptive sync 100-165 Hz (can't wait 1/60 s)", 165.0, 100.0, 165.0, false },
+            { "a fixed 144 Hz monitor", 144.0, 144.0, 144.0, false },
+            { "a fixed 60 Hz monitor", 60.0, 60.0, 60.0, false },
+            { "range unknown at 160 Hz", 160.0, 0.0, 0.0, false },
+        };
+        for (const Range& r : ranges)
+        {
+            PresentSchedule v;
+            v.SetDisplay(r.hz, r.minHz, r.maxHz);
+            CHECK(v.FastDisplay() == r.fast, "%s: %s", r.name, r.fast ? "a fast display" : "not a fast display");
+        }
     }
 
     void Watchdog()
@@ -120,6 +140,24 @@ namespace
             for (int i = 0; i < 46000; i++)
                 tripped |= s.Reported(true, (i % 5 == 0 ? 21 : i % 9) * kMs);
             CHECK(!tripped, "up to 21 ms late: no trip");
+        }
+        // An adaptive-sync monitor (48-160 Hz) as measured: shown 2.7 ms early to
+        // 5.5 ms late, on its refresh grid (a third to a half of them over 2 ms
+        // early): no trip; the same on a 120 Hz panel, which isn't that
+        // coarse: trips.
+        {
+            PresentSchedule monitor, panel;
+            monitor.SetDisplay(160.0, 48.0, 160.0);
+            panel.SetDisplayHz(120.0);
+            bool monitorTripped = false, panelTripped = false;
+            for (int i = 0; i < 46000; i++)
+            {
+                const int64_t lateNs = i % 2 ? 5'500'000 : -2'700'000;  // half of them 2.7 ms early
+                monitorTripped |= monitor.Reported(true, lateNs);
+                panelTripped |= panel.Reported(true, lateNs);
+            }
+            CHECK(!monitorTripped, "adaptive sync, 2.7 ms early to 5.5 late: no trip");
+            CHECK(panelTripped, "a 120 Hz panel that early: trips");
         }
         // ProMotion as measured: never more than 1.2 ms early (0 of 46,000).
         {
