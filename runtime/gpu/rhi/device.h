@@ -361,7 +361,9 @@ namespace gpu::rhi
         // Thread-safe. nullptr on failure.
         virtual std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) = 0;
         virtual std::unique_ptr<Pipeline> CreateComputePipeline(const ComputePipelineDesc& desc) = 0;
-        // The compiled-pipeline cache on disk (today's VkPipelineCache file).
+        // The compiled-pipeline cache on disk (today's VkPipelineCache file). What it holds is the
+        // backend's own, so each has its file name (in the cache folder): switching backends keeps both.
+        virtual const char* PipelineCacheFile() const = 0;
         virtual std::vector<uint8_t> SavePipelineCache() = 0;
         virtual void LoadPipelineCache(const void* data, size_t size) = 0;
 

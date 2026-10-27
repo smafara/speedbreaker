@@ -56,6 +56,35 @@ namespace gpu::rhi::metal
             return error && error->localizedDescription() ? error->localizedDescription()->utf8String() : "unknown error";
         }
 
+        // SPIRV-Cross takes ~3.8 ms a shader, and makes the same MSL every launch (MoltenVK keeps its
+        // conversions for that): the MSL of each shader as ToMsl made it, in the pipeline cache file.
+        // Keyed by everything the MSL depends on (the SPIR-V, the stage, the layout's slot numbering,
+        // the options, the SPIRV-Cross library), so a stale entry is never found, only left unused.
+        class MslCache
+        {
+        public:
+            struct Key
+            {
+                uint64_t a = 0, b = 0;
+                bool operator<(const Key& o) const { return a != o.a ? a < o.a : b < o.b; }
+            };
+            struct Code
+            {
+                std::string msl, entry;
+                uint32_t group[3] = {};  // (compute) the workgroup size
+            };
+            bool Find(const Key& key, Code& code) const;
+            void Add(const Key& key, Code code);
+            size_t Size() const;
+            std::vector<uint8_t> Save() const;
+            // Entries from a saved cache; data that isn't one (another version, cut short) adds none.
+            size_t Load(const void* data, size_t size);
+
+        private:
+            mutable std::mutex m_mutex;
+            std::map<Key, Code> m_entries;
+        };
+
         struct Context
         {
             Ptr<MTL::Device> device;
@@ -63,6 +92,7 @@ namespace gpu::rhi::metal
             std::string deviceName;
             Capabilities caps;
             Ptr<MTL::SamplerState> blitSamplers[2];  // nearest, linear: the scaled copies'
+            MslCache mslCache;
 
             MTL::SamplerState* BlitSampler(Filter f) const { return blitSamplers[f == Filter::Linear].get(); }
 
@@ -380,9 +410,9 @@ namespace gpu::rhi::metal
         // ---- shaders (metal_shaders.cpp) ---------------------------------------------
 
         // MSL for `code` (SPIR-V) in the binding layout's slot numbering; `entry` gets the entry point's
-        // name in it, `size` (compute) the workgroup size.
-        std::string ToMsl(const ShaderCode& code, spv::ExecutionModel model, const MetalBindingLayout& layout, std::string& entry,
-            MTL::Size* size, bool pointSize = false);
+        // name in it, `size` (compute) the workgroup size. From `cache` when it has it, else made and added.
+        std::string ToMsl(MslCache& cache, const ShaderCode& code, spv::ExecutionModel model, const MetalBindingLayout& layout,
+            std::string& entry, MTL::Size* size, bool pointSize = false);
         // A function of `msl` named `entry`, or an empty pointer (logged).
         Ptr<MTL::Function> MakeFunction(MTL::Device& device, const std::string& msl, const std::string& entry);
 

@@ -46,6 +46,10 @@ else()
         ${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-core.a
         "-framework Metal" "-framework Foundation" "-framework QuartzCore")
     target_compile_definitions(SbMetalBackend INTERFACE SB_METAL=1)
+    # The MSL kept in the pipeline cache file (rhi/metal/metal_shaders.cpp) is only as good as the
+    # SPIRV-Cross that made it: its library file's hash is part of every entry's key.
+    file(SHA256 ${SB_SPIRV_CROSS_ROOT}/lib/libspirv-cross-msl.a SB_SPIRV_CROSS_MSL_SHA256)
+    target_compile_definitions(SbMetalBackend INTERFACE SB_SPIRV_CROSS_ID="${SB_SPIRV_CROSS_MSL_SHA256}")
 endif()
 # The platform layer (platform/*.h): Windows' implementation in
 # platform/win32, everyone else's in platform/posix.

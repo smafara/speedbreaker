@@ -818,3 +818,21 @@ replay on Metal).
   MoltenVK saves its conversions. Consequence: direct MSL emission would save ~270 ms once plus
   ~250 ms a run, the second of which a disk cache of the generated MSL (keyed by the SPIR-V, the
   layout and the SPIRV-Cross version) gets with far less code. Emitter not worth it for speed.
+- 2026-10-26 — **Metal MSL cache** (on `feature/metal-backend-renderer`). After the safe-math
+  change a warm Metal run still paid ~247 ms for the world replay's 65 pipelines to Vulkan's 30:
+  SPIRV-Cross ran again every launch, where MoltenVK keeps its conversions. The Metal device now
+  keeps each shader's MSL (`impl::MslCache`) in the renderer's pipeline cache file, which is
+  `pipelines-metal.bin` for Metal (new `Device::PipelineCacheFile()`; Vulkan's stays
+  `pipelines.bin`, so switching the Renderer setting no longer overwrites the other's cache).
+  Key: 128 bits over the SPIR-V, stage, point size, the layout's slot numbering and push constant,
+  a `kTranslateVersion` for Translate's options, and the SHA-256 of `libspirv-cross-msl.a`
+  (CMake, `SB_SPIRV_CROSS_ID`), so a stale entry is never found. A file that isn't ours or is cut
+  short adds nothing. Measured (world replay, Metal, the macOS library cache warm for these
+  options): 65 pipelines in 20 ms with the MSL cache loaded (was 247 ms); the file is 1.4 MB for
+  88 shaders; frames still bit-identical to Metal's baselines and within 11 levels of Vulkan's.
+  The first run with new compile options pays macOS's compile again (3.3 s here, after safe math).
+  New shared RHI test `PipelineCache` (a pipeline works after saving and loading, on both
+  backends; Metal also patches the cached MSL and checks that the patched code is what ran, junk
+  and cut-short files add nothing; mutation-checked). Not done: the macOS library compile itself
+  (macOS's own cache keeps it), and a size limit on the file (it holds every shader ever seen; a
+  new SPIRV-Cross or Translate version leaves the old entries unused until the file is deleted).

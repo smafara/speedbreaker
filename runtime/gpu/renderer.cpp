@@ -1458,7 +1458,7 @@ namespace gpu::renderer
             return spirv;
         }
 
-        // The device's pipeline cache, persisted as GetCachePath()/pipelines.bin.
+        // The device's pipeline cache, persisted as GetCachePath()/<the device's PipelineCacheFile()>.
         // Saved every 600 frames when new pipelines appeared, and at exit.
         uint32_t s_pipelinesAtSave = 0;
 
@@ -1466,7 +1466,7 @@ namespace gpu::renderer
         {
             std::vector<uint8_t> data;
             if (s_shaderCacheEnabled)
-                if (FILE* f = fopen((GetCachePath() / "pipelines.bin").string().c_str(), "rb"))
+                if (FILE* f = fopen((GetCachePath() / s_rhi->PipelineCacheFile()).string().c_str(), "rb"))
                 {
                     fseek(f, 0, SEEK_END);
                     long size = ftell(f);
@@ -1498,7 +1498,7 @@ namespace gpu::renderer
                 return;
             std::error_code ec;
             std::filesystem::create_directories(GetCachePath(), ec);
-            std::filesystem::path file = GetCachePath() / "pipelines.bin", temp = file;
+            std::filesystem::path file = GetCachePath() / s_rhi->PipelineCacheFile(), temp = file;
             temp += ".tmp";
             if (FILE* f = fopen(temp.string().c_str(), "wb"))
             {

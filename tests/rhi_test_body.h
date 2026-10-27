@@ -172,6 +172,89 @@ namespace
         munmap(host, size);
     }
 
+    // Out[i] = in[i] + add on g_device (- add with `sign` -1: a cached shader patched to subtract):
+    // the add shader, run (true: it did).
+    bool RunAdd(uint32_t add, int sign = 1)
+    {
+        constexpr uint32_t kCount = 256;
+        auto in = Make(kCount * 4, MemoryKind::Upload, kBufferStorage);
+        auto out = Make(kCount * 4, MemoryKind::Upload, kBufferStorage);
+        for (uint32_t i = 0; i < kCount; i++)
+            Words(*in)[i] = i;
+        auto layout = InOutLayout();
+        auto set = g_device->CreateBindingSet(*layout, 0);
+        BindingEntry entries[] = { Buf(0, *in), Buf(1, *out) };
+        set->Update(entries, 2);
+        ComputePipelineDesc pd;
+        pd.code = Code(k_add, sizeof(k_add) / 4);
+        pd.layout = layout.get();
+        auto pipeline = g_device->CreateComputePipeline(pd);
+        if (!pipeline)
+            return false;
+        Run([&](CommandList& cmd) {
+            cmd.SetPipeline(*pipeline);
+            cmd.BindSet(*layout, 0, *set);
+            cmd.PushConstants(*layout, &add, 4);
+            cmd.Dispatch(kCount / 64, 1, 1);
+            BufferTransition t[] = { { out.get(), State::ShaderWrite, State::HostRead } };
+            cmd.Transition(nullptr, 0, t, 1);
+        });
+        bool ok = true;
+        for (uint32_t i = 0; i < kCount; i++)
+            ok &= Words(*out)[i] == i + uint32_t(sign) * add;
+        return ok;
+    }
+
+    // The pipeline cache the renderer keeps on disk: what one device saves another takes, and
+    // pipelines made on it work. (Metal keeps the MSL SPIRV-Cross made, a file of its own.)
+    void PipelineCache()
+    {
+        const std::string file = g_device->PipelineCacheFile();
+        CHECK(!file.empty() && file.find('/') == std::string::npos, "the cache has a file name (%s)", file.c_str());
+        CHECK(RunAdd(3), "a pipeline works");
+        const std::vector<uint8_t> blob = g_device->SavePipelineCache();
+        CHECK(!blob.empty(), "the device saves its cache (%zu bytes)", blob.size());
+
+        std::unique_ptr<Device> other = MakeDevice();
+        if (!other)
+            return;
+        other->LoadPipelineCache(blob.data(), blob.size());
+        std::swap(g_device, other);
+        CHECK(RunAdd(5), "a pipeline works on a device that loaded the cache");
+        const std::vector<uint8_t> again = g_device->SavePipelineCache();
+        std::swap(g_device, other);
+        if (std::string(RHI_BACKEND_NAME) == "Metal")
+        {
+            CHECK(again == blob, "the loaded cache saves as it was (%zu bytes)", again.size());
+            // Not a cache of ours, or cut short: all of it is left out, and pipelines still work.
+            // The shader that runs is the cached one: patch its MSL (+ to -) and the sums change.
+            std::vector<uint8_t> patched = blob;
+            size_t plus = 0;
+            for (size_t i = 0; i + 3 <= patched.size() && !plus; i++)
+                if (memcmp(&patched[i], " + ", 3) == 0)
+                    plus = i + 1;
+            CHECK(plus != 0, "the cached MSL has an addition to patch");
+            if (plus)
+            {
+                patched[plus] = '-';
+                std::unique_ptr<Device> third = MakeDevice();
+                third->LoadPipelineCache(patched.data(), patched.size());
+                std::swap(g_device, third);
+                CHECK(RunAdd(5, -1), "the pipeline ran the cached MSL, not a new translation");
+                std::swap(g_device, third);
+            }
+            std::unique_ptr<Device> bad = MakeDevice();
+            const uint8_t junk[40] = { 1, 2, 3 };
+            bad->LoadPipelineCache(junk, sizeof(junk));
+            bad->LoadPipelineCache(blob.data(), blob.size() / 2);
+            bad->LoadPipelineCache(nullptr, 0);
+            CHECK(bad->SavePipelineCache().empty(), "junk and a cut-short cache add nothing");
+            std::swap(g_device, bad);
+            CHECK(RunAdd(9), "a pipeline works after them");
+            std::swap(g_device, bad);
+        }
+    }
+
     // The renderer's "set 0": a persistent table with a dynamic uniform offset.
     void DynamicOffsets()
     {
@@ -843,6 +926,8 @@ int main()
     BufferCopies();
     printf("host memory import\n");
     HostImport();
+    printf("pipeline cache\n");
+    PipelineCache();
     printf("binding set, dynamic offsets\n");
     DynamicOffsets();
     printf("pushed bindings\n");

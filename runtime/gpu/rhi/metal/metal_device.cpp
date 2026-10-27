@@ -238,8 +238,8 @@ namespace gpu::rhi::metal
                 Pool pool;
                 const auto& layout = *static_cast<const MetalBindingLayout*>(desc.layout);
                 std::string vsEntry, fsEntry;
-                const std::string vsMsl = ToMsl(desc.vertex, spv::ExecutionModelVertex, layout, vsEntry, nullptr, desc.topology == Topology::PointList);
-                const std::string fsMsl = ToMsl(desc.fragment, spv::ExecutionModelFragment, layout, fsEntry, nullptr);
+                const std::string vsMsl = ToMsl(m_c->mslCache, desc.vertex, spv::ExecutionModelVertex, layout, vsEntry, nullptr, desc.topology == Topology::PointList);
+                const std::string fsMsl = ToMsl(m_c->mslCache, desc.fragment, spv::ExecutionModelFragment, layout, fsEntry, nullptr);
                 Ptr<MTL::Function> vs = MakeFunction(*m_c->device.get(), vsMsl, vsEntry), fs = MakeFunction(*m_c->device.get(), fsMsl, fsEntry);
                 if (!vs || !fs)
                     return nullptr;
@@ -303,7 +303,7 @@ namespace gpu::rhi::metal
                 const auto& layout = *static_cast<const MetalBindingLayout*>(desc.layout);
                 std::string entry;
                 MTL::Size group{};
-                const std::string msl = ToMsl(desc.code, spv::ExecutionModelGLCompute, layout, entry, &group);
+                const std::string msl = ToMsl(m_c->mslCache, desc.code, spv::ExecutionModelGLCompute, layout, entry, &group);
                 Ptr<MTL::Function> function = MakeFunction(*m_c->device.get(), msl, entry);
                 if (!function)
                     return nullptr;
@@ -319,8 +319,17 @@ namespace gpu::rhi::metal
                 return compute;
             }
 
-            std::vector<uint8_t> SavePipelineCache() override { return {}; }  // (Metal's own cache keeps what it compiled)
-            void LoadPipelineCache(const void*, size_t) override {}
+            // What is kept is the MSL SPIRV-Cross made (impl::MslCache); the library macOS compiles
+            // from it is macOS's own cache to keep, which a binary archive would not replace.
+            const char* PipelineCacheFile() const override { return "pipelines-metal.bin"; }
+            std::vector<uint8_t> SavePipelineCache() override { return m_c->mslCache.Save(); }
+            void LoadPipelineCache(const void* data, size_t size) override
+            {
+                const size_t entries = m_c->mslCache.Load(data, size);
+                if (size)
+                    fprintf(stderr, "[rhi/metal] shader cache: %zu MSL shaders loaded%s\n", entries, entries ? "" : " (the file wasn't one this build reads)");
+            }
+            size_t CachedShaders() const { return m_c->mslCache.Size(); }
 
             std::unique_ptr<CommandList> CreateCommandList() override { return MakeCommandList(*m_c, m_internal); }
             std::unique_ptr<Fence> CreateFence(bool signaled) override { return std::make_unique<MetalFence>(signaled); }

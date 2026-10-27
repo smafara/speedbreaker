@@ -797,6 +797,7 @@ namespace gpu::rhi::vulkan
                 return std::make_unique<VkPipelineObject>(*m_c, pipeline, VK_PIPELINE_BIND_POINT_COMPUTE);
             }
 
+            const char* PipelineCacheFile() const override { return "pipelines.bin"; }
             std::vector<uint8_t> SavePipelineCache() override
             {
                 size_t size = 0;
